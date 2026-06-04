@@ -78,7 +78,7 @@ Every message is a JSON object with a top-level `type` field:
     "platform": "windows/amd64",
     "tun_device": "TachyonTUN",
     "xray_installed_version": "v25.5.16",  // null if not installed
-    "config_path": "C:\\Users\\user\\AppData\\Roaming\\Tachyon\\config.yaml"
+    "config_path": "C:\\Users\\user\\AppData\\Roaming\\Tachyon\\config.json"
   }
 }
 ```

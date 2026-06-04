@@ -164,40 +164,47 @@ install_tachyon() {
   install -m 755 "$TMP/tachyon-core" "$INSTALL_DIR/tachyon-core"
   rm -rf "$TMP"
   # Generate server config
-  cat > "$CONFIG_DIR/server.yaml" <<YAML
-mode: server
-
-server:
-  listen: ":$PORT"
-  tls:
-    cert: $CERT_DIR/fullchain.pem
-    key:  $CERT_DIR/key.pem
-  xray_backend:
-    addr: "127.0.0.1:$XRAY_INTERNAL_PORT"
-  relay:
-    dial_timeout: 5s
-    idle_timeout: 60s
-
-tgp:
-  fec:
-    data_shards: 4
-    parity_shards: 2
-    group_timeout: 20ms
-  pacing:
-    initial_rate_pps: 128
-    max_rate_pps: 1000
-  connection_migration: true
-  multipath: true
-
-xray:
-  install_dir: "$XRAY_DIR/"
-  config_file: "$CONFIG_DIR/xray-server.json"
-
-observability:
-  log_level: info
-  log_file: "$LOG_DIR/tachyon-core.log"
-  metrics_addr: "127.0.0.1:19090"
-YAML
+  cat > "$CONFIG_DIR/server.json" <<JSON
+{
+  "mode": "server",
+  "server": {
+    "listen": ":$PORT",
+    "tls": {
+      "cert": "$CERT_DIR/fullchain.pem",
+      "key": "$CERT_DIR/key.pem"
+    },
+    "xray_backend": {
+      "addr": "127.0.0.1:$XRAY_INTERNAL_PORT"
+    },
+    "relay": {
+      "dial_timeout": "5s",
+      "idle_timeout": "60s"
+    }
+  },
+  "tgp": {
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms"
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": true
+  },
+  "xray": {
+    "install_dir": "$XRAY_DIR/",
+    "config_file": "$CONFIG_DIR/xray-server.json"
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "$LOG_DIR/tachyon-core.log",
+    "metrics_addr": "127.0.0.1:19090"
+  }
+}
+JSON
   chown -R "$TACHYON_USER:$TACHYON_USER" "$CONFIG_DIR"
   cat > /etc/systemd/system/tachyon-core.service <<UNIT
 [Unit]
@@ -208,7 +215,7 @@ Wants=network-online.target
 Type=simple
 User=$TACHYON_USER
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart=$INSTALL_DIR/tachyon-core run --config $CONFIG_DIR/server.yaml
+ExecStart=$INSTALL_DIR/tachyon-core run --config $CONFIG_DIR/server.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

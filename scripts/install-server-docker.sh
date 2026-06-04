@@ -67,29 +67,44 @@ write_configs() {
   "outbounds": [{ "protocol": "freedom" }]
 }
 JSON
-  # tachyon-core server.yaml
-  cat > "$COMPOSE_DIR/config/server.yaml" <<YAML
-mode: server
-server:
-  listen: ":$PORT"
-  tls:
-    cert: /etc/tachyon/certs/fullchain.pem
-    key:  /etc/tachyon/certs/key.pem
-  xray_backend:
-    addr: "127.0.0.1:$XRAY_INTERNAL_PORT"
-  relay:
-    dial_timeout: 5s
-    idle_timeout: 60s
-tgp:
-  fec: { data_shards: 4, parity_shards: 2, group_timeout: 20ms }
-  pacing: { initial_rate_pps: 128, max_rate_pps: 1000 }
-  connection_migration: true
-  multipath: true
-observability:
-  log_level: info
-  log_file: /var/log/tachyon/tachyon-core.log
-  metrics_addr: "127.0.0.1:19090"
-YAML
+  # tachyon-core server.json
+  cat > "$COMPOSE_DIR/config/server.json" <<JSON
+{
+  "mode": "server",
+  "server": {
+    "listen": ":$PORT",
+    "tls": {
+      "cert": "/etc/tachyon/certs/fullchain.pem",
+      "key": "/etc/tachyon/certs/key.pem"
+    },
+    "xray_backend": {
+      "addr": "127.0.0.1:$XRAY_INTERNAL_PORT"
+    },
+    "relay": {
+      "dial_timeout": "5s",
+      "idle_timeout": "60s"
+    }
+  },
+  "tgp": {
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms"
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": true
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "/var/log/tachyon/tachyon-core.log",
+    "metrics_addr": "127.0.0.1:19090"
+  }
+}
+JSON
   success "Configs written."
 }
 
@@ -124,10 +139,10 @@ services:
       xray:
         condition: service_healthy
     volumes:
-      - $COMPOSE_DIR/config/server.yaml:/etc/tachyon/server.yaml:ro
+      - $COMPOSE_DIR/config/server.json:/etc/tachyon/server.json:ro
       - $COMPOSE_DIR/certs:/etc/tachyon/certs:ro
       - $COMPOSE_DIR/logs:/var/log/tachyon
-    command: ["tachyon-core", "run", "--config", "/etc/tachyon/server.yaml"]
+    command: ["tachyon-core", "run", "--config", "/etc/tachyon/server.json"]
     ulimits:
       nofile: { soft: 1048576, hard: 1048576 }
     healthcheck:

@@ -9,8 +9,12 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -28,30 +32,30 @@ const (
 // Root config
 // ---------------------------------------------------------------------------
 
-// Config is the top-level configuration object. It is loaded from a YAML file
-// and optionally overridden by environment variables.
+// Config is the top-level configuration object. JSON is the canonical on-disk
+// format; YAML is still accepted so early developer configs keep working.
 type Config struct {
 	// Mode selects client or server operation. Required.
-	Mode Mode `yaml:"mode"`
+	Mode Mode `yaml:"mode" json:"mode"`
 
 	// Client contains settings only relevant when Mode == "client".
-	Client ClientConfig `yaml:"client,omitempty"`
+	Client ClientConfig `yaml:"client,omitempty" json:"client,omitempty"`
 
 	// Server contains settings only relevant when Mode == "server".
-	Server ServerConfig `yaml:"server,omitempty"`
+	Server ServerConfig `yaml:"server,omitempty" json:"server,omitempty"`
 
 	// TGP contains settings shared between client and server TGP paths.
-	TGP TGPConfig `yaml:"tgp"`
+	TGP TGPConfig `yaml:"tgp" json:"tgp"`
 
 	// Xray contains settings for managing the xray-core binary.
-	Xray XrayConfig `yaml:"xray"`
+	Xray XrayConfig `yaml:"xray" json:"xray"`
 
 	// IPC controls the Prism ↔ Core communication endpoints.
 	// Only meaningful in client mode.
-	IPC IPCConfig `yaml:"ipc"`
+	IPC IPCConfig `yaml:"ipc" json:"ipc"`
 
 	// Observability controls logging, metrics and tracing.
-	Observability ObservabilityConfig `yaml:"observability"`
+	Observability ObservabilityConfig `yaml:"observability" json:"observability"`
 }
 
 // ---------------------------------------------------------------------------
@@ -61,13 +65,13 @@ type Config struct {
 // ClientConfig holds all client-side settings.
 type ClientConfig struct {
 	// TUN configures the virtual network interface.
-	TUN TUNConfig `yaml:"tun"`
+	TUN TUNConfig `yaml:"tun" json:"tun"`
 
 	// Routing defines the rule-based traffic classification engine.
-	Routing RoutingConfig `yaml:"routing"`
+	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
 	// Proxy is the upstream server this client connects to.
-	Proxy ProxyConfig `yaml:"proxy"`
+	Proxy ProxyConfig `yaml:"proxy" json:"proxy"`
 }
 
 // TUNConfig describes the TUN device to create.
@@ -76,64 +80,64 @@ type TUNConfig struct {
 	//   Linux:   tachyon0
 	//   macOS:   utun9
 	//   Windows: Tachyon
-	Name string `yaml:"name"`
+	Name string `yaml:"name" json:"name"`
 
 	// Address is the IPv4 CIDR assigned to the TUN interface, e.g. "198.18.0.1/16".
-	Address string `yaml:"address"`
+	Address string `yaml:"address" json:"address"`
 
 	// MTU. Defaults to 9000 (jumbo frame) for performance; reduce to 1500 if
 	// the network path does not support jumbo frames.
-	MTU int `yaml:"mtu"`
+	MTU int `yaml:"mtu" json:"mtu"`
 
 	// AutoRoute adds a default route pointing at the TUN interface so all
 	// traffic is captured. Disable if using policy routing instead.
-	AutoRoute bool `yaml:"auto_route"`
+	AutoRoute bool `yaml:"auto_route" json:"auto_route"`
 
 	// DNSHijack intercepts DNS UDP/53 traffic and forwards it through the proxy.
-	DNSHijack bool `yaml:"dns_hijack"`
+	DNSHijack bool `yaml:"dns_hijack" json:"dns_hijack"`
 }
 
 // RoutingConfig defines how traffic is classified into routing decisions.
 type RoutingConfig struct {
 	// DefaultAction is the fallback when no rule matches.
 	// One of: "xray", "tgp", "direct", "drop". Defaults to "xray".
-	DefaultAction string `yaml:"default_action"`
+	DefaultAction string `yaml:"default_action" json:"default_action"`
 
 	// Rules is evaluated in priority order (highest priority first).
-	Rules []RouteRule `yaml:"rules"`
+	Rules []RouteRule `yaml:"rules" json:"rules"`
 }
 
 // RouteRule is a single routing rule. Exactly one match field should be set.
 type RouteRule struct {
 	// Priority: higher value = evaluated earlier. Defaults to 0.
-	Priority int `yaml:"priority"`
+	Priority int `yaml:"priority" json:"priority"`
 
 	// Match criteria (exactly one should be set):
-	ProcessName  string `yaml:"process_name,omitempty"`  // e.g. "cs2.exe"
-	Domain       string `yaml:"domain,omitempty"`        // suffix match, e.g. "steam.com"
-	CIDR         string `yaml:"cidr,omitempty"`          // e.g. "10.0.0.0/8"
-	GeoIPCountry string `yaml:"geoip,omitempty"`         // e.g. "CN"
-	Protocol     string `yaml:"protocol,omitempty"`      // "tcp" or "udp"
+	ProcessName  string `yaml:"process_name,omitempty" json:"process_name,omitempty"` // e.g. "cs2.exe"
+	Domain       string `yaml:"domain,omitempty" json:"domain,omitempty"`             // suffix match, e.g. "steam.com"
+	CIDR         string `yaml:"cidr,omitempty" json:"cidr,omitempty"`                 // e.g. "10.0.0.0/8"
+	GeoIPCountry string `yaml:"geoip,omitempty" json:"geoip,omitempty"`               // e.g. "CN"
+	Protocol     string `yaml:"protocol,omitempty" json:"protocol,omitempty"`         // "tcp" or "udp"
 
 	// Action to take when matched.
 	// One of: "xray", "tgp", "direct", "drop"
-	Action string `yaml:"action"`
+	Action string `yaml:"action" json:"action"`
 }
 
 // ProxyConfig describes the upstream Tachyon/Xray server.
 type ProxyConfig struct {
 	// ServerAddr is the host:port of the remote server, e.g. "vpn.example.com:443".
-	ServerAddr string `yaml:"server_addr"`
+	ServerAddr string `yaml:"server_addr" json:"server_addr"`
 
 	// VLESSuuid is the VLESS user ID for Xray traffic.
-	VLESSUID string `yaml:"vless_uuid"`
+	VLESSUID string `yaml:"vless_uuid" json:"vless_uuid"`
 
 	// TGPServerAddr is the host:port for TGP game traffic.
 	// If empty, TGP traffic uses ServerAddr.
-	TGPServerAddr string `yaml:"tgp_server_addr,omitempty"`
+	TGPServerAddr string `yaml:"tgp_server_addr,omitempty" json:"tgp_server_addr,omitempty"`
 
 	// SNI overrides the TLS ServerName for Reality handshake.
-	SNI string `yaml:"sni,omitempty"`
+	SNI string `yaml:"sni,omitempty" json:"sni,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -143,38 +147,38 @@ type ProxyConfig struct {
 // ServerConfig holds all server-side settings.
 type ServerConfig struct {
 	// Listen is the address to bind, e.g. ":443".
-	Listen string `yaml:"listen"`
+	Listen string `yaml:"listen" json:"listen"`
 
 	// TLS configures the server certificate.
-	TLS TLSConfig `yaml:"tls"`
+	TLS TLSConfig `yaml:"tls" json:"tls"`
 
 	// XrayBackend is the local address where xray-core is listening.
 	// tachyon-core (server mode) spawns xray-core and proxies TLS flows to it.
-	XrayBackend XrayBackendConfig `yaml:"xray_backend"`
+	XrayBackend XrayBackendConfig `yaml:"xray_backend" json:"xray_backend"`
 
 	// Relay configures the UDP relay to upstream game servers.
-	Relay RelayConfig `yaml:"relay"`
+	Relay RelayConfig `yaml:"relay" json:"relay"`
 }
 
 // TLSConfig points at the certificate and key used by the server.
 type TLSConfig struct {
-	CertFile string `yaml:"cert"`
-	KeyFile  string `yaml:"key"`
+	CertFile string `yaml:"cert" json:"cert"`
+	KeyFile  string `yaml:"key" json:"key"`
 }
 
 // XrayBackendConfig tells tachyon-core (server) where xray is listening locally.
 type XrayBackendConfig struct {
 	// Addr is the local TCP address of the xray inbound, e.g. "127.0.0.1:18443".
-	Addr string `yaml:"addr"`
+	Addr string `yaml:"addr" json:"addr"`
 }
 
 // RelayConfig controls the UDP relay behaviour.
 type RelayConfig struct {
 	// DialTimeout is the maximum time to establish an upstream UDP "connection".
-	DialTimeout time.Duration `yaml:"dial_timeout"`
+	DialTimeout time.Duration `yaml:"dial_timeout" json:"dial_timeout"`
 
 	// IdleTimeout closes relay sessions that have been silent for this long.
-	IdleTimeout time.Duration `yaml:"idle_timeout"`
+	IdleTimeout time.Duration `yaml:"idle_timeout" json:"idle_timeout"`
 }
 
 // ---------------------------------------------------------------------------
@@ -183,42 +187,42 @@ type RelayConfig struct {
 
 // TGPConfig holds TGP parameters used by both client and server.
 type TGPConfig struct {
-	FEC     FECConfig     `yaml:"fec"`
-	Pacing  PacingConfig  `yaml:"pacing"`
+	FEC    FECConfig    `yaml:"fec" json:"fec"`
+	Pacing PacingConfig `yaml:"pacing" json:"pacing"`
 
 	// ConnectionMigration enables transparent session migration on IP change.
-	ConnectionMigration bool `yaml:"connection_migration"`
+	ConnectionMigration bool `yaml:"connection_migration" json:"connection_migration"`
 
 	// Multipath enables simultaneous send over all available network interfaces.
-	Multipath bool `yaml:"multipath"`
+	Multipath bool `yaml:"multipath" json:"multipath"`
 
 	// HandshakeTimeout is the maximum time to complete the TGP handshake.
-	HandshakeTimeout time.Duration `yaml:"handshake_timeout"`
+	HandshakeTimeout time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
 
 	// SessionIdleTimeout closes sessions that have been idle for this long.
-	SessionIdleTimeout time.Duration `yaml:"session_idle_timeout"`
+	SessionIdleTimeout time.Duration `yaml:"session_idle_timeout" json:"session_idle_timeout"`
 }
 
 // FECConfig controls Reed-Solomon forward error correction.
 type FECConfig struct {
 	// DataShards is the number of original data packets per FEC group.
-	DataShards int `yaml:"data_shards"`
+	DataShards int `yaml:"data_shards" json:"data_shards"`
 	// ParityShards is the number of parity packets added per FEC group.
 	// Set to 0 to disable FEC.
-	ParityShards int `yaml:"parity_shards"`
+	ParityShards int `yaml:"parity_shards" json:"parity_shards"`
 	// GroupTimeout is how long to wait for all shards before attempting
 	// partial reconstruction.
-	GroupTimeout time.Duration `yaml:"group_timeout"`
+	GroupTimeout time.Duration `yaml:"group_timeout" json:"group_timeout"`
 }
 
 // PacingConfig controls the Token Bucket send pacer.
 type PacingConfig struct {
 	// InitialRatePPS is the starting packet-per-second rate.
 	// Auto-adjusted based on measured game tick rate.
-	InitialRatePPS float64 `yaml:"initial_rate_pps"`
+	InitialRatePPS float64 `yaml:"initial_rate_pps" json:"initial_rate_pps"`
 
 	// MaxRatePPS is the hard ceiling.
-	MaxRatePPS float64 `yaml:"max_rate_pps"`
+	MaxRatePPS float64 `yaml:"max_rate_pps" json:"max_rate_pps"`
 }
 
 // ---------------------------------------------------------------------------
@@ -229,11 +233,11 @@ type PacingConfig struct {
 type XrayConfig struct {
 	// InstallDir is the directory where tachyon-core stores the xray binary.
 	// Defaults to <data_dir>/xray/
-	InstallDir string `yaml:"install_dir,omitempty"`
+	InstallDir string `yaml:"install_dir,omitempty" json:"install_dir,omitempty"`
 
 	// ConfigFile is the path to the xray JSON config that tachyon-core generates.
 	// Defaults to <data_dir>/xray/config.json
-	ConfigFile string `yaml:"config_file,omitempty"`
+	ConfigFile string `yaml:"config_file,omitempty" json:"config_file,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -243,13 +247,13 @@ type XrayConfig struct {
 // IPCConfig controls how Prism connects to Core.
 type IPCConfig struct {
 	// WebSocketAddr is the address for the real-time telemetry WebSocket.
-	WebSocketAddr string `yaml:"websocket_addr"`
+	WebSocketAddr string `yaml:"websocket_addr" json:"websocket_addr"`
 
 	// GRPCAddr is the address for the gRPC control plane.
-	GRPCAddr string `yaml:"grpc_addr"`
+	GRPCAddr string `yaml:"grpc_addr" json:"grpc_addr"`
 
 	// TelemetryIntervalMS controls how frequently telemetry events are pushed.
-	TelemetryIntervalMS int `yaml:"telemetry_interval_ms"`
+	TelemetryIntervalMS int `yaml:"telemetry_interval_ms" json:"telemetry_interval_ms"`
 }
 
 // ---------------------------------------------------------------------------
@@ -259,34 +263,50 @@ type IPCConfig struct {
 // ObservabilityConfig controls logging and metrics.
 type ObservabilityConfig struct {
 	// LogLevel: "debug", "info", "warn", "error". Defaults to "info".
-	LogLevel string `yaml:"log_level"`
+	LogLevel string `yaml:"log_level" json:"log_level"`
 
 	// LogFile writes logs to this path in addition to stderr. Empty = stderr only.
-	LogFile string `yaml:"log_file,omitempty"`
+	LogFile string `yaml:"log_file,omitempty" json:"log_file,omitempty"`
 
 	// MetricsAddr is the Prometheus /metrics HTTP endpoint.
 	// Empty disables the endpoint.
-	MetricsAddr string `yaml:"metrics_addr,omitempty"`
+	MetricsAddr string `yaml:"metrics_addr,omitempty" json:"metrics_addr,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
 // Load / validate
 // ---------------------------------------------------------------------------
 
-// Load reads a YAML config file and applies defaults.
+// Load reads a JSON config file and applies defaults. Legacy YAML files are
+// accepted for now, but generated configs use JSON.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 	cfg := defaults()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	if err := unmarshalConfig(path, data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return cfg, nil
+}
+
+func unmarshalConfig(path string, data []byte, cfg *Config) error {
+	trimmed := bytes.TrimSpace(data)
+	if isJSONConfig(path, trimmed) && !json.Valid(trimmed) {
+		return fmt.Errorf("invalid JSON")
+	}
+	return yaml.Unmarshal(data, cfg)
+}
+
+func isJSONConfig(path string, data []byte) bool {
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		return true
+	}
+	return bytes.HasPrefix(data, []byte("{"))
 }
 
 // defaults returns a Config populated with sensible defaults.

@@ -2,10 +2,10 @@
 //
 // Usage:
 //
-//	tachyon-core run --config /etc/tachyon/config.yaml
+//	tachyon-core run --config /etc/tachyon/config.json
 //	tachyon-core version
-//	tachyon-core generate-config --mode client > config.yaml
-//	tachyon-core generate-config --mode server > config.yaml
+//	tachyon-core generate-config --mode client > config.json
+//	tachyon-core generate-config --mode server > config.json
 package main
 
 import (
@@ -59,7 +59,7 @@ func run(args []string) error {
 
 // cmdRun is the primary subcommand that starts the daemon.
 func cmdRun(args []string) error {
-	configPath := "config.yaml"
+	configPath := "config.json"
 	for i, a := range args {
 		if (a == "--config" || a == "-c") && i+1 < len(args) {
 			configPath = args[i+1]
@@ -71,7 +71,6 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Setup structured logger before everything else.
 	logger := buildLogger(cfg.Observability.LogLevel, cfg.Observability.LogFile)
 	slog.SetDefault(logger)
 
@@ -81,17 +80,14 @@ func cmdRun(args []string) error {
 		"config", configPath,
 	)
 
-	// Build the application (dependency injection).
 	application, err := app.New(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("initialise application: %w", err)
 	}
 
-	// Root context cancelled on SIGINT / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Run blocks until the context is cancelled or a fatal error occurs.
 	if err := application.Run(ctx); err != nil {
 		return fmt.Errorf("application error: %w", err)
 	}
@@ -100,7 +96,7 @@ func cmdRun(args []string) error {
 	return nil
 }
 
-// cmdGenerateConfig prints a template config to stdout.
+// cmdGenerateConfig prints a JSON config template to stdout.
 func cmdGenerateConfig(args []string) error {
 	mode := config.ModeClient
 	for i, a := range args {
@@ -141,139 +137,143 @@ func buildLogger(level, logFile string) *slog.Logger {
 		if err == nil {
 			return slog.New(slog.NewJSONHandler(f, opts))
 		}
-		// Fall through to stderr on error.
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `tachyon-core — Tachyon network daemon
+	fmt.Fprint(os.Stderr, `tachyon-core - Tachyon network daemon
 
 USAGE:
   tachyon-core <command> [options]
 
 COMMANDS:
   run               Start the daemon (client or server mode)
-    --config/-c     Path to config file (default: config.yaml)
+    --config/-c     Path to config file (default: config.json)
 
-  generate-config   Print a template config to stdout
+  generate-config   Print a JSON config template to stdout
     --mode/-m       "client" or "server" (default: client)
 
   version           Print version information
 
 EXAMPLES:
   # Start as a client daemon
-  tachyon-core run --config /etc/tachyon/client.yaml
+  tachyon-core run --config /etc/tachyon/client.json
 
   # Start as a server
-  tachyon-core run --config /etc/tachyon/server.yaml
+  tachyon-core run --config /etc/tachyon/server.json
 
   # Generate a client config template
-  tachyon-core generate-config --mode client > client.yaml
+  tachyon-core generate-config --mode client > client.json
 `)
 }
 
-// ---------------------------------------------------------------------------
-// Embedded config templates
-// ---------------------------------------------------------------------------
-
-const clientConfigTemplate = `# Tachyon Core — Client Mode Configuration
-mode: client
-
-client:
-  tun:
-    name: ""            # auto-selected per platform
-    address: "198.18.0.1/16"
-    mtu: 9000
-    auto_route: true
-    dns_hijack: true
-
-  routing:
-    default_action: xray   # xray | tgp | direct | drop
-    rules:
-      # Example: route CS2 game traffic via TGP (low-latency UDP path)
-      - process_name: cs2.exe
-        action: tgp
-        priority: 100
-
-      # Example: bypass LAN traffic
-      - cidr: "192.168.0.0/16"
-        action: direct
-        priority: 50
-
-      # Example: bypass mainland China IPs
-      - geoip: CN
-        action: direct
-        priority: 10
-
-  proxy:
-    server_addr: "your-server.example.com:443"
-    vless_uuid: "00000000-0000-0000-0000-000000000000"
-    sni: "your-server.example.com"
-
-tgp:
-  fec:
-    data_shards: 4
-    parity_shards: 2
-    group_timeout: 20ms
-  pacing:
-    initial_rate_pps: 128
-    max_rate_pps: 1000
-  connection_migration: true
-  multipath: false
-  handshake_timeout: 5s
-  session_idle_timeout: 60s
-
-xray:
-  install_dir: ""   # defaults to <data_dir>/xray/
-
-ipc:
-  websocket_addr: "127.0.0.1:9999"
-  grpc_addr: "127.0.0.1:50051"
-  telemetry_interval_ms: 500
-
-observability:
-  log_level: info
-  log_file: ""        # empty = stderr only
-  metrics_addr: ""    # empty = disabled
+const clientConfigTemplate = `{
+  "mode": "client",
+  "client": {
+    "tun": {
+      "name": "",
+      "address": "198.18.0.1/16",
+      "mtu": 9000,
+      "auto_route": true,
+      "dns_hijack": true
+    },
+    "routing": {
+      "default_action": "xray",
+      "rules": [
+        {
+          "process_name": "cs2.exe",
+          "action": "tgp",
+          "priority": 100
+        },
+        {
+          "cidr": "192.168.0.0/16",
+          "action": "direct",
+          "priority": 50
+        },
+        {
+          "geoip": "CN",
+          "action": "direct",
+          "priority": 10
+        }
+      ]
+    },
+    "proxy": {
+      "server_addr": "your-server.example.com:443",
+      "vless_uuid": "00000000-0000-0000-0000-000000000000",
+      "sni": "your-server.example.com"
+    }
+  },
+  "tgp": {
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms"
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": false,
+    "handshake_timeout": "5s",
+    "session_idle_timeout": "60s"
+  },
+  "xray": {
+    "install_dir": ""
+  },
+  "ipc": {
+    "websocket_addr": "127.0.0.1:9999",
+    "grpc_addr": "127.0.0.1:50051",
+    "telemetry_interval_ms": 500
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "",
+    "metrics_addr": ""
+  }
+}
 `
 
-const serverConfigTemplate = `# Tachyon Core — Server Mode Configuration
-mode: server
-
-server:
-  listen: ":443"
-
-  tls:
-    cert: "/etc/tachyon/certs/fullchain.pem"
-    key:  "/etc/tachyon/certs/key.pem"
-
-  xray_backend:
-    addr: "127.0.0.1:18443"
-
-  relay:
-    dial_timeout: 5s
-    idle_timeout: 60s
-
-tgp:
-  fec:
-    data_shards: 4
-    parity_shards: 2
-    group_timeout: 20ms
-  pacing:
-    initial_rate_pps: 128
-    max_rate_pps: 1000
-  connection_migration: true
-  multipath: true
-  handshake_timeout: 5s
-  session_idle_timeout: 300s
-
-xray:
-  install_dir: "/opt/tachyon/xray/"
-  config_file: "/etc/tachyon/xray-server.json"
-
-observability:
-  log_level: info
-  log_file: "/var/log/tachyon/tachyon-core.log"
-  metrics_addr: "127.0.0.1:19090"
+const serverConfigTemplate = `{
+  "mode": "server",
+  "server": {
+    "listen": ":443",
+    "tls": {
+      "cert": "/etc/tachyon/certs/fullchain.pem",
+      "key": "/etc/tachyon/certs/key.pem"
+    },
+    "xray_backend": {
+      "addr": "127.0.0.1:18443"
+    },
+    "relay": {
+      "dial_timeout": "5s",
+      "idle_timeout": "60s"
+    }
+  },
+  "tgp": {
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms"
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": true,
+    "handshake_timeout": "5s",
+    "session_idle_timeout": "300s"
+  },
+  "xray": {
+    "install_dir": "/opt/tachyon/xray/",
+    "config_file": "/etc/tachyon/xray-server.json"
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "/var/log/tachyon/tachyon-core.log",
+    "metrics_addr": "127.0.0.1:19090"
+  }
+}
 `

@@ -1,0 +1,86 @@
+# Tachyon Game Protocol (TGP) 线格式规范
+
+[English](tgp-spec.md)
+
+**版本:** TGP/1.0
+
+**状态:** 草案
+
+**目标读者:** Tachyon Core 与服务端实现者
+
+**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 数据包封包/解包，以及 Reed-Solomon FEC 编解码。完整 session relay、迁移确认和多路径去重仍属于下一阶段。
+
+---
+
+## 1. 目标
+
+TGP 是面向游戏 UDP 流量设计的低抖动传输协议。它的目标不是抢占带宽，而是在稳定速率下保持极小队列，减少 Bufferbloat。
+
+| 目标 | 机制 |
+|---|---|
+| 低抖动 | Token Bucket Pacing，避免突发 |
+| 0-RTT 丢包恢复 | Reed-Solomon FEC |
+| 连接迁移 | 128-bit Session ID |
+| 抗 QoS 识别 | DTLS-like 外层头 + ChaCha20-Poly1305 |
+| 多路径预留 | 多 transport fan-out + 接收端去重 |
+
+---
+
+## 2. 数据包结构
+
+所有整数在线上均为 big-endian。
+
+### 2.1 外层头，明文，13 字节
+
+外层头模拟 DTLS 1.0 record header：
+
+| 字段 | 大小 | 值 |
+|---|---:|---|
+| ContentType | 1 byte | `0x17`，application_data |
+| Version | 2 bytes | `0xFE 0xFF`，DTLS 1.0 |
+| Epoch | 2 bytes | 初始为 `0x0000` |
+| SequenceNumber | 6 bytes | 48-bit 包序号 |
+| Length | 2 bytes | 后续密文长度 |
+
+外层头作为 AEAD additional data 参与认证，篡改会导致解包失败。
+
+### 2.2 内层头，认证加密，43 字节
+
+内层头与游戏 payload 一起用 ChaCha20-Poly1305 加密。当前密钥派生方式：
+
+```text
+HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
+```
+
+| 字段 | 大小 | 说明 |
+|---|---:|---|
+| Magic | 4 bytes | `TGP\x01` |
+| Flags | 1 byte | 控制、FEC、迁移、关闭、多路径、加密标记 |
+| Reserved | 2 bytes | 保留，当前写 0 |
+| SessionID | 16 bytes | 连接迁移使用的会话 ID |
+| StreamID | 2 bytes | 逻辑流 ID |
+| PacketNumber | 8 bytes | 单调递增包号 |
+| FECGroup | 4 bytes | FEC 组 ID |
+| FECIndex | 1 byte | shard index |
+| FECTotal | 1 byte | data + parity shard 总数 |
+| FECDataShards | 1 byte | 原始 data shard 数量 |
+| Reserved | 1 byte | 保留，当前写 0 |
+| PayloadLength | 2 bytes | 游戏 payload 长度 |
+
+---
+
+## 3. 已实现组件
+
+- `crypto.go`: 生成 X25519 key pair，并从 shared secret 派生双向流量密钥。
+- `codec.go`: 生成 DTLS-like 外层头，使用 ChaCha20-Poly1305 封包/解包。
+- `fec.go`: 基于 `github.com/klauspost/reedsolomon` 的 FEC 编解码器。
+- `pacer.go`: 深度为 1 的 token bucket pacer，用于平滑发包。
+
+---
+
+## 4. 下一阶段
+
+- 将 codec/FEC/pacer 组装成真正的 TGP session 状态机。
+- 增加 HELLO/HELLO_ACK 控制包与握手超时。
+- 实现服务端 relay、连接迁移确认和多路径去重窗口。
+- 将 client pipeline 的 TGP 判决接入真实 session manager。

@@ -1,10 +1,17 @@
 # Tachyon Game Protocol (TGP) — Wire Format Specification
 
+[中文说明](tgp-spec.zh-CN.md)
+
 **Version:** TGP/1.0
 
 **Status:** Draft
 
 **Target audience:** Core and Server implementers
+
+**Implementation status:** Core currently implements X25519/HKDF traffic-key
+derivation, ChaCha20-Poly1305 packet sealing/opening, and Reed-Solomon FEC in
+`internal/tgp`. Full session relay, migration confirmation, and multipath
+deduplication are planned next.
 
 ---
 
@@ -27,7 +34,7 @@ game proxies (TUIC, Hysteria 2) for latency-sensitive game traffic.
 
 All integers are **big-endian** on the wire.
 
-### 2.1 Outer Header (16 bytes, plaintext)
+### 2.1 Outer Header (13 bytes, plaintext)
 
 Mimics a DTLS 1.0 Record header (`RFC 6347 §4.1`):
 
@@ -51,10 +58,11 @@ Mimics a DTLS 1.0 Record header (`RFC 6347 §4.1`):
 | SequenceNumber | 6 bytes | Random per packet for DPI evasion |
 | Length | 2 bytes | Byte length of the encrypted inner payload |
 
-### 2.2 Inner Header (36 bytes, authenticated encrypted)
+### 2.2 Inner Header (43 bytes, authenticated encrypted)
 
 The inner header and payload are encrypted with **ChaCha20-Poly1305** (IETF).
-Key derivation: `HKDF-SHA256(shared_secret, "tgp-session-key", session_id)`.
+Key derivation: `HKDF-SHA256(shared_secret, salt=session_id,
+info="tachyon-tgp-v1 traffic keys")`.
 
 ```
  0                   1                   2                   3

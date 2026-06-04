@@ -1,6 +1,6 @@
 module github.com/tachyon-space/tachyon-core
 
-go 1.25.0
+go 1.26.4
 
 require (
 	github.com/klauspost/reedsolomon v1.14.0

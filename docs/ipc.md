@@ -18,3 +18,18 @@ service RoutingService {
 
 Manual game profiles must be preserved exactly as entered by the user. Automatic
 scans may add suggestions, but they must not override manual routing choices.
+
+## HTTP Bridge
+
+The first implementation exposes a small local HTTP JSON bridge on
+`127.0.0.1:55123`:
+
+- `GET /v1/health`
+- `GET /v1/routing/game-profiles`
+- `POST /v1/routing/game-profiles`
+- `PUT /v1/routing/game-profiles/{id}`
+- `DELETE /v1/routing/game-profiles/{id}`
+
+This bridge is a compatibility layer for early Prism integration. The routing
+service behind it is transport-agnostic and can be reused by gRPC or WebSocket
+handlers.

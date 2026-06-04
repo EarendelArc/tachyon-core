@@ -18,6 +18,7 @@ func main() {
 		Name:          "tachyon-core",
 		Version:       "0.1.0-dev",
 		IPCListenAddr: "127.0.0.1:55123",
+		ConfigPath:    "tachyon-core.config.json",
 	})
 
 	if err := daemon.Run(ctx); err != nil && err != context.Canceled {

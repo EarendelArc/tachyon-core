@@ -38,46 +38,46 @@ const (
 )
 
 type MatchRule struct {
-	ProcessNames []string
-	Paths        []string
-	PathPrefixes []string
-	SHA256       []string
-	SteamAppIDs  []uint32
+	ProcessNames []string `json:"processNames"`
+	Paths        []string `json:"paths"`
+	PathPrefixes []string `json:"pathPrefixes"`
+	SHA256       []string `json:"sha256"`
+	SteamAppIDs  []uint32 `json:"steamAppIds"`
 }
 
 type GameProfile struct {
-	ID          string
-	DisplayName string
-	Enabled     bool
-	Manual      bool
-	Priority    int
-	Match       MatchRule
-	UDPPolicy   UDPPolicy
-	TCPPolicy   TCPPolicy
+	ID          string    `json:"id"`
+	DisplayName string    `json:"displayName"`
+	Enabled     bool      `json:"enabled"`
+	Manual      bool      `json:"manual"`
+	Priority    int       `json:"priority"`
+	Match       MatchRule `json:"match"`
+	UDPPolicy   UDPPolicy `json:"udpPolicy"`
+	TCPPolicy   TCPPolicy `json:"tcpPolicy"`
 }
 
 type SteamPolicy struct {
-	Enabled                  bool
-	TrackChildProcesses      bool
-	AccelerateGameUDP        bool
-	AccelerateSteamDownloads bool
+	Enabled                  bool `json:"enabled"`
+	TrackChildProcesses      bool `json:"trackChildProcesses"`
+	AccelerateGameUDP        bool `json:"accelerateGameUdp"`
+	AccelerateSteamDownloads bool `json:"accelerateSteamDownloads"`
 }
 
 type LauncherPolicy struct {
-	Steam SteamPolicy
+	Steam SteamPolicy `json:"steam"`
 }
 
 type Engine struct {
-	Profiles  []GameProfile
-	Launchers LauncherPolicy
+	Profiles  []GameProfile  `json:"profiles"`
+	Launchers LauncherPolicy `json:"launchers"`
 }
 
 type Decision struct {
-	Kind      DecisionKind
-	UDPPolicy UDPPolicy
-	TCPPolicy TCPPolicy
-	ProfileID string
-	Reason    string
+	Kind      DecisionKind `json:"kind"`
+	UDPPolicy UDPPolicy    `json:"udpPolicy"`
+	TCPPolicy TCPPolicy    `json:"tcpPolicy"`
+	ProfileID string       `json:"profileId"`
+	Reason    string       `json:"reason"`
 }
 
 func (e Engine) Decide(proc pidtrack.ProcessInfo, flow pidtrack.FlowKey) Decision {

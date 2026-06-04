@@ -1,66 +1,286 @@
+// Package app is the dependency-injection root of tachyon-core.
+//
+// It wires together all internal subsystems and hands them off to either the
+// client runner or the server runner depending on the configured mode.
+//
+// Startup order (client mode):
+//  1. Observability (metrics endpoint, logger)
+//  2. Xray binary verification / download prompt
+//  3. TUN device creation
+//  4. PID tracker
+//  5. Routing engine (loads rules)
+//  6. Xray subprocess runner
+//  7. IPC server (gRPC + WebSocket) — Prism can connect now
+//  8. TUN pipeline starts forwarding packets
+//
+// Startup order (server mode):
+//  1. Observability
+//  2. Xray subprocess runner (server config)
+//  3. TGP relay
+//  4. Port 443 multiplexer → dispatches to Xray backend or TGP relay
 package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/ipc"
+	"github.com/tachyon-space/tachyon-core/internal/pidtrack"
+	"github.com/tachyon-space/tachyon-core/internal/pipeline"
 	"github.com/tachyon-space/tachyon-core/internal/routing"
+	"github.com/tachyon-space/tachyon-core/internal/tun"
 )
 
-type Config struct {
-	Name          string
-	Version       string
-	IPCListenAddr string
-	ConfigPath    string
-}
-
+// App is the fully wired application. Callers obtain one via New and then
+// call Run to block until the context is cancelled.
 type App struct {
-	cfg Config
+	cfg    *config.Config
+	logger *slog.Logger
+	mode   config.Mode
 }
 
-func New(cfg Config) *App {
-	return &App{cfg: cfg}
+// New constructs and validates the application without starting any I/O.
+// Any error here is a programming or configuration mistake.
+func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config must not be nil")
+	}
+	return &App{
+		cfg:    cfg,
+		logger: logger,
+		mode:   cfg.Mode,
+	}, nil
 }
 
+// Run starts the application and blocks until ctx is cancelled.
+// It is the responsibility of the caller to cancel ctx on shutdown signals.
 func (a *App) Run(ctx context.Context) error {
-	configPath := a.cfg.ConfigPath
-	if configPath == "" {
-		configPath = "tachyon-core.config.json"
+	switch a.mode {
+	case config.ModeClient:
+		return a.runClient(ctx)
+	case config.ModeServer:
+		return a.runServer(ctx)
+	default:
+		return fmt.Errorf("unknown mode: %q", a.mode)
 	}
-	if envPath := os.Getenv("TACHYON_CORE_CONFIG"); envPath != "" {
-		configPath = envPath
+}
+
+// ---------------------------------------------------------------------------
+// Client mode
+// ---------------------------------------------------------------------------
+
+func (a *App) runClient(ctx context.Context) error {
+	a.logger.Info("starting in client mode")
+
+	tunPrefixes, err := parseTUNPrefixes(a.cfg.Client.TUN.Address)
+	if err != nil {
+		return err
 	}
 
-	routingService := routing.NewService(routing.NewFileStore(configPath))
-	ipcServer := ipc.NewHTTPServer(routingService)
+	tunDevice, err := tun.New(tun.Options{
+		Name:      a.cfg.Client.TUN.Name,
+		Addresses: tunPrefixes,
+		MTU:       a.cfg.Client.TUN.MTU,
+		AutoRoute: a.cfg.Client.TUN.AutoRoute,
+		DNSHijack: a.cfg.Client.TUN.DNSHijack,
+	})
+	if err != nil {
+		return fmt.Errorf("create TUN device: %w", err)
+	}
+	defer func() {
+		if err := tunDevice.Close(); err != nil {
+			a.logger.Warn("close TUN device", "error", err)
+		}
+	}()
+	a.logger.Info("TUN device ready",
+		"name", tunDevice.Name(),
+		"addresses", tunDevice.Addresses(),
+		"mtu", tunDevice.MTU(),
+	)
+
+	tracker, err := pidtrack.New()
+	if err != nil {
+		return fmt.Errorf("create PID tracker: %w", err)
+	}
+	a.logger.Info("PID tracker ready")
+
+	routingService := routing.NewService(routing.NewFileStore(defaultRoutingStorePath()))
+	gameEngine, err := routingService.Engine(ctx)
+	if err != nil {
+		return fmt.Errorf("load routing profiles: %w", err)
+	}
+	packetRouter := pipeline.NewRouter(a.cfg.Client.Routing, gameEngine)
+	a.logger.Info("routing engine ready", "profiles", len(gameEngine.Profiles), "config_rules", len(a.cfg.Client.Routing.Rules))
+
+	ipcHTTP := ipc.NewHTTPServer(routingService)
 	httpServer := &http.Server{
-		Addr:              a.cfg.IPCListenAddr,
-		Handler:           ipcServer.Handler(),
+		Addr:              clientHTTPAddr(a.cfg.IPC),
+		Handler:           ipcHTTP.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 3)
 	go func() {
-		fmt.Printf("%s %s listening on http://%s\n", a.cfg.Name, a.cfg.Version, a.cfg.IPCListenAddr)
-		errCh <- httpServer.ListenAndServe()
+		a.logger.Info("IPC HTTP bridge listening", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("IPC HTTP bridge: %w", err)
+		}
 	}()
 
+	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
+
+	// TODO M2: start Xray subprocess runner
+	// TODO M3: start TGP client session manager
+
+	packetPipeline := pipeline.New(pipeline.Options{
+		Device:  tunDevice,
+		Tracker: tracker,
+		Router:  packetRouter,
+		Handler: pipeline.LoggingHandler{Logger: a.logger},
+		Logger:  a.logger,
+	})
+	go func() {
+		a.logger.Info("TUN packet pipeline running")
+		if err := packetPipeline.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("packet pipeline: %w", err)
+		}
+	}()
+
+	a.logger.Info("client subsystems initialised, waiting for shutdown signal")
+	var runErr error
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		return ctx.Err()
-	case err := <-errCh:
-		if err == http.ErrServerClosed {
-			return ctx.Err()
-		}
+		a.logger.Info("client shutdown initiated", "reason", ctx.Err())
+	case runErr = <-errCh:
+		a.logger.Error("client subsystem failed", "error", runErr)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
+	}
+	if err := a.shutdownClient(shutdownCtx); err != nil {
 		return err
 	}
+	if stats := packetPipeline.Snapshot(); stats.PacketsRead > 0 {
+		a.logger.Info("packet pipeline stopped",
+			"packets", stats.PacketsRead,
+			"unsupported", stats.Unsupported,
+			"lookup_errors", stats.LookupErrors,
+			"xray", stats.DecidedXray,
+			"tgp", stats.DecidedTGP,
+			"direct", stats.DecidedDirect,
+			"drop", stats.DecidedDrop,
+		)
+	}
+	return runErr
+}
+
+func (a *App) shutdownClient(ctx context.Context) error {
+	a.logger.Info("shutting down client subsystems")
+	// TODO: stop subsystems in reverse startup order
+	_ = ctx
+	a.logger.Info("client shutdown complete")
+	return nil
+}
+
+func parseTUNPrefixes(raw string) ([]netip.Prefix, error) {
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("parse client.tun.address %q: %w", value, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("client.tun.address must contain at least one CIDR prefix")
+	}
+	return prefixes, nil
+}
+
+func clientHTTPAddr(cfg config.IPCConfig) string {
+	if value := strings.TrimSpace(os.Getenv("TACHYON_HTTP_ADDR")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(cfg.WebSocketAddr); value != "" {
+		return value
+	}
+	return "127.0.0.1:55123"
+}
+
+func defaultRoutingStorePath() string {
+	if value := strings.TrimSpace(os.Getenv("TACHYON_ROUTING_STORE")); value != "" {
+		return value
+	}
+	if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, "tachyon", "routing.json")
+	}
+	return filepath.Join(".", "tachyon-routing.json")
+}
+
+func refreshRoutingEngine(ctx context.Context, service *routing.Service, router *pipeline.Router, logger *slog.Logger) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			engine, err := service.Engine(ctx)
+			if err != nil {
+				logger.Warn("refresh routing engine", "error", err)
+				continue
+			}
+			router.SetGameEngine(engine)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Server mode
+// ---------------------------------------------------------------------------
+
+func (a *App) runServer(ctx context.Context) error {
+	a.logger.Info("starting in server mode",
+		"listen", a.cfg.Server.Listen,
+		"xray_backend", a.cfg.Server.XrayBackend.Addr,
+	)
+
+	// TODO M2: start Xray subprocess (server config)
+	// TODO M3: start TGP relay
+	// TODO M3: start port-443 multiplexer
+
+	a.logger.Info("server subsystems initialised (stubs), waiting for shutdown signal")
+	<-ctx.Done()
+	a.logger.Info("server shutdown initiated", "reason", ctx.Err())
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	return a.shutdownServer(shutdownCtx)
+}
+
+func (a *App) shutdownServer(ctx context.Context) error {
+	a.logger.Info("shutting down server subsystems")
+	_ = ctx
+	a.logger.Info("server shutdown complete")
+	return nil
 }

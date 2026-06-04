@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/tachyon-space/tachyon-core/internal/launcher"
 	"github.com/tachyon-space/tachyon-core/internal/routing"
 )
 
@@ -43,6 +46,7 @@ func (s *HTTPServer) routes() {
 	s.mux.HandleFunc("POST /v1/routing/game-profiles", s.handleAddGameProfile)
 	s.mux.HandleFunc("PUT /v1/routing/game-profiles/", s.handleUpdateGameProfile)
 	s.mux.HandleFunc("DELETE /v1/routing/game-profiles/", s.handleRemoveGameProfile)
+	s.mux.HandleFunc("GET /v1/launchers/steam/scan", s.handleScanSteam)
 }
 
 func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -96,9 +100,78 @@ func (s *HTTPServer) handleRemoveGameProfile(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *HTTPServer) handleScanSteam(w http.ResponseWriter, r *http.Request) {
+	root := strings.TrimSpace(r.URL.Query().Get("root"))
+	scanner := launcher.NewSteamScanner()
+
+	var apps []launcher.SteamAppManifest
+	var err error
+	if root == "" {
+		apps, err = scanner.ScanDefaultRoots(r.Context())
+	} else {
+		apps, err = scanner.Scan(r.Context(), root)
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"apps":     apps,
+		"profiles": steamProfileSuggestions(apps),
+	})
+}
+
 func profileIDFromPath(path string) string {
 	const prefix = "/v1/routing/game-profiles/"
 	return strings.TrimSpace(strings.TrimPrefix(path, prefix))
+}
+
+func steamProfileSuggestions(apps []launcher.SteamAppManifest) []routing.GameProfile {
+	profiles := make([]routing.GameProfile, 0, len(apps))
+	for _, app := range apps {
+		displayName := app.Name
+		if displayName == "" {
+			displayName = app.InstallDir
+		}
+		if displayName == "" || app.AppID == 0 {
+			continue
+		}
+
+		prefix := ""
+		if app.LibraryPath != "" && app.InstallDir != "" {
+			prefix = filepath.Join(app.LibraryPath, "steamapps", "common", app.InstallDir)
+		}
+
+		profiles = append(profiles, routing.GameProfile{
+			ID:          "steam-" + uint32String(app.AppID),
+			DisplayName: displayName,
+			Enabled:     true,
+			Manual:      false,
+			Priority:    10,
+			Match: routing.MatchRule{
+				PathPrefixes: compactStrings([]string{prefix}),
+				SteamAppIDs:  []uint32{app.AppID},
+			},
+			UDPPolicy: routing.UDPPolicyTGP,
+			TCPPolicy: routing.TCPPolicyAuto,
+		})
+	}
+	return profiles
+}
+
+func uint32String(value uint32) string {
+	return strconv.FormatUint(uint64(value), 10)
+}
+
+func compactStrings(values []string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func decodeJSON(r *http.Request, dst any) error {

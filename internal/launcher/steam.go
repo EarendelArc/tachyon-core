@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+var DefaultSteamRoots = []string{
+	`C:\Program Files (x86)\Steam`,
+	`C:\Program Files\Steam`,
+}
+
 type SteamLibraryFolder struct {
 	Path   string   `json:"path"`
 	AppIDs []uint32 `json:"appIds"`
@@ -63,6 +68,21 @@ func (s *SteamScanner) Scan(ctx context.Context, steamRoot string) ([]SteamAppMa
 		manifests = append(manifests, apps...)
 	}
 
+	return manifests, nil
+}
+
+func (s *SteamScanner) ScanDefaultRoots(ctx context.Context) ([]SteamAppManifest, error) {
+	var manifests []SteamAppManifest
+	for _, root := range DefaultSteamRoots {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		apps, err := s.Scan(ctx, root)
+		if err != nil {
+			continue
+		}
+		manifests = append(manifests, apps...)
+	}
 	return manifests, nil
 }
 

@@ -40,11 +40,17 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 		if err != nil {
 			return err
 		}
+		localIP, err := netip.ParseAddr(flow.LocalIP)
+		if err != nil {
+			return err
+		}
 		remoteIP, err := netip.ParseAddr(flow.RemoteIP)
 		if err != nil {
 			return err
 		}
 		tunnelPayload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+			LocalIP:    localIP,
+			LocalPort:  flow.LocalPort,
 			RemoteIP:   remoteIP,
 			RemotePort: flow.RemotePort,
 			Payload:    udpPayload,

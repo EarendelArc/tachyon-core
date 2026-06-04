@@ -3,6 +3,7 @@ package tgp
 import (
 	"bytes"
 	"context"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -46,7 +47,16 @@ func TestRelayReceivesClientManagerPayload(t *testing.T) {
 	}
 	defer manager.Close()
 
-	payload := []byte("captured l3 packet")
+	payload, err := MarshalTunnelDatagram(TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("203.0.113.1"),
+		RemotePort: 27015,
+		Payload:    []byte("captured payload"),
+	})
+	if err != nil {
+		t.Fatalf("marshal tunnel datagram: %v", err)
+	}
 	if err := manager.SendPacket(ctx, capturedPacketStreamID, payload); err != nil {
 		t.Fatalf("manager send: %v", err)
 	}

@@ -38,6 +38,9 @@ func TestClientPacketHandlerSendsTGPDecision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse tunnel datagram: %v", err)
 	}
+	if tunnel.LocalIP != netip.MustParseAddr("198.18.0.2") || tunnel.LocalPort != 53000 {
+		t.Fatalf("unexpected tunnel local endpoint: %#v", tunnel)
+	}
 	if tunnel.RemoteIP != netip.MustParseAddr("203.0.113.9") || tunnel.RemotePort != 27015 {
 		t.Fatalf("unexpected tunnel target: %#v", tunnel)
 	}

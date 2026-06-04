@@ -10,6 +10,7 @@ import (
 
 type RelayPacket struct {
 	SessionID SessionID
+	Session   Session
 	Payload   []byte
 }
 
@@ -86,6 +87,7 @@ func (r *Relay) ListenAndServe(ctx context.Context) error {
 		}
 		packet := RelayPacket{
 			SessionID: session.ID(),
+			Session:   session,
 			Payload:   append([]byte(nil), payload...),
 		}
 		if err := r.handler.HandleRelayPacket(ctx, packet); err != nil {

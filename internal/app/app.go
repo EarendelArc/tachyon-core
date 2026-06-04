@@ -144,6 +144,13 @@ func (a *App) runClient(ctx context.Context) error {
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
 		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
+		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
+			packet, err := buildIPv4UDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
+			if err != nil {
+				return err
+			}
+			return tunDevice.WritePacket(packet)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("create TGP client manager: %w", err)

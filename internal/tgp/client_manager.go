@@ -20,6 +20,7 @@ type ClientManagerOptions struct {
 	PacerPPS         float64
 	HandshakeTimeout time.Duration
 	Dial             DialFunc
+	OnDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 }
 
 type ClientManager struct {
@@ -28,9 +29,12 @@ type ClientManager struct {
 	pacerPPS         float64
 	handshakeTimeout time.Duration
 	dial             DialFunc
+	onDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 
 	mu      sync.Mutex
 	session Session
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
@@ -52,12 +56,16 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 			return DialSession(ctx, localAddr, remoteAddr, pacerPPS)
 		}
 	}
+	managerCtx, cancel := context.WithCancel(context.Background())
 	return &ClientManager{
 		remoteAddr:       remote,
 		localAddr:        local,
 		pacerPPS:         opts.PacerPPS,
 		handshakeTimeout: timeout,
 		dial:             dial,
+		onDatagram:       opts.OnDatagram,
+		ctx:              managerCtx,
+		cancel:           cancel,
 	}, nil
 }
 
@@ -74,6 +82,9 @@ func (m *ClientManager) SendPacket(ctx context.Context, streamID StreamID, paylo
 }
 
 func (m *ClientManager) Close() error {
+	if m.cancel != nil {
+		m.cancel()
+	}
 	m.mu.Lock()
 	session := m.session
 	m.session = nil
@@ -108,6 +119,9 @@ func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
 		return nil, fmt.Errorf("dial tgp session %s: %w", remoteAddr, err)
 	}
 	m.session = session
+	if m.onDatagram != nil {
+		go m.readLoop(session)
+	}
 	return session, nil
 }
 
@@ -117,4 +131,20 @@ func (m *ClientManager) resetSession(session Session) {
 		m.session = nil
 	}
 	m.mu.Unlock()
+}
+
+func (m *ClientManager) readLoop(session Session) {
+	for {
+		payload, err := session.RecvPacket(m.ctx, capturedPacketStreamID)
+		if err != nil {
+			return
+		}
+		datagram, err := ParseTunnelDatagram(payload)
+		if err != nil {
+			continue
+		}
+		if err := m.onDatagram(m.ctx, datagram); err != nil {
+			continue
+		}
+	}
 }

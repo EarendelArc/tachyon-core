@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -88,6 +89,59 @@ func TestClientManagerLoopbackHandshake(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("got %q, want %q", got, payload)
+	}
+}
+
+func TestClientManagerReceivesTunnelDatagram(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client, server, err := NewLoopbackSessionPair(ctx, 100000)
+	if err != nil {
+		t.Fatalf("session pair: %v", err)
+	}
+	defer server.Close()
+
+	gotCh := make(chan TunnelDatagram, 1)
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		Dial: func(context.Context, string, net.Addr, float64) (Session, error) {
+			return client, nil
+		},
+		OnDatagram: func(_ context.Context, datagram TunnelDatagram) error {
+			gotCh <- datagram
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.sessionFor(ctx); err != nil {
+		t.Fatalf("sessionFor: %v", err)
+	}
+	wire, err := MarshalTunnelDatagram(TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("203.0.113.7"),
+		RemotePort: 27015,
+		Payload:    []byte("reply"),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := server.SendPacket(ctx, capturedPacketStreamID, wire); err != nil {
+		t.Fatalf("server send: %v", err)
+	}
+
+	select {
+	case got := <-gotCh:
+		if !bytes.Equal(got.Payload, []byte("reply")) {
+			t.Fatalf("unexpected payload: %q", got.Payload)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for datagram: %v", ctx.Err())
 	}
 }
 

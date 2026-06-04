@@ -13,25 +13,38 @@ var (
 )
 
 type TunnelDatagram struct {
+	LocalIP    netip.Addr
+	LocalPort  uint16
 	RemoteIP   netip.Addr
 	RemotePort uint16
 	Payload    []byte
 }
 
 func MarshalTunnelDatagram(datagram TunnelDatagram) ([]byte, error) {
+	if !datagram.LocalIP.IsValid() {
+		return nil, fmt.Errorf("%w: invalid local ip", ErrInvalidTunnelData)
+	}
 	if !datagram.RemoteIP.IsValid() {
 		return nil, fmt.Errorf("%w: invalid remote ip", ErrInvalidTunnelData)
 	}
 
-	addr := datagram.RemoteIP.AsSlice()
-	if len(addr) != 4 && len(addr) != 16 {
-		return nil, fmt.Errorf("%w: unsupported address length %d", ErrInvalidTunnelData, len(addr))
+	localAddr := datagram.LocalIP.AsSlice()
+	remoteAddr := datagram.RemoteIP.AsSlice()
+	if len(localAddr) != 4 && len(localAddr) != 16 {
+		return nil, fmt.Errorf("%w: unsupported local address length %d", ErrInvalidTunnelData, len(localAddr))
 	}
-	out := make([]byte, 0, 4+1+len(addr)+2+len(datagram.Payload))
+	if len(remoteAddr) != 4 && len(remoteAddr) != 16 {
+		return nil, fmt.Errorf("%w: unsupported remote address length %d", ErrInvalidTunnelData, len(remoteAddr))
+	}
+	out := make([]byte, 0, 4+1+len(localAddr)+2+1+len(remoteAddr)+2+len(datagram.Payload))
 	out = append(out, tunnelMagic[:]...)
-	out = append(out, byte(len(addr)))
-	out = append(out, addr...)
+	out = append(out, byte(len(localAddr)))
+	out = append(out, localAddr...)
 	var port [2]byte
+	binary.BigEndian.PutUint16(port[:], datagram.LocalPort)
+	out = append(out, port[:]...)
+	out = append(out, byte(len(remoteAddr)))
+	out = append(out, remoteAddr...)
 	binary.BigEndian.PutUint16(port[:], datagram.RemotePort)
 	out = append(out, port[:]...)
 	out = append(out, datagram.Payload...)
@@ -39,41 +52,63 @@ func MarshalTunnelDatagram(datagram TunnelDatagram) ([]byte, error) {
 }
 
 func ParseTunnelDatagram(data []byte) (TunnelDatagram, error) {
-	if len(data) < 4+1+2 {
+	if len(data) < 4+1+2+1+2 {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
 	if string(data[:4]) != string(tunnelMagic[:]) {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
-	addrLen := int(data[4])
-	if addrLen != 4 && addrLen != 16 {
-		return TunnelDatagram{}, fmt.Errorf("%w: unsupported address length %d", ErrInvalidTunnelData, addrLen)
+	localLen := int(data[4])
+	if localLen != 4 && localLen != 16 {
+		return TunnelDatagram{}, fmt.Errorf("%w: unsupported local address length %d", ErrInvalidTunnelData, localLen)
 	}
-	if len(data) < 4+1+addrLen+2 {
+	if len(data) < 4+1+localLen+2+1+2 {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
-	var addr netip.Addr
-	var ok bool
-	if addrLen == 4 {
+	var localIP netip.Addr
+	if localLen == 4 {
 		var raw [4]byte
 		copy(raw[:], data[5:9])
-		addr = netip.AddrFrom4(raw)
-		ok = true
+		localIP = netip.AddrFrom4(raw)
 	} else {
 		var raw [16]byte
 		copy(raw[:], data[5:21])
-		addr = netip.AddrFrom16(raw)
-		ok = true
+		localIP = netip.AddrFrom16(raw)
 	}
-	if !ok {
+	localPortOffset := 5 + localLen
+	localPort := binary.BigEndian.Uint16(data[localPortOffset : localPortOffset+2])
+
+	remoteLenOffset := localPortOffset + 2
+	remoteLen := int(data[remoteLenOffset])
+	if remoteLen != 4 && remoteLen != 16 {
+		return TunnelDatagram{}, fmt.Errorf("%w: unsupported remote address length %d", ErrInvalidTunnelData, remoteLen)
+	}
+	remoteOffset := remoteLenOffset + 1
+	remotePortOffset := remoteOffset + remoteLen
+	if len(data) < remotePortOffset+2 {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
-	portOffset := 5 + addrLen
+	var remoteIP netip.Addr
+	if remoteLen == 4 {
+		var raw [4]byte
+		copy(raw[:], data[remoteOffset:remotePortOffset])
+		remoteIP = netip.AddrFrom4(raw)
+	} else {
+		var raw [16]byte
+		copy(raw[:], data[remoteOffset:remotePortOffset])
+		remoteIP = netip.AddrFrom16(raw)
+	}
 	return TunnelDatagram{
-		RemoteIP:   addr,
-		RemotePort: binary.BigEndian.Uint16(data[portOffset : portOffset+2]),
-		Payload:    append([]byte(nil), data[portOffset+2:]...),
+		LocalIP:    localIP,
+		LocalPort:  localPort,
+		RemoteIP:   remoteIP,
+		RemotePort: binary.BigEndian.Uint16(data[remotePortOffset : remotePortOffset+2]),
+		Payload:    append([]byte(nil), data[remotePortOffset+2:]...),
 	}, nil
+}
+
+func (d TunnelDatagram) LocalAddrPort() netip.AddrPort {
+	return netip.AddrPortFrom(d.LocalIP, d.LocalPort)
 }
 
 func (d TunnelDatagram) RemoteAddrPort() netip.AddrPort {

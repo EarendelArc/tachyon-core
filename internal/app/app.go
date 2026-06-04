@@ -293,7 +293,12 @@ func (a *App) runServer(ctx context.Context) error {
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
 		ListenAddr: a.cfg.Server.Listen,
 		PacerPPS:   a.cfg.TGP.Pacing.InitialRatePPS,
-		Handler:    serverRelayHandler{logger: a.logger},
+		Handler: serverRelayHandler{
+			logger: a.logger,
+			forwarder: netUDPForwarder{
+				timeout: a.cfg.Server.Relay.DialTimeout,
+			},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("create TGP relay: %w", err)

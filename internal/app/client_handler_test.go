@@ -3,8 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"net/netip"
 	"testing"
 
+	"github.com/tachyon-space/tachyon-core/internal/pidtrack"
 	"github.com/tachyon-space/tachyon-core/internal/pipeline"
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
@@ -12,10 +15,15 @@ import (
 func TestClientPacketHandlerSendsTGPDecision(t *testing.T) {
 	sender := &fakeTGPPacketSender{}
 	handler := clientPacketHandler{tgp: sender}
-	packet := []byte{0x45, 0, 0, 28}
+	packet := makeIPv4UDPPacket([]byte("hello"))
 
 	err := handler.HandlePacket(context.Background(), pipeline.Decision{
 		Action: pipeline.ActionTGP,
+		Flow: pidtrack.FlowKey{
+			Transport:  pidtrack.TransportUDP,
+			RemoteIP:   "203.0.113.9",
+			RemotePort: 27015,
+		},
 	}, packet)
 	if err != nil {
 		t.Fatalf("handle packet: %v", err)
@@ -26,8 +34,15 @@ func TestClientPacketHandlerSendsTGPDecision(t *testing.T) {
 	if sender.streams[0] != capturedPacketStream {
 		t.Fatalf("unexpected stream id: %d", sender.streams[0])
 	}
-	if !bytes.Equal(sender.sent[0], packet) {
-		t.Fatalf("sent packet mismatch: %x != %x", sender.sent[0], packet)
+	tunnel, err := tgp.ParseTunnelDatagram(sender.sent[0])
+	if err != nil {
+		t.Fatalf("parse tunnel datagram: %v", err)
+	}
+	if tunnel.RemoteIP != netip.MustParseAddr("203.0.113.9") || tunnel.RemotePort != 27015 {
+		t.Fatalf("unexpected tunnel target: %#v", tunnel)
+	}
+	if !bytes.Equal(tunnel.Payload, []byte("hello")) {
+		t.Fatalf("sent payload mismatch: %q", tunnel.Payload)
 	}
 }
 
@@ -53,4 +68,17 @@ func (s *fakeTGPPacketSender) SendPacket(_ context.Context, streamID tgp.StreamI
 	s.streams = append(s.streams, streamID)
 	s.sent = append(s.sent, append([]byte(nil), payload...))
 	return nil
+}
+
+func makeIPv4UDPPacket(payload []byte) []byte {
+	packet := make([]byte, 20+8+len(payload))
+	packet[0] = 0x45
+	packet[9] = 17
+	copy(packet[12:16], []byte{198, 18, 0, 2})
+	copy(packet[16:20], []byte{203, 0, 113, 9})
+	binary.BigEndian.PutUint16(packet[20:22], 53000)
+	binary.BigEndian.PutUint16(packet[22:24], 27015)
+	binary.BigEndian.PutUint16(packet[24:26], uint16(8+len(payload)))
+	copy(packet[28:], payload)
+	return packet
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 
+	"github.com/tachyon-space/tachyon-core/internal/pidtrack"
 	"github.com/tachyon-space/tachyon-core/internal/pipeline"
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
@@ -31,14 +33,33 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 		if h.tgp == nil {
 			return errors.New("tgp handler is not configured")
 		}
-		if err := h.tgp.SendPacket(ctx, capturedPacketStream, packet); err != nil {
+		if decision.Flow.Transport != pidtrack.TransportUDP {
+			return errors.New("tgp handler received non-UDP packet")
+		}
+		flow, udpPayload, err := pipeline.ExtractUDPPayload(packet)
+		if err != nil {
+			return err
+		}
+		remoteIP, err := netip.ParseAddr(flow.RemoteIP)
+		if err != nil {
+			return err
+		}
+		tunnelPayload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+			RemoteIP:   remoteIP,
+			RemotePort: flow.RemotePort,
+			Payload:    udpPayload,
+		})
+		if err != nil {
+			return err
+		}
+		if err := h.tgp.SendPacket(ctx, capturedPacketStream, tunnelPayload); err != nil {
 			return err
 		}
 		logger.Debug("packet sent via TGP",
 			"process", decision.Process.Name,
 			"remote", decision.Flow.RemoteIP,
 			"remote_port", decision.Flow.RemotePort,
-			"bytes", len(packet),
+			"bytes", len(udpPayload),
 		)
 	case pipeline.ActionDrop:
 		logger.Debug("packet dropped by route decision",

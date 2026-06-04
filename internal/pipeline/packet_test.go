@@ -31,6 +31,29 @@ func TestParseIPv4UDPFlow(t *testing.T) {
 	}
 }
 
+func TestExtractIPv4UDPPayload(t *testing.T) {
+	packet := make([]byte, 20+8+5)
+	packet[0] = 0x45
+	packet[9] = 17
+	copy(packet[12:16], []byte{198, 18, 0, 2})
+	copy(packet[16:20], []byte{203, 0, 113, 9})
+	binary.BigEndian.PutUint16(packet[20:22], 53000)
+	binary.BigEndian.PutUint16(packet[22:24], 27015)
+	binary.BigEndian.PutUint16(packet[24:26], 13)
+	copy(packet[28:], []byte("hello"))
+
+	flow, payload, err := ExtractUDPPayload(packet)
+	if err != nil {
+		t.Fatalf("extract udp payload: %v", err)
+	}
+	if flow.RemoteIP != "203.0.113.9" || flow.RemotePort != 27015 {
+		t.Fatalf("unexpected flow: %#v", flow)
+	}
+	if string(payload) != "hello" {
+		t.Fatalf("unexpected payload: %q", payload)
+	}
+}
+
 func TestParseIPv6TCPFlow(t *testing.T) {
 	packet := make([]byte, 40+20)
 	packet[0] = 0x60

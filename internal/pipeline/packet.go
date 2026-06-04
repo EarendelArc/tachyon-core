@@ -30,6 +30,21 @@ func ParseFlow(packet []byte) (pidtrack.FlowKey, error) {
 	}
 }
 
+func ExtractUDPPayload(packet []byte) (pidtrack.FlowKey, []byte, error) {
+	if len(packet) < 1 {
+		return pidtrack.FlowKey{}, nil, ErrPacketTooShort
+	}
+
+	switch packet[0] >> 4 {
+	case 4:
+		return extractIPv4UDPPayload(packet)
+	case 6:
+		return extractIPv6UDPPayload(packet)
+	default:
+		return pidtrack.FlowKey{}, nil, ErrUnsupportedIP
+	}
+}
+
 func parseIPv4Flow(packet []byte) (pidtrack.FlowKey, error) {
 	if len(packet) < 20 {
 		return pidtrack.FlowKey{}, ErrPacketTooShort
@@ -56,6 +71,25 @@ func parseIPv4Flow(packet []byte) (pidtrack.FlowKey, error) {
 	}, nil
 }
 
+func extractIPv4UDPPayload(packet []byte) (pidtrack.FlowKey, []byte, error) {
+	flow, err := parseIPv4Flow(packet)
+	if err != nil {
+		return pidtrack.FlowKey{}, nil, err
+	}
+	if flow.Transport != pidtrack.TransportUDP {
+		return pidtrack.FlowKey{}, nil, ErrUnsupportedProtocol
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+8 {
+		return pidtrack.FlowKey{}, nil, ErrPacketTooShort
+	}
+	udpLen := int(binary.BigEndian.Uint16(packet[ihl+4 : ihl+6]))
+	if udpLen < 8 || len(packet) < ihl+udpLen {
+		return pidtrack.FlowKey{}, nil, ErrPacketTooShort
+	}
+	return flow, append([]byte(nil), packet[ihl+8:ihl+udpLen]...), nil
+}
+
 func parseIPv6Flow(packet []byte) (pidtrack.FlowKey, error) {
 	if len(packet) < 44 {
 		return pidtrack.FlowKey{}, ErrPacketTooShort
@@ -80,6 +114,24 @@ func parseIPv6Flow(packet []byte) (pidtrack.FlowKey, error) {
 		RemoteIP:   dst.String(),
 		RemotePort: binary.BigEndian.Uint16(packet[42:44]),
 	}, nil
+}
+
+func extractIPv6UDPPayload(packet []byte) (pidtrack.FlowKey, []byte, error) {
+	flow, err := parseIPv6Flow(packet)
+	if err != nil {
+		return pidtrack.FlowKey{}, nil, err
+	}
+	if flow.Transport != pidtrack.TransportUDP {
+		return pidtrack.FlowKey{}, nil, ErrUnsupportedProtocol
+	}
+	if len(packet) < 48 {
+		return pidtrack.FlowKey{}, nil, ErrPacketTooShort
+	}
+	udpLen := int(binary.BigEndian.Uint16(packet[44:46]))
+	if udpLen < 8 || len(packet) < 40+udpLen {
+		return pidtrack.FlowKey{}, nil, ErrPacketTooShort
+	}
+	return flow, append([]byte(nil), packet[48:40+udpLen]...), nil
 }
 
 func transportFromIPProtocol(proto byte) (pidtrack.Transport, error) {

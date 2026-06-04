@@ -37,6 +37,7 @@ import (
 	"github.com/tachyon-space/tachyon-core/internal/pidtrack"
 	"github.com/tachyon-space/tachyon-core/internal/pipeline"
 	"github.com/tachyon-space/tachyon-core/internal/routing"
+	"github.com/tachyon-space/tachyon-core/internal/tgp"
 	"github.com/tachyon-space/tachyon-core/internal/tun"
 )
 
@@ -139,14 +140,29 @@ func (a *App) runClient(ctx context.Context) error {
 	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
 
 	// TODO M2: start Xray subprocess runner
-	// TODO M3: start TGP client session manager
+	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
+		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
+		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
+		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("create TGP client manager: %w", err)
+	}
+	defer func() {
+		if err := tgpManager.Close(); err != nil {
+			a.logger.Warn("close TGP client manager", "error", err)
+		}
+	}()
 
 	packetPipeline := pipeline.New(pipeline.Options{
 		Device:  tunDevice,
 		Tracker: tracker,
 		Router:  packetRouter,
-		Handler: pipeline.LoggingHandler{Logger: a.logger},
-		Logger:  a.logger,
+		Handler: clientPacketHandler{
+			logger: a.logger,
+			tgp:    tgpManager,
+		},
+		Logger: a.logger,
 	})
 	go func() {
 		a.logger.Info("TUN packet pipeline running")
@@ -223,6 +239,13 @@ func clientHTTPAddr(cfg config.IPCConfig) string {
 		return value
 	}
 	return "127.0.0.1:55123"
+}
+
+func clientTGPRemoteAddr(cfg config.ProxyConfig) string {
+	if value := strings.TrimSpace(cfg.TGPServerAddr); value != "" {
+		return value
+	}
+	return strings.TrimSpace(cfg.ServerAddr)
 }
 
 func defaultRoutingStorePath() string {

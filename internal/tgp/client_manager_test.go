@@ -1,0 +1,116 @@
+package tgp
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"testing"
+	"time"
+)
+
+func TestClientManagerDialsOnceAndSends(t *testing.T) {
+	session := &fakeSession{state: SessionEstablished}
+	dials := 0
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		Dial: func(context.Context, string, net.Addr, float64) (Session, error) {
+			dials++
+			return session, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := manager.SendPacket(ctx, 1, []byte("one")); err != nil {
+		t.Fatalf("send one: %v", err)
+	}
+	if err := manager.SendPacket(ctx, 1, []byte("two")); err != nil {
+		t.Fatalf("send two: %v", err)
+	}
+	if dials != 1 {
+		t.Fatalf("expected one dial, got %d", dials)
+	}
+	if len(session.sent) != 2 || !bytes.Equal(session.sent[1], []byte("two")) {
+		t.Fatalf("unexpected sent payloads: %#v", session.sent)
+	}
+}
+
+func TestClientManagerLoopbackHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	serverTransport, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	serverCh := make(chan *DatagramSession, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		server, err := AcceptSession(ctx, serverTransport, 100000)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		serverCh <- server
+	}()
+
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr:       serverTransport.LocalAddr().String(),
+		LocalAddr:        "127.0.0.1:0",
+		PacerPPS:         100000,
+		HandshakeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	defer manager.Close()
+
+	payload := []byte("raw captured ip packet")
+	if err := manager.SendPacket(ctx, 0, payload); err != nil {
+		t.Fatalf("manager send: %v", err)
+	}
+
+	var server *DatagramSession
+	select {
+	case server = <-serverCh:
+	case err := <-errCh:
+		t.Fatalf("server accept: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("server accept timeout: %v", ctx.Err())
+	}
+	defer server.Close()
+
+	got, err := server.RecvPacket(ctx, 0)
+	if err != nil {
+		t.Fatalf("server recv: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %q, want %q", got, payload)
+	}
+}
+
+type fakeSession struct {
+	state SessionState
+	sent  [][]byte
+}
+
+func (s *fakeSession) ID() SessionID { return SessionID{} }
+func (s *fakeSession) State() SessionState {
+	if s.state == 0 {
+		return SessionEstablished
+	}
+	return s.state
+}
+func (s *fakeSession) SendPacket(_ context.Context, _ StreamID, payload []byte) error {
+	s.sent = append(s.sent, append([]byte(nil), payload...))
+	return nil
+}
+func (s *fakeSession) RecvPacket(context.Context, StreamID) ([]byte, error) { return nil, nil }
+func (s *fakeSession) Migrate(context.Context, net.Addr) error              { return nil }
+func (s *fakeSession) Close() error {
+	s.state = SessionClosed
+	return nil
+}
+func (s *fakeSession) Stats() SessionStats { return SessionStats{} }

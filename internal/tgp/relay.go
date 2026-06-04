@@ -90,10 +90,12 @@ func (r *Relay) ListenAndServe(ctx context.Context) error {
 			Session:   session,
 			Payload:   append([]byte(nil), payload...),
 		}
-		if err := r.handler.HandleRelayPacket(ctx, packet); err != nil {
-			return fmt.Errorf("handle relay packet: %w", err)
-		}
+		go r.handlePacket(ctx, packet)
 	}
+}
+
+func (r *Relay) handlePacket(ctx context.Context, packet RelayPacket) {
+	_ = r.handler.HandleRelayPacket(ctx, packet)
 }
 
 func (r *Relay) LocalAddr() net.Addr {

@@ -9,6 +9,7 @@
 - 手动配置拥有最高优先级。
 - Steam 本体不会被当成游戏进程。
 - Steam 子进程游戏，以及 `steamapps/common` 下的可执行文件，可以被识别为游戏流量。
+- Steam 游戏库扫描会解析 `libraryfolders.vdf` 和 `appmanifest_*.acf`，先生成建议，再由用户确认创建手动配置。
 - 游戏 UDP 默认走 TGP。
 - 游戏 TCP 默认使用 auto，让登录、商店、下载等流量继续按普通规则选择 Xray 或直连。
 

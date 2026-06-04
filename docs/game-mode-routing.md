@@ -12,6 +12,8 @@ falling back to generic routing.
 - Steam itself is not treated as a game process.
 - Steam child games and executables under `steamapps/common` may be treated as
   game traffic.
+- Steam library scanning parses `libraryfolders.vdf` and `appmanifest_*.acf`
+  as suggestions before creating manual profiles.
 - Game UDP defaults to TGP.
 - Game TCP defaults to auto, allowing login and store traffic to use Xray or
   direct routing according to normal rules.

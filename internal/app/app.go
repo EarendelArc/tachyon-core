@@ -139,7 +139,10 @@ func (a *App) runClient(ctx context.Context) error {
 
 	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
 
-	// TODO M2: start Xray subprocess runner
+	xrayRunner, err := a.startClientXray(ctx)
+	if err != nil {
+		return fmt.Errorf("start client xray: %w", err)
+	}
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
 		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
@@ -193,6 +196,7 @@ func (a *App) runClient(ctx context.Context) error {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
 	}
+	stopXray(shutdownCtx, xrayRunner, a.logger)
 	if err := a.shutdownClient(shutdownCtx); err != nil {
 		return err
 	}
@@ -294,8 +298,11 @@ func (a *App) runServer(ctx context.Context) error {
 		"xray_backend", a.cfg.Server.XrayBackend.Addr,
 	)
 
-	// TODO M2: start Xray subprocess (server config)
 	// TODO M3: start port-443 multiplexer
+	xrayRunner, err := a.startServerXray(ctx)
+	if err != nil {
+		return fmt.Errorf("start server xray: %w", err)
+	}
 
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
 		ListenAddr: a.cfg.Server.Listen,
@@ -339,6 +346,7 @@ func (a *App) runServer(ctx context.Context) error {
 	if err := tgpRelay.Close(); err != nil {
 		a.logger.Warn("shutdown TGP relay", "error", err)
 	}
+	stopXray(shutdownCtx, xrayRunner, a.logger)
 	if err := a.shutdownServer(shutdownCtx); err != nil {
 		return err
 	}

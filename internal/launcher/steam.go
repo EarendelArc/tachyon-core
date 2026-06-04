@@ -2,8 +2,11 @@ package launcher
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -20,6 +23,71 @@ type SteamAppManifest struct {
 	Universe    string `json:"universe"`
 	StateFlags  uint32 `json:"stateFlags"`
 	LibraryPath string `json:"libraryPath"`
+}
+
+type SteamScanner struct{}
+
+func NewSteamScanner() *SteamScanner {
+	return &SteamScanner{}
+}
+
+func (s *SteamScanner) Scan(ctx context.Context, steamRoot string) ([]SteamAppManifest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	libraryFile := filepath.Join(steamRoot, "steamapps", "libraryfolders.vdf")
+	file, err := os.Open(libraryFile)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	folders, err := ParseSteamLibraryFolders(file)
+	if err != nil {
+		return nil, err
+	}
+	if !containsLibraryPath(folders, steamRoot) {
+		folders = append([]SteamLibraryFolder{{Path: steamRoot}}, folders...)
+	}
+
+	var manifests []SteamAppManifest
+	for _, folder := range folders {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		apps, err := scanSteamAppManifests(folder.Path)
+		if err != nil {
+			continue
+		}
+		manifests = append(manifests, apps...)
+	}
+
+	return manifests, nil
+}
+
+func scanSteamAppManifests(libraryPath string) ([]SteamAppManifest, error) {
+	pattern := filepath.Join(libraryPath, "steamapps", "appmanifest_*.acf")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	var manifests []SteamAppManifest
+	for _, path := range files {
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		manifest, err := ParseSteamAppManifest(file)
+		_ = file.Close()
+		if err != nil {
+			continue
+		}
+		manifest.LibraryPath = libraryPath
+		manifests = append(manifests, manifest)
+	}
+	return manifests, nil
 }
 
 func ParseSteamLibraryFolders(r io.Reader) ([]SteamLibraryFolder, error) {
@@ -63,6 +131,20 @@ func ParseSteamLibraryFolders(r io.Reader) ([]SteamLibraryFolder, error) {
 	}
 
 	return folders, nil
+}
+
+func containsLibraryPath(folders []SteamLibraryFolder, path string) bool {
+	normalized := normalizePath(path)
+	for _, folder := range folders {
+		if normalizePath(folder.Path) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizePath(path string) string {
+	return strings.ToLower(filepath.Clean(path))
 }
 
 func ParseSteamAppManifest(r io.Reader) (SteamAppManifest, error) {
@@ -141,9 +223,15 @@ func quotedTokens(line string) []string {
 		if end < 0 {
 			return tokens
 		}
-		tokens = append(tokens, line[:end])
+		tokens = append(tokens, unescapeVDFString(line[:end]))
 		line = line[end+1:]
 	}
+}
+
+func unescapeVDFString(value string) string {
+	value = strings.ReplaceAll(value, `\\`, `\`)
+	value = strings.ReplaceAll(value, `\"`, `"`)
+	return value
 }
 
 func matchingClose(tokens []string, openIdx int) int {

@@ -288,17 +288,49 @@ func (a *App) runServer(ctx context.Context) error {
 	)
 
 	// TODO M2: start Xray subprocess (server config)
-	// TODO M3: start TGP relay
 	// TODO M3: start port-443 multiplexer
 
-	a.logger.Info("server subsystems initialised (stubs), waiting for shutdown signal")
-	<-ctx.Done()
-	a.logger.Info("server shutdown initiated", "reason", ctx.Err())
+	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
+		ListenAddr: a.cfg.Server.Listen,
+		PacerPPS:   a.cfg.TGP.Pacing.InitialRatePPS,
+		Handler:    serverRelayHandler{logger: a.logger},
+	})
+	if err != nil {
+		return fmt.Errorf("create TGP relay: %w", err)
+	}
+	defer func() {
+		if err := tgpRelay.Close(); err != nil {
+			a.logger.Warn("close TGP relay", "error", err)
+		}
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		a.logger.Info("TGP relay listening", "addr", a.cfg.Server.Listen)
+		if err := tgpRelay.ListenAndServe(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("TGP relay: %w", err)
+		}
+	}()
+
+	a.logger.Info("server subsystems initialised, waiting for shutdown signal")
+	var runErr error
+	select {
+	case <-ctx.Done():
+		a.logger.Info("server shutdown initiated", "reason", ctx.Err())
+	case runErr = <-errCh:
+		a.logger.Error("server subsystem failed", "error", runErr)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	return a.shutdownServer(shutdownCtx)
+	if err := tgpRelay.Close(); err != nil {
+		a.logger.Warn("shutdown TGP relay", "error", err)
+	}
+	if err := a.shutdownServer(shutdownCtx); err != nil {
+		return err
+	}
+	return runErr
 }
 
 func (a *App) shutdownServer(ctx context.Context) error {

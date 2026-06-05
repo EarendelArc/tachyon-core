@@ -1,8 +1,8 @@
 // Package config defines the unified configuration schema for tachyon-core.
 //
 // A single tachyon-core binary can operate in two modes:
-//   - "client"  TUN stack + PID routing + Xray/TGP client session
-//   - "server"  Port multiplexer + Xray backend + TGP relay
+//   - "client"  TUN stack + PID routing + TGP client session
+//   - "server"  TGP relay
 //
 // The mode is selected by the top-level Mode field. Shared subsystems
 // (TGP protocol parameters, observability) live at the top level.
@@ -46,9 +46,6 @@ type Config struct {
 
 	// TGP contains settings shared between client and server TGP paths.
 	TGP TGPConfig `yaml:"tgp" json:"tgp"`
-
-	// Xray contains settings for managing the xray-core binary.
-	Xray XrayConfig `yaml:"xray" json:"xray"`
 
 	// IPC controls the Prism ↔ Core communication endpoints.
 	// Only meaningful in client mode.
@@ -100,7 +97,7 @@ type TUNConfig struct {
 // RoutingConfig defines how traffic is classified into routing decisions.
 type RoutingConfig struct {
 	// DefaultAction is the fallback when no rule matches.
-	// One of: "xray", "tgp", "direct", "drop". Defaults to "xray".
+	// One of: "tgp", "direct", "drop". Defaults to "direct".
 	DefaultAction string `yaml:"default_action" json:"default_action"`
 
 	// Rules is evaluated in priority order (highest priority first).
@@ -120,24 +117,18 @@ type RouteRule struct {
 	Protocol     string `yaml:"protocol,omitempty" json:"protocol,omitempty"`         // "tcp" or "udp"
 
 	// Action to take when matched.
-	// One of: "xray", "tgp", "direct", "drop"
+	// One of: "tgp", "direct", "drop"
 	Action string `yaml:"action" json:"action"`
 }
 
-// ProxyConfig describes the upstream Tachyon/Xray server.
+// ProxyConfig describes the upstream Tachyon TGP server.
 type ProxyConfig struct {
-	// ServerAddr is the host:port of the remote server, e.g. "vpn.example.com:443".
+	// ServerAddr is the host:port of the remote TGP server, e.g. "game.example.com:443".
 	ServerAddr string `yaml:"server_addr" json:"server_addr"`
-
-	// VLESSuuid is the VLESS user ID for Xray traffic.
-	VLESSUID string `yaml:"vless_uuid" json:"vless_uuid"`
 
 	// TGPServerAddr is the host:port for TGP game traffic.
 	// If empty, TGP traffic uses ServerAddr.
 	TGPServerAddr string `yaml:"tgp_server_addr,omitempty" json:"tgp_server_addr,omitempty"`
-
-	// SNI overrides the TLS ServerName for Reality handshake.
-	SNI string `yaml:"sni,omitempty" json:"sni,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +143,6 @@ type ServerConfig struct {
 	// TLS configures the server certificate.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
 
-	// XrayBackend is the local address where xray-core is listening.
-	// tachyon-core (server mode) spawns xray-core and proxies TLS flows to it.
-	XrayBackend XrayBackendConfig `yaml:"xray_backend" json:"xray_backend"`
-
 	// Relay configures the UDP relay to upstream game servers.
 	Relay RelayConfig `yaml:"relay" json:"relay"`
 }
@@ -164,12 +151,6 @@ type ServerConfig struct {
 type TLSConfig struct {
 	CertFile string `yaml:"cert" json:"cert"`
 	KeyFile  string `yaml:"key" json:"key"`
-}
-
-// XrayBackendConfig tells tachyon-core (server) where xray is listening locally.
-type XrayBackendConfig struct {
-	// Addr is the local TCP address of the xray inbound, e.g. "127.0.0.1:18443".
-	Addr string `yaml:"addr" json:"addr"`
 }
 
 // RelayConfig controls the UDP relay behaviour.
@@ -223,21 +204,6 @@ type PacingConfig struct {
 
 	// MaxRatePPS is the hard ceiling.
 	MaxRatePPS float64 `yaml:"max_rate_pps" json:"max_rate_pps"`
-}
-
-// ---------------------------------------------------------------------------
-// Xray binary management
-// ---------------------------------------------------------------------------
-
-// XrayConfig controls the xray-core binary lifecycle.
-type XrayConfig struct {
-	// InstallDir is the directory where tachyon-core stores the xray binary.
-	// Defaults to <data_dir>/xray/
-	InstallDir string `yaml:"install_dir,omitempty" json:"install_dir,omitempty"`
-
-	// ConfigFile is the path to the xray JSON config that tachyon-core generates.
-	// Defaults to <data_dir>/xray/config.json
-	ConfigFile string `yaml:"config_file,omitempty" json:"config_file,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +284,6 @@ func resolveRelativePaths(configPath string, cfg *Config) {
 
 	cfg.Server.TLS.CertFile = resolvePath(baseDir, cfg.Server.TLS.CertFile)
 	cfg.Server.TLS.KeyFile = resolvePath(baseDir, cfg.Server.TLS.KeyFile)
-	cfg.Xray.InstallDir = resolvePath(baseDir, cfg.Xray.InstallDir)
-	cfg.Xray.ConfigFile = resolvePath(baseDir, cfg.Xray.ConfigFile)
 	cfg.Observability.LogFile = resolvePath(baseDir, cfg.Observability.LogFile)
 }
 
@@ -342,14 +306,11 @@ func defaults() *Config {
 				DNSHijack: true,
 			},
 			Routing: RoutingConfig{
-				DefaultAction: "xray",
+				DefaultAction: "direct",
 			},
 		},
 		Server: ServerConfig{
 			Listen: ":443",
-			XrayBackend: XrayBackendConfig{
-				Addr: "127.0.0.1:18443",
-			},
 			Relay: RelayConfig{
 				DialTimeout: 5 * time.Second,
 				IdleTimeout: 60 * time.Second,
@@ -391,11 +352,6 @@ func (c *Config) Validate() error {
 	if c.Mode == ModeClient {
 		if c.Client.Proxy.ServerAddr == "" {
 			return fmt.Errorf("client.proxy.server_addr is required in client mode")
-		}
-	}
-	if c.Mode == ModeServer {
-		if c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "" {
-			return fmt.Errorf("server.tls.cert and server.tls.key are required in server mode")
 		}
 	}
 	if c.TGP.FEC.DataShards < 1 {

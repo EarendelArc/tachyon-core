@@ -2,8 +2,8 @@
 
 [English](README.md)
 
-Tachyon Core 是 Tachyon 的无头网络核心守护进程。它采用类似 xray-core 的
-运行模型：一个二进制文件、两种运行模式、显式 JSON 配置。
+Tachyon Core 是 Tachyon 的无头 UDP 游戏加速守护进程。它采用一个二进制文件、
+两种运行模式和显式 JSON 配置。
 
 ```bash
 tachyon-core run --config client.json
@@ -12,28 +12,25 @@ tachyon-core run --config server.json
 
 ## 边界划分
 
-- Prism 负责订阅获取、订阅解析、节点选择，以及后续生成 Core/Xray 可消费的
-  配置。
-- Core 负责流量接管、基于进程的路由、Xray 子进程生命周期、TGP 传输和服务端
-  Relay 行为。
-- Xray-core 永远不会被编译进 Core，只会作为外部二进制被下载、校验和启动。
-- TCP 代理流量与 UDP 游戏流量端到端走完全独立的传输路径。
+- Prism 负责订阅获取、订阅解析、节点选择、Xray 生命周期、Xray JSON 生成和桌面端
+  总控编排。
+- Core 只负责 UDP 游戏加速路径：流量接管、基于进程的游戏路由、TGP 传输和服务端
+  TGP Relay 行为。
+- Tachyon Core 内部不再有 Xray 的运行时或编译期依赖。
+- TCP 代理流量属于 Prism/Xray，UDP 游戏流量属于 Tachyon Core/TGP。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
-- Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析，包括
-  `xray.config_file`。
+- Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析。
 
 ## 架构
 
 ```text
 客户端模式
   TUN 虚拟网卡 -> PID 追踪器 -> 路由引擎
-    TCP 网页流量  -> 本地 Xray 子进程
     UDP 游戏流量  -> TGP 客户端会话
+    TCP/代理流量  -> Core 忽略，由 Prism/Xray 负责
 
 服务端模式
-  :443 TCP/UDP 监听
-    TLS ClientHello -> 本地 Xray 后端
-    TGP/DTLS 包     -> TGP Relay
+  UDP 监听 -> TGP Relay -> 真实游戏服务器
 ```
 
 ## 当前进度
@@ -50,8 +47,6 @@ tachyon-core run --config server.json
 | macOS TUN | 已完成 |
 | Windows TUN | 存根 |
 | macOS PID 追踪 | 存根 |
-| Xray 子进程 Runner | 已完成 |
-| Xray 客户端配置生成 | 已完成 |
 | TGP X25519 握手与 AEAD | 已完成 |
 | TGP UDP Relay 骨架 | 已完成 |
 | 客户端 TUN -> 路由 -> TGP 回写测试 | 已完成 |
@@ -70,14 +65,11 @@ mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.js
 ## 服务端部署
 
 ```bash
-sudo bash scripts/install-server.sh \
-  --domain vpn.example.com \
-  --email admin@example.com
+sudo bash scripts/install-server.sh --port 443
 
-sudo bash scripts/install-server-docker.sh \
-  --domain vpn.example.com \
-  --email admin@example.com
+sudo bash scripts/install-server-docker.sh --port 443
 ```
 
-Prism/Core IPC 设计见 [docs/ipc-api.md](docs/ipc-api.md)，TGP 协议格式见
+Prism/Core IPC 设计见 [docs/ipc-api.md](docs/ipc-api.md) 和
+[docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)，TGP 协议格式见
 [docs/tgp-spec.md](docs/tgp-spec.md)。

@@ -73,8 +73,8 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 			"remote", decision.Flow.RemoteIP,
 			"remote_port", decision.Flow.RemotePort,
 		)
-	case pipeline.ActionDirect, pipeline.ActionXray:
-		logger.Debug("packet route decision pending transport implementation",
+	case pipeline.ActionDirect:
+		logger.Debug("packet route decision bypassed by core",
 			"action", decision.Action,
 			"reason", decision.Reason,
 			"process", decision.Process.Name,

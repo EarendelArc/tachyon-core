@@ -14,9 +14,7 @@ func TestLoadJSONConfig(t *testing.T) {
   "mode": "client",
   "client": {
     "proxy": {
-      "server_addr": "vpn.example.com:443",
-      "vless_uuid": "00000000-0000-0000-0000-000000000000",
-      "sni": "vpn.example.com"
+      "server_addr": "game.example.com:443"
     }
   },
   "tgp": {
@@ -43,7 +41,7 @@ func TestLoadJSONConfig(t *testing.T) {
 	if cfg.Mode != ModeClient {
 		t.Fatalf("mode = %q, want %q", cfg.Mode, ModeClient)
 	}
-	if cfg.Client.Proxy.ServerAddr != "vpn.example.com:443" {
+	if cfg.Client.Proxy.ServerAddr != "game.example.com:443" {
 		t.Fatalf("server addr = %q", cfg.Client.Proxy.ServerAddr)
 	}
 	if cfg.TGP.HandshakeTimeout != 5*time.Second {
@@ -92,12 +90,8 @@ func TestLoadResolvesRelativePathsFromConfigDirectory(t *testing.T) {
   "mode": "client",
   "client": {
     "proxy": {
-      "server_addr": "vpn.example.com:443"
+      "server_addr": "game.example.com:443"
     }
-  },
-  "xray": {
-    "install_dir": "xray-bin",
-    "config_file": "xray-client.json"
   },
   "observability": {
     "log_file": "logs/tachyon.log"
@@ -112,8 +106,6 @@ func TestLoadResolvesRelativePathsFromConfigDirectory(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	assertPath(t, cfg.Xray.InstallDir, filepath.Join(dir, "xray-bin"))
-	assertPath(t, cfg.Xray.ConfigFile, filepath.Join(dir, "xray-client.json"))
 	assertPath(t, cfg.Observability.LogFile, filepath.Join(dir, "logs", "tachyon.log"))
 }
 
@@ -122,7 +114,6 @@ func TestLoadKeepsAbsolutePaths(t *testing.T) {
 	path := filepath.Join(dir, "server.json")
 	certPath := filepath.Join(dir, "certs", "fullchain.pem")
 	keyPath := filepath.Join(dir, "certs", "key.pem")
-	xrayConfigPath := filepath.Join(dir, "xray", "server.json")
 	data := []byte(`{
   "mode": "server",
   "server": {
@@ -130,9 +121,6 @@ func TestLoadKeepsAbsolutePaths(t *testing.T) {
       "cert": ` + quoteJSON(certPath) + `,
       "key": ` + quoteJSON(keyPath) + `
     }
-  },
-  "xray": {
-    "config_file": ` + quoteJSON(xrayConfigPath) + `
   }
 }`)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -146,7 +134,6 @@ func TestLoadKeepsAbsolutePaths(t *testing.T) {
 
 	assertPath(t, cfg.Server.TLS.CertFile, certPath)
 	assertPath(t, cfg.Server.TLS.KeyFile, keyPath)
-	assertPath(t, cfg.Xray.ConfigFile, xrayConfigPath)
 }
 
 func assertPath(t *testing.T, got string, want string) {

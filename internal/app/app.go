@@ -5,19 +5,16 @@
 //
 // Startup order (client mode):
 //  1. Observability (metrics endpoint, logger)
-//  2. Xray binary verification / download prompt
-//  3. TUN device creation
-//  4. PID tracker
-//  5. Routing engine (loads rules)
-//  6. Xray subprocess runner
-//  7. IPC server (gRPC + WebSocket) — Prism can connect now
-//  8. TUN pipeline starts forwarding packets
+//  2. TUN device creation
+//  3. PID tracker
+//  4. Routing engine (loads rules)
+//  5. IPC server for Prism control
+//  6. TGP client session
+//  7. TUN pipeline starts forwarding game UDP packets
 //
 // Startup order (server mode):
 //  1. Observability
-//  2. Xray subprocess runner (server config)
-//  3. TGP relay
-//  4. Port 443 multiplexer → dispatches to Xray backend or TGP relay
+//  2. TGP relay
 package app
 
 import (
@@ -139,10 +136,6 @@ func (a *App) runClient(ctx context.Context) error {
 
 	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
 
-	xrayRunner, err := a.startClientXray(ctx)
-	if err != nil {
-		return fmt.Errorf("start client xray: %w", err)
-	}
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
 		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
@@ -196,7 +189,6 @@ func (a *App) runClient(ctx context.Context) error {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
 	}
-	stopXray(shutdownCtx, xrayRunner, a.logger)
 	if err := a.shutdownClient(shutdownCtx); err != nil {
 		return err
 	}
@@ -205,7 +197,6 @@ func (a *App) runClient(ctx context.Context) error {
 			"packets", stats.PacketsRead,
 			"unsupported", stats.Unsupported,
 			"lookup_errors", stats.LookupErrors,
-			"xray", stats.DecidedXray,
 			"tgp", stats.DecidedTGP,
 			"direct", stats.DecidedDirect,
 			"drop", stats.DecidedDrop,
@@ -293,16 +284,7 @@ func refreshRoutingEngine(ctx context.Context, service *routing.Service, router 
 // ---------------------------------------------------------------------------
 
 func (a *App) runServer(ctx context.Context) error {
-	a.logger.Info("starting in server mode",
-		"listen", a.cfg.Server.Listen,
-		"xray_backend", a.cfg.Server.XrayBackend.Addr,
-	)
-
-	// TODO M3: start port-443 multiplexer
-	xrayRunner, err := a.startServerXray(ctx)
-	if err != nil {
-		return fmt.Errorf("start server xray: %w", err)
-	}
+	a.logger.Info("starting in server mode", "listen", a.cfg.Server.Listen)
 
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
 		ListenAddr: a.cfg.Server.Listen,
@@ -346,7 +328,6 @@ func (a *App) runServer(ctx context.Context) error {
 	if err := tgpRelay.Close(); err != nil {
 		a.logger.Warn("shutdown TGP relay", "error", err)
 	}
-	stopXray(shutdownCtx, xrayRunner, a.logger)
 	if err := a.shutdownServer(shutdownCtx); err != nil {
 		return err
 	}

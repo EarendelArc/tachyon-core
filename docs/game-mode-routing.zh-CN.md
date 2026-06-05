@@ -12,7 +12,8 @@
 - Steam 子进程游戏，以及 `steamapps/common` 下的可执行文件，可以作为游戏配置建议。
 - Steam 游戏库扫描会解析 `libraryfolders.vdf` 和 `appmanifest_*.acf`，再由 Prism 让用户确认添加。
 - 游戏 UDP 默认走 TGP。
-- 游戏 TCP 默认使用 `auto`，让登录、商店和下载等流量继续按普通规则选择 Xray 或直连。
+- 游戏 TCP 默认使用 `auto`；Core 不代理 TCP。登录、商店、下载等 TCP 代理流量由
+  Prism/Xray 负责。
 
 ## 存储示例
 

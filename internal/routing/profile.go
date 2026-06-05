@@ -22,7 +22,6 @@ type TCPPolicy string
 
 const (
 	TCPPolicyAuto   TCPPolicy = "auto"
-	TCPPolicyXray   TCPPolicy = "xray"
 	TCPPolicyDirect TCPPolicy = "direct"
 	TCPPolicyBlock  TCPPolicy = "block"
 )

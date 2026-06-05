@@ -213,7 +213,7 @@ func validUDPPolicy(policy UDPPolicy) bool {
 }
 
 func validTCPPolicy(policy TCPPolicy) bool {
-	return slices.Contains([]TCPPolicy{TCPPolicyAuto, TCPPolicyXray, TCPPolicyDirect, TCPPolicyBlock}, policy)
+	return slices.Contains([]TCPPolicy{TCPPolicyAuto, TCPPolicyDirect, TCPPolicyBlock}, policy)
 }
 
 func cloneConfig(cfg Config) Config {

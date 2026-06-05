@@ -29,7 +29,6 @@ type Stats struct {
 	PacketsRead   uint64
 	Unsupported   uint64
 	LookupErrors  uint64
-	DecidedXray   uint64
 	DecidedTGP    uint64
 	DecidedDirect uint64
 	DecidedDrop   uint64
@@ -102,7 +101,6 @@ func (p *Pipeline) Snapshot() Stats {
 		PacketsRead:   atomic.LoadUint64(&p.stats.PacketsRead),
 		Unsupported:   atomic.LoadUint64(&p.stats.Unsupported),
 		LookupErrors:  atomic.LoadUint64(&p.stats.LookupErrors),
-		DecidedXray:   atomic.LoadUint64(&p.stats.DecidedXray),
 		DecidedTGP:    atomic.LoadUint64(&p.stats.DecidedTGP),
 		DecidedDirect: atomic.LoadUint64(&p.stats.DecidedDirect),
 		DecidedDrop:   atomic.LoadUint64(&p.stats.DecidedDrop),
@@ -135,8 +133,6 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 
 func (p *Pipeline) countDecision(action Action) {
 	switch action {
-	case ActionXray:
-		atomic.AddUint64(&p.stats.DecidedXray, 1)
 	case ActionTGP:
 		atomic.AddUint64(&p.stats.DecidedTGP, 1)
 	case ActionDirect:

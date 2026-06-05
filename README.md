@@ -2,8 +2,8 @@
 
 [中文说明](README.zh-CN.md)
 
-Tachyon Core is the headless network daemon for Tachyon. It follows the
-xray-core operating model: one binary, two modes, explicit JSON configuration.
+Tachyon Core is the headless UDP game acceleration daemon for Tachyon. It uses
+one binary with two modes and explicit JSON configuration.
 
 ```bash
 tachyon-core run --config client.json
@@ -12,30 +12,28 @@ tachyon-core run --config server.json
 
 ## Design Boundary
 
-- Prism owns subscription retrieval, subscription parsing, node selection, and
-  future Core/Xray config generation.
-- Core owns packet capture, process-aware routing, Xray subprocess lifecycle,
-  TGP transport, and server relay behavior.
-- Xray-core is never compiled into Tachyon Core. It is downloaded, verified, and
-  launched as an external subprocess.
-- TCP proxy traffic and UDP game traffic use separate end-to-end paths.
+- Prism owns subscription retrieval, subscription parsing, node selection,
+  Xray lifecycle, Xray JSON generation, and desktop orchestration.
+- Core owns only the UDP game acceleration path: packet capture, process-aware
+  game routing, TGP transport, and TGP server relay behavior.
+- Xray has no runtime or build-time dependency inside Tachyon Core.
+- TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
+  Tachyon Core/TGP.
 - JSON is the canonical Core config format. Legacy YAML is accepted only for
   early developer compatibility.
-- Relative file paths in Core JSON, including `xray.config_file`, are resolved
-  from the directory that contains the loaded config file.
+- Relative file paths in Core JSON are resolved from the directory that contains
+  the loaded config file.
 
 ## Architecture
 
 ```text
 Client mode
   TUN device -> PID tracker -> routing engine
-    TCP web traffic  -> local Xray subprocess
     UDP game traffic -> TGP client session
+    TCP/proxy traffic -> ignored by Core; Prism/Xray owns this path
 
 Server mode
-  :443 TCP/UDP listener
-    TLS ClientHello -> local Xray backend
-    TGP/DTLS packet -> TGP relay
+  UDP listener -> TGP relay -> real game server
 ```
 
 ## Implementation Status
@@ -52,8 +50,6 @@ Server mode
 | macOS TUN | Done |
 | Windows TUN | Stub |
 | macOS PID tracking | Stub |
-| Xray subprocess runner | Done |
-| Xray client config generation | Done |
 | TGP X25519 handshake and AEAD | Done |
 | TGP UDP relay skeleton | Done |
 | Client TUN -> routing -> TGP writeback test | Done |
@@ -72,14 +68,11 @@ mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.js
 ## Server Deployment
 
 ```bash
-sudo bash scripts/install-server.sh \
-  --domain vpn.example.com \
-  --email admin@example.com
+sudo bash scripts/install-server.sh --port 443
 
-sudo bash scripts/install-server-docker.sh \
-  --domain vpn.example.com \
-  --email admin@example.com
+sudo bash scripts/install-server-docker.sh --port 443
 ```
 
-See [docs/ipc-api.md](docs/ipc-api.md) for Prism/Core IPC design notes and
-[docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.
+See [docs/ipc-api.md](docs/ipc-api.md) and
+[docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.
+See [docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.

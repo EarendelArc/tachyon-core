@@ -79,7 +79,7 @@ func TestPipelineTGPRelayWritesResponseToTUN(t *testing.T) {
 	packetPipeline := pipeline.New(pipeline.Options{
 		Device:  device,
 		Tracker: integrationTracker{proc: pidtrack.ProcessInfo{Name: "game.exe"}},
-		Router: pipeline.NewRouter(config.RoutingConfig{DefaultAction: "xray"}, routing.Engine{
+		Router: pipeline.NewRouter(config.RoutingConfig{DefaultAction: "direct"}, routing.Engine{
 			Profiles: []routing.GameProfile{
 				{
 					ID:          "game",

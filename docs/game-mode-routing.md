@@ -15,8 +15,8 @@ back to generic routing.
 - Steam library scanning parses `libraryfolders.vdf` and `appmanifest_*.acf`
   before Prism asks the user to add a profile.
 - Game UDP defaults to TGP.
-- Game TCP defaults to `auto`, allowing login, store, and download traffic to
-  use Xray or direct routing according to normal rules.
+- Game TCP defaults to `auto`; Core does not proxy TCP traffic. Prism/Xray owns
+  login, store, download, and other TCP proxy flows.
 
 ## Store Example
 

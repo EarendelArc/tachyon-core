@@ -179,7 +179,7 @@ const clientConfigTemplate = `{
       "dns_hijack": true
     },
     "routing": {
-      "default_action": "xray",
+      "default_action": "direct",
       "rules": [
         {
           "process_name": "cs2.exe",
@@ -199,9 +199,8 @@ const clientConfigTemplate = `{
       ]
     },
     "proxy": {
-      "server_addr": "your-server.example.com:443",
-      "vless_uuid": "00000000-0000-0000-0000-000000000000",
-      "sni": "your-server.example.com"
+      "server_addr": "your-game-relay.example.com:443",
+      "tgp_server_addr": "your-game-relay.example.com:443"
     }
   },
   "tgp": {
@@ -218,9 +217,6 @@ const clientConfigTemplate = `{
     "multipath": false,
     "handshake_timeout": "5s",
     "session_idle_timeout": "60s"
-  },
-  "xray": {
-    "install_dir": ""
   },
   "ipc": {
     "websocket_addr": "127.0.0.1:9999",
@@ -239,13 +235,6 @@ const serverConfigTemplate = `{
   "mode": "server",
   "server": {
     "listen": ":443",
-    "tls": {
-      "cert": "/etc/tachyon/certs/fullchain.pem",
-      "key": "/etc/tachyon/certs/key.pem"
-    },
-    "xray_backend": {
-      "addr": "127.0.0.1:18443"
-    },
     "relay": {
       "dial_timeout": "5s",
       "idle_timeout": "60s"
@@ -265,10 +254,6 @@ const serverConfigTemplate = `{
     "multipath": true,
     "handshake_timeout": "5s",
     "session_idle_timeout": "300s"
-  },
-  "xray": {
-    "install_dir": "/opt/tachyon/xray/",
-    "config_file": "/etc/tachyon/xray-server.json"
   },
   "observability": {
     "log_level": "info",

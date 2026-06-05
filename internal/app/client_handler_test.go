@@ -52,7 +52,7 @@ func TestClientPacketHandlerSendsTGPDecision(t *testing.T) {
 func TestClientPacketHandlerIgnoresNonTGPDecision(t *testing.T) {
 	sender := &fakeTGPPacketSender{}
 	handler := clientPacketHandler{tgp: sender}
-	for _, action := range []pipeline.Action{pipeline.ActionXray, pipeline.ActionDirect, pipeline.ActionDrop} {
+	for _, action := range []pipeline.Action{pipeline.ActionDirect, pipeline.ActionDrop} {
 		if err := handler.HandlePacket(context.Background(), pipeline.Decision{Action: action}, []byte{1}); err != nil {
 			t.Fatalf("handle %s: %v", action, err)
 		}

@@ -10,7 +10,7 @@ import (
 
 func TestRouterConfigRuleWinsByPriority(t *testing.T) {
 	router := NewRouter(config.RoutingConfig{
-		DefaultAction: "xray",
+		DefaultAction: "direct",
 		Rules: []config.RouteRule{
 			{CIDR: "8.8.8.0/24", Action: "direct", Priority: 10},
 			{Protocol: "udp", Action: "tgp", Priority: 100},
@@ -27,7 +27,7 @@ func TestRouterConfigRuleWinsByPriority(t *testing.T) {
 }
 
 func TestRouterGameProfileRoutesUDPToTGP(t *testing.T) {
-	router := NewRouter(config.RoutingConfig{DefaultAction: "xray"}, routing.Engine{
+	router := NewRouter(config.RoutingConfig{DefaultAction: "direct"}, routing.Engine{
 		Profiles: []routing.GameProfile{
 			{
 				ID:          "game",
@@ -51,7 +51,7 @@ func TestRouterGameProfileRoutesUDPToTGP(t *testing.T) {
 
 func TestRouterManualGameProfileWinsOverConfigRules(t *testing.T) {
 	router := NewRouter(config.RoutingConfig{
-		DefaultAction: "xray",
+		DefaultAction: "direct",
 		Rules: []config.RouteRule{
 			{ProcessName: "game.exe", Action: "direct", Priority: 1000},
 		},

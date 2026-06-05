@@ -14,7 +14,6 @@ import (
 type Action string
 
 const (
-	ActionXray   Action = "xray"
 	ActionTGP    Action = "tgp"
 	ActionDirect Action = "direct"
 	ActionDrop   Action = "drop"
@@ -51,7 +50,7 @@ func NewRouter(cfg config.RoutingConfig, gameEngine routing.Engine) *Router {
 
 	return &Router{
 		rules:         rules,
-		defaultAction: normalizeAction(cfg.DefaultAction, ActionXray),
+		defaultAction: normalizeAction(cfg.DefaultAction, ActionDirect),
 		gameEngine:    gameEngine,
 	}
 }
@@ -145,8 +144,6 @@ func actionFromPolicies(transport pidtrack.Transport, decision routing.Decision)
 
 	if transport == pidtrack.TransportTCP {
 		switch decision.TCPPolicy {
-		case routing.TCPPolicyXray:
-			return ActionXray
 		case routing.TCPPolicyDirect:
 			return ActionDirect
 		case routing.TCPPolicyBlock:
@@ -159,8 +156,6 @@ func actionFromPolicies(transport pidtrack.Transport, decision routing.Decision)
 
 func normalizeAction(raw string, fallback Action) Action {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "xray":
-		return ActionXray
 	case "tgp":
 		return ActionTGP
 	case "direct":

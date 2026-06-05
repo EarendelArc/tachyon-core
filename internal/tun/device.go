@@ -10,7 +10,7 @@
 // A TUN device receives raw IPv4/IPv6 packets from the OS kernel. The TUN
 // pipeline reads these packets, passes them to the userspace TCP/IP stack
 // (gVisor netstack), which reconstructs TCP/UDP streams. The routing engine
-// then decides whether to forward each flow via Xray or TGP.
+// then decides whether to forward game UDP flows via TGP.
 //
 // Ownership model: the caller owns the TUNDevice and must call Close when done.
 // Closing the device releases the OS interface and stops all packet reads.

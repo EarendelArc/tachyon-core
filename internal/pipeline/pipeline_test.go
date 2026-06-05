@@ -51,7 +51,7 @@ func TestPipelineReadsLooksUpAndDecides(t *testing.T) {
 	p := New(Options{
 		Device:  &fakeDevice{packet: packet},
 		Tracker: fakeTracker{proc: pidtrack.ProcessInfo{Name: "game.exe"}},
-		Router: NewRouter(config.RoutingConfig{DefaultAction: "xray"}, routing.Engine{
+		Router: NewRouter(config.RoutingConfig{DefaultAction: "direct"}, routing.Engine{
 			Profiles: []routing.GameProfile{
 				{
 					ID:          "game",

@@ -2,21 +2,20 @@
 
 **版本：** v1.0-draft
 
-**边界：** Tachyon Core 只暴露 UDP 游戏加速控制与遥测。订阅解析、Xray 生命周期、
-Xray JSON 生成和 TCP 代理编排都属于 Tachyon Prism。
+**边界：** Tachyon Core 只暴露 UDP 游戏加速控制与遥测。订阅解析、Xray 生命周期、Xray JSON 生成、TCP 代理编排、持久化游戏配置和启动器扫描都属于 Tachyon Prism。Prism 生成的游戏配置通过 `client.json` 中的 `client.routing.game_profiles` 传给 Core。
 
 ## HTTP Bridge
 
-第一版实现会在 `127.0.0.1:55123` 暴露本地 HTTP JSON bridge。
+当前实现会在 `127.0.0.1:55123` 暴露本地 HTTP JSON bridge。路由配置变更接口仅作为兼容层保留；新的 Prism 会在本地持久化 profiles，并重新生成 Core JSON。
 
 | Method | Path | 用途 |
 | --- | --- | --- |
 | `GET` | `/v1/health` | Core 就绪探测 |
-| `GET` | `/v1/routing/game-profiles` | 列出手动和已保存的游戏配置 |
-| `POST` | `/v1/routing/game-profiles` | 添加手动游戏配置 |
-| `PUT` | `/v1/routing/game-profiles/{id}` | 替换游戏配置 |
-| `DELETE` | `/v1/routing/game-profiles/{id}` | 删除游戏配置 |
-| `GET` | `/v1/launchers/steam/scan?root=...` | 扫描 Steam 游戏库并返回建议 |
+| `GET` | `/v1/routing/game-profiles` | 兼容：列出内存中的游戏配置 |
+| `POST` | `/v1/routing/game-profiles` | 兼容：添加内存游戏配置 |
+| `PUT` | `/v1/routing/game-profiles/{id}` | 兼容：替换内存游戏配置 |
+| `DELETE` | `/v1/routing/game-profiles/{id}` | 兼容：删除内存游戏配置 |
+| `GET` | `/v1/launchers/steam/scan?root=...` | 兼容：旧 Steam 扫描入口 |
 
 ## 路由决策
 
@@ -28,8 +27,7 @@ Core 的路由动作被刻意限制为：
 | `direct` | Core 不处理该流量 |
 | `drop` | 丢弃数据包 |
 
-Core 中没有 `xray` action。任何 Xray 进程、TCP 代理以及订阅出站节点选择都由
-Prism 负责。
+Core 中没有 `xray` action。任何 Xray 进程、TCP 代理以及订阅出站节点选择都由 Prism 负责。
 
 ## 未来遥测事件
 
@@ -70,11 +68,6 @@ package tachyon.core.v1;
 
 service CoreControl {
   rpc GetStatus(StatusRequest) returns (StatusResponse);
-  rpc ListGameProfiles(ListGameProfilesRequest) returns (ListGameProfilesResponse);
-  rpc AddGameProfile(AddGameProfileRequest) returns (GameProfile);
-  rpc UpdateGameProfile(UpdateGameProfileRequest) returns (GameProfile);
-  rpc RemoveGameProfile(RemoveGameProfileRequest) returns (RemoveGameProfileResponse);
-  rpc ScanSteam(ScanSteamRequest) returns (ScanSteamResponse);
   rpc StreamTelemetry(TelemetryRequest) returns (stream TelemetryEvent);
 }
 ```
@@ -85,6 +78,5 @@ service CoreControl {
 | --- | --- |
 | `CORE_NOT_READY` | Core 尚未初始化完成 |
 | `INVALID_CONFIG` | Core JSON 配置校验失败 |
-| `INVALID_PROFILE` | 游戏配置 payload 无效 |
 | `TUN_PERMISSION_DENIED` | 操作系统权限不足，无法创建 TUN 设备 |
 | `TGP_SESSION_FAILED` | TGP 会话握手或传输失败 |

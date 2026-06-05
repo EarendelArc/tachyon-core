@@ -4,21 +4,24 @@
 
 **Boundary:** Tachyon Core exposes only UDP game acceleration controls and
 telemetry. Subscription parsing, Xray lifecycle, Xray JSON generation, and TCP
-proxy orchestration belong to Tachyon Prism.
+proxy orchestration belong to Tachyon Prism. Prism also owns persistent game
+profiles and launcher scanning; generated profiles are passed to Core through
+`client.routing.game_profiles` in `client.json`.
 
 ## HTTP Bridge
 
-The first implementation exposes a local HTTP JSON bridge on
-`127.0.0.1:55123`.
+The current implementation exposes a local HTTP JSON bridge on
+`127.0.0.1:55123`. Routing profile mutation endpoints are compatibility-only;
+new Prism builds persist profiles locally and regenerate Core JSON instead.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/health` | Core readiness probe |
-| `GET` | `/v1/routing/game-profiles` | List manual and stored game profiles |
-| `POST` | `/v1/routing/game-profiles` | Add a manual game profile |
-| `PUT` | `/v1/routing/game-profiles/{id}` | Replace a game profile |
-| `DELETE` | `/v1/routing/game-profiles/{id}` | Remove a game profile |
-| `GET` | `/v1/launchers/steam/scan?root=...` | Scan Steam libraries and return suggestions |
+| `GET` | `/v1/routing/game-profiles` | Compatibility: list in-memory game profiles |
+| `POST` | `/v1/routing/game-profiles` | Compatibility: add an in-memory game profile |
+| `PUT` | `/v1/routing/game-profiles/{id}` | Compatibility: replace an in-memory game profile |
+| `DELETE` | `/v1/routing/game-profiles/{id}` | Compatibility: remove an in-memory game profile |
+| `GET` | `/v1/launchers/steam/scan?root=...` | Compatibility: legacy Steam scan endpoint |
 
 ## Route Decisions
 
@@ -72,11 +75,6 @@ package tachyon.core.v1;
 
 service CoreControl {
   rpc GetStatus(StatusRequest) returns (StatusResponse);
-  rpc ListGameProfiles(ListGameProfilesRequest) returns (ListGameProfilesResponse);
-  rpc AddGameProfile(AddGameProfileRequest) returns (GameProfile);
-  rpc UpdateGameProfile(UpdateGameProfileRequest) returns (GameProfile);
-  rpc RemoveGameProfile(RemoveGameProfileRequest) returns (RemoveGameProfileResponse);
-  rpc ScanSteam(ScanSteamRequest) returns (ScanSteamResponse);
   rpc StreamTelemetry(TelemetryRequest) returns (stream TelemetryEvent);
 }
 ```

@@ -2,26 +2,24 @@
 
 [中文说明](ipc.zh-CN.md)
 
-Prism controls Core through a local gRPC or WebSocket API. The first stable API
-surface is routing profile management.
+Prism controls Core through local IPC for health, lifecycle, route telemetry,
+and TGP session telemetry. Persistent game profile management belongs to Prism.
+Prism writes profiles into Core JSON under `client.routing.game_profiles`.
 
 ```protobuf
-service RoutingService {
-  rpc ListGameProfiles(ListGameProfilesRequest) returns (ListGameProfilesResponse);
-  rpc AddGameProfile(AddGameProfileRequest) returns (GameProfile);
-  rpc UpdateGameProfile(UpdateGameProfileRequest) returns (GameProfile);
-  rpc RemoveGameProfile(RemoveGameProfileRequest) returns (RemoveGameProfileResponse);
-  rpc ScanInstalledGames(ScanInstalledGamesRequest) returns (ScanInstalledGamesResponse);
-  rpc SetProgramGameMode(SetProgramGameModeRequest) returns (SetProgramGameModeResponse);
+service CoreControl {
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  rpc StreamTelemetry(TelemetryRequest) returns (stream TelemetryEvent);
 }
 ```
 
 Manual game profiles must be preserved exactly as entered by the user. Automatic
-scans may add suggestions, but they must not override manual routing choices.
+launcher scans may add suggestions in Prism, but they must not override manual
+routing choices. Core consumes the resulting JSON and makes runtime decisions.
 
 ## HTTP Bridge
 
-The first implementation exposes a small local HTTP JSON bridge on
+The current implementation exposes a small local HTTP JSON bridge on
 `127.0.0.1:55123`:
 
 - `GET /v1/health`
@@ -30,6 +28,5 @@ The first implementation exposes a small local HTTP JSON bridge on
 - `PUT /v1/routing/game-profiles/{id}`
 - `DELETE /v1/routing/game-profiles/{id}`
 
-This bridge is a compatibility layer for early Prism integration. The routing
-service behind it is transport-agnostic and can be reused by gRPC or WebSocket
-handlers.
+The routing endpoints are compatibility-only for early Prism integration. New
+Prism builds own persistence locally and regenerate `client.json` instead.

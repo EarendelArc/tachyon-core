@@ -1,9 +1,9 @@
 # Release Process
 
 Tachyon Core releases are published by GitHub Actions from this repository.
-Releases are currently alpha-quality because Windows TUN and macOS PID tracking
-are not complete yet, but the artifacts are useful for Prism-managed downloads
-and integration testing.
+Releases are currently alpha-quality because Windows TUN is not complete yet,
+but the artifacts are useful for Prism-managed downloads and integration
+testing.
 
 ## Trigger
 

@@ -33,7 +33,7 @@ tachyon-core run --config server.json
 
 ## 当前进度
 
-Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alpha 集成，但 Windows TUN 和 macOS PID 追踪仍需要真实实现，Prism 才能提供完整的跨平台自动游戏模式体验。
+Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alpha 集成，但 Windows TUN 仍需要真实 Wintun 实现，Prism 才能在 Windows 上提供完整的自动游戏模式体验。
 
 | 模块 | 状态 |
 | --- | --- |
@@ -46,7 +46,7 @@ Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alp
 | Windows PID 追踪 | 已完成 |
 | macOS TUN | 已完成 |
 | Windows TUN | 存根 |
-| macOS PID 追踪 | 存根 |
+| macOS PID 追踪 | Alpha lsof/ps 后端 |
 | TGP X25519 握手与 AEAD | 已完成 |
 | TGP UDP Relay 骨架 | 已完成 |
 | 客户端 TUN -> 路由 -> TGP 回写测试 | 已完成 |

@@ -1,8 +1,8 @@
 # 发布流程
 
 Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 alpha
-质量，因为 Windows TUN 和 macOS PID 追踪还没有完成；但这些产物已经可以用于
-Prism 托管下载和集成测试。
+质量，因为 Windows TUN 还没有完成；但这些产物已经可以用于 Prism 托管下载和
+集成测试。
 
 ## 触发方式
 

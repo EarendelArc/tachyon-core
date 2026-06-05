@@ -42,9 +42,9 @@ Server mode
 ## Implementation Status
 
 Tachyon Core is not a production-complete release yet. The protocol and
-pipeline are ready for alpha integration, but Windows TUN and macOS PID
-tracking still need real implementations before Prism can provide a fully
-automatic cross-platform game-mode experience.
+pipeline are ready for alpha integration, but Windows TUN still needs a real
+Wintun implementation before Prism can provide a fully automatic Windows
+game-mode experience.
 
 | Area | Status |
 | --- | --- |
@@ -57,7 +57,7 @@ automatic cross-platform game-mode experience.
 | Windows PID tracking | Done |
 | macOS TUN | Done |
 | Windows TUN | Stub |
-| macOS PID tracking | Stub |
+| macOS PID tracking | Alpha lsof/ps backend |
 | TGP X25519 handshake and AEAD | Done |
 | TGP UDP relay skeleton | Done |
 | Client TUN -> routing -> TGP writeback test | Done |

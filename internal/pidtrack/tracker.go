@@ -6,7 +6,7 @@
 //
 // Platform implementations:
 //   - Linux:   /proc/net/tcp6 + /proc/<pid>/fd/ inode join
-//   - macOS:   proc_pidinfo(PROC_PIDFDINFO) via libproc  (stub — M1)
+//   - macOS:   lsof -F socket lookup + ps process metadata (alpha)
 //   - Windows: GetExtendedTcpTable / GetExtendedUdpTable (iphlpapi.dll)
 //
 // Performance notes:

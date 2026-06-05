@@ -2,8 +2,10 @@
 
 [中文说明](README.zh-CN.md)
 
-Tachyon Core is the headless UDP game acceleration daemon for Tachyon. It uses
-one binary with two modes and explicit JSON configuration.
+Tachyon Core is the headless transport core for the Tachyon game protocol. Its
+role is similar to `xray-core`: it is a standalone network core with explicit
+JSON configuration, but its protocol is designed for low-latency, low-loss game
+traffic instead of general TCP proxying.
 
 ```bash
 tachyon-core run --config client.json
@@ -14,8 +16,8 @@ tachyon-core run --config server.json
 
 - Prism owns subscription retrieval, subscription parsing, node selection,
   Xray lifecycle, Xray JSON generation, and desktop orchestration.
-- Core owns only the UDP game acceleration path: packet capture, process-aware
-  game routing, TGP transport, and TGP server relay behavior.
+- Core owns Tachyon protocol transport: packet capture, process-aware game
+  routing, TGP client transport, and TGP server relay behavior.
 - Xray has no runtime or build-time dependency inside Tachyon Core.
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.

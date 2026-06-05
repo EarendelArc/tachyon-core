@@ -2,8 +2,9 @@
 
 [English](README.md)
 
-Tachyon Core 是 Tachyon 的无头 UDP 游戏加速守护进程。它采用一个二进制文件、
-两种运行模式和显式 JSON 配置。
+Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：
+是一个独立网络核心，使用显式 JSON 配置，但它的协议面向低延迟、低丢包的游戏
+流量，而不是通用 TCP 代理。
 
 ```bash
 tachyon-core run --config client.json
@@ -14,8 +15,8 @@ tachyon-core run --config server.json
 
 - Prism 负责订阅获取、订阅解析、节点选择、Xray 生命周期、Xray JSON 生成和桌面端
   总控编排。
-- Core 只负责 UDP 游戏加速路径：流量接管、基于进程的游戏路由、TGP 传输和服务端
-  TGP Relay 行为。
+- Core 负责 Tachyon 协议传输：流量接管、基于进程的游戏路由、TGP 客户端传输和
+  服务端 TGP Relay 行为。
 - Tachyon Core 内部不再有 Xray 的运行时或编译期依赖。
 - TCP 代理流量属于 Prism/Xray，UDP 游戏流量属于 Tachyon Core/TGP。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。

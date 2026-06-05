@@ -288,6 +288,7 @@ func Load(path string) (*Config, error) {
 	if err := unmarshalConfig(path, data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	resolveRelativePaths(path, cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -307,6 +308,26 @@ func isJSONConfig(path string, data []byte) bool {
 		return true
 	}
 	return bytes.HasPrefix(data, []byte("{"))
+}
+
+func resolveRelativePaths(configPath string, cfg *Config) {
+	baseDir := filepath.Dir(configPath)
+	if absPath, err := filepath.Abs(configPath); err == nil {
+		baseDir = filepath.Dir(absPath)
+	}
+
+	cfg.Server.TLS.CertFile = resolvePath(baseDir, cfg.Server.TLS.CertFile)
+	cfg.Server.TLS.KeyFile = resolvePath(baseDir, cfg.Server.TLS.KeyFile)
+	cfg.Xray.InstallDir = resolvePath(baseDir, cfg.Xray.InstallDir)
+	cfg.Xray.ConfigFile = resolvePath(baseDir, cfg.Xray.ConfigFile)
+	cfg.Observability.LogFile = resolvePath(baseDir, cfg.Observability.LogFile)
+}
+
+func resolvePath(baseDir string, value string) string {
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Clean(filepath.Join(baseDir, value))
 }
 
 // defaults returns a Config populated with sensible defaults.

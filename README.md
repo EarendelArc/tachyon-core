@@ -21,6 +21,8 @@ tachyon-core run --config server.json
 - TCP proxy traffic and UDP game traffic use separate end-to-end paths.
 - JSON is the canonical Core config format. Legacy YAML is accepted only for
   early developer compatibility.
+- Relative file paths in Core JSON, including `xray.config_file`, are resolved
+  from the directory that contains the loaded config file.
 
 ## Architecture
 

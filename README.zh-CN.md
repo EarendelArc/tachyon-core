@@ -19,6 +19,8 @@ tachyon-core run --config server.json
 - Xray-core 永远不会被编译进 Core，只会作为外部二进制被下载、校验和启动。
 - TCP 代理流量与 UDP 游戏流量端到端走完全独立的传输路径。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
+- Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析，包括
+  `xray.config_file`。
 
 ## 架构
 

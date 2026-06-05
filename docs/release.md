@@ -17,6 +17,12 @@ git push origin v0.1.0-alpha.1
 The `Release` workflow can also be started manually from GitHub Actions with a
 tag input.
 
+For local verification without publishing to GitHub, run:
+
+```powershell
+scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-release
+```
+
 ## Assets
 
 The workflow builds these ZIP assets:

@@ -15,6 +15,12 @@ git push origin v0.1.0-alpha.1
 
 也可以在 GitHub Actions 页面手动运行 `Release` workflow，并输入 tag。
 
+如果只需要在本地验证产物而不发布到 GitHub，可以运行：
+
+```powershell
+scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-release
+```
+
 ## 产物
 
 workflow 会构建以下 ZIP 资产：

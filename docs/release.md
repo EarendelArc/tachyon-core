@@ -36,6 +36,10 @@ Each archive contains:
 - `README.md`
 - `README.zh-CN.md`
 
+Windows archives do not bundle `wintun.dll` yet. Prism must verify that
+`wintun.dll` exists next to the configured `tachyon-core.exe` before starting
+Core on Windows.
+
 The release also includes `SHA256SUMS.txt` for Prism-side verification.
 
 ## Prism Contract

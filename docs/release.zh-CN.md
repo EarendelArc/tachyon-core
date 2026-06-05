@@ -34,6 +34,9 @@ workflow 会构建以下 ZIP 资产：
 - `README.md`
 - `README.zh-CN.md`
 
+Windows 压缩包暂不内置 `wintun.dll`。Prism 在 Windows 上启动 Core 前，必须检查
+配置的 `tachyon-core.exe` 同目录是否存在 `wintun.dll`。
+
 release 还会包含 `SHA256SUMS.txt`，供 Prism 下载后校验。
 
 ## Prism 下载约定

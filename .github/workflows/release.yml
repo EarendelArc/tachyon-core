@@ -173,7 +173,8 @@ jobs:
             echo
             echo "This is an automated Tachyon Core release for Prism-managed downloads."
             echo
-            echo "Current implementation status: alpha. Windows TUN and macOS PID tracking are still incomplete."
+            echo "Current implementation status: alpha. Windows TUN uses a dynamic wintun.dll backend and still needs elevated-host validation."
+            echo "Windows users must place wintun.dll next to tachyon-core.exe."
             echo
             echo "Artifacts:"
             for file in release/*.zip; do

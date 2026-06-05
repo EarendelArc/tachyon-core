@@ -207,7 +207,7 @@ func (a *App) runClient(ctx context.Context) error {
 
 func (a *App) shutdownClient(ctx context.Context) error {
 	a.logger.Info("shutting down client subsystems")
-	// TODO: stop subsystems in reverse startup order
+	// Subsystem-owned resources are closed by the defers registered in runClient.
 	_ = ctx
 	a.logger.Info("client shutdown complete")
 	return nil

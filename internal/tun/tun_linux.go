@@ -115,13 +115,7 @@ func (t *linuxTUN) Close() error {
 // ---------------------------------------------------------------------------
 
 func setMTU(iface string, mtu int) error {
-	return withNetlinkSocket(func(fd int) error {
-		_ = fd
-		// Use ip link set dev <iface> mtu <mtu> via rtnetlink.
-		// For brevity, we shell out; a production implementation should
-		// use the golang.org/x/sys/unix netlink API directly.
-		return runIP("link", "set", "dev", iface, "mtu", fmt.Sprintf("%d", mtu))
-	})
+	return runIP("link", "set", "dev", iface, "mtu", fmt.Sprintf("%d", mtu))
 }
 
 func setAddresses(iface string, addrs []netip.Prefix) error {
@@ -141,10 +135,6 @@ func addDefaultRoute(iface string) error {
 	// Add routes for both IPv4 and IPv6 if needed.
 	_ = runIP("route", "add", "default", "dev", iface)
 	return nil
-}
-
-func withNetlinkSocket(fn func(fd int) error) error {
-	return fn(0) // stub — real impl uses unix.Socket(AF_NETLINK, ...)
 }
 
 func runIP(args ...string) error {

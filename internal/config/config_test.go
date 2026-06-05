@@ -63,6 +63,64 @@ func TestLoadJSONRejectsYAML(t *testing.T) {
 	}
 }
 
+func TestLoadEmbeddedGameProfiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.json")
+	data := []byte(`{
+  "mode": "client",
+  "client": {
+    "routing": {
+      "default_action": "direct",
+      "game_profiles": [
+        {
+          "id": "manual-cs2",
+          "displayName": "Counter-Strike 2",
+          "enabled": true,
+          "manual": true,
+          "priority": 100,
+          "match": {
+            "processNames": ["cs2.exe"],
+            "paths": [],
+            "pathPrefixes": [],
+            "sha256": [],
+            "steamAppIds": [730]
+          },
+          "udpPolicy": "tgp",
+          "tcpPolicy": "auto"
+        }
+      ],
+      "launchers": {
+        "steam": {
+          "enabled": true,
+          "trackChildProcesses": true,
+          "accelerateGameUdp": true,
+          "accelerateSteamDownloads": false
+        }
+      }
+    },
+    "proxy": {
+      "server_addr": "game.example.com:443"
+    }
+  }
+}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got := len(cfg.Client.Routing.GameProfiles); got != 1 {
+		t.Fatalf("game profiles = %d, want 1", got)
+	}
+	if cfg.Client.Routing.GameProfiles[0].Match.ProcessNames[0] != "cs2.exe" {
+		t.Fatalf("unexpected profile: %#v", cfg.Client.Routing.GameProfiles[0])
+	}
+	if cfg.Client.Routing.Launchers == nil || !cfg.Client.Routing.Launchers.Steam.Enabled {
+		t.Fatalf("steam launcher policy not loaded: %#v", cfg.Client.Routing.Launchers)
+	}
+}
+
 func TestLoadLegacyYAMLConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.yaml")
 	data := []byte(`mode: client

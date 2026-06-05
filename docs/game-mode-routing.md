@@ -18,34 +18,39 @@ back to generic routing.
 - Game TCP defaults to `auto`; Core does not proxy TCP traffic. Prism/Xray owns
   login, store, download, and other TCP proxy flows.
 
-## Store Example
+## Core JSON Example
 
 ```json
 {
-  "gameProfiles": [
-    {
-      "id": "cs2",
-      "displayName": "Counter-Strike 2",
-      "enabled": true,
-      "manual": true,
-      "priority": 100,
-      "match": {
-        "processNames": ["cs2.exe"],
-        "paths": [],
-        "pathPrefixes": [],
-        "sha256": [],
-        "steamAppIds": [730]
-      },
-      "udpPolicy": "tgp",
-      "tcpPolicy": "auto"
-    }
-  ],
-  "launchers": {
-    "steam": {
-      "enabled": true,
-      "trackChildProcesses": true,
-      "accelerateGameUdp": true,
-      "accelerateSteamDownloads": false
+  "client": {
+    "routing": {
+      "default_action": "direct",
+      "game_profiles": [
+        {
+          "id": "cs2",
+          "displayName": "Counter-Strike 2",
+          "enabled": true,
+          "manual": true,
+          "priority": 100,
+          "match": {
+            "processNames": ["cs2.exe"],
+            "paths": [],
+            "pathPrefixes": [],
+            "sha256": [],
+            "steamAppIds": [730]
+          },
+          "udpPolicy": "tgp",
+          "tcpPolicy": "auto"
+        }
+      ],
+      "launchers": {
+        "steam": {
+          "enabled": true,
+          "trackChildProcesses": true,
+          "accelerateGameUdp": true,
+          "accelerateSteamDownloads": false
+        }
+      }
     }
   }
 }

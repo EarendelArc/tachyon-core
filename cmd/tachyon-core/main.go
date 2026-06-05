@@ -180,12 +180,33 @@ const clientConfigTemplate = `{
     },
     "routing": {
       "default_action": "direct",
-      "rules": [
+      "game_profiles": [
         {
-          "process_name": "cs2.exe",
-          "action": "tgp",
-          "priority": 100
-        },
+          "id": "cs2",
+          "displayName": "Counter-Strike 2",
+          "enabled": true,
+          "manual": true,
+          "priority": 100,
+          "match": {
+            "processNames": ["cs2.exe"],
+            "paths": [],
+            "pathPrefixes": [],
+            "sha256": [],
+            "steamAppIds": [730]
+          },
+          "udpPolicy": "tgp",
+          "tcpPolicy": "auto"
+        }
+      ],
+      "launchers": {
+        "steam": {
+          "enabled": true,
+          "trackChildProcesses": true,
+          "accelerateGameUdp": true,
+          "accelerateSteamDownloads": false
+        }
+      },
+      "rules": [
         {
           "cidr": "192.168.0.0/16",
           "action": "direct",

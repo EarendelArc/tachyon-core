@@ -15,7 +15,8 @@ tachyon-core run --config server.json
 ## Design Boundary
 
 - Prism owns subscription retrieval, subscription parsing, node selection,
-  Xray lifecycle, Xray JSON generation, and desktop orchestration.
+  Xray lifecycle, Xray JSON generation, game profile management, launcher
+  scanning, and desktop orchestration.
 - Core owns Tachyon protocol transport: packet capture, process-aware game
   routing, TGP client transport, and TGP server relay behavior.
 - Xray has no runtime or build-time dependency inside Tachyon Core.
@@ -49,9 +50,9 @@ automatic cross-platform game-mode experience.
 | --- | --- |
 | Unified client/server CLI | Done |
 | JSON config loading and generation | Done |
+| Embedded Prism game profiles in Core JSON | Done |
 | Process-aware routing profiles | Done |
-| Manual game-mode profile API | Done |
-| Steam library scan API | Done |
+| Local HTTP routing bridge compatibility | Done |
 | Linux TUN and PID tracking | Done |
 | Windows PID tracking | Done |
 | macOS TUN | Done |

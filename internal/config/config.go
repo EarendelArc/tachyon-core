@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/routing"
 	"gopkg.in/yaml.v3"
 )
 
@@ -102,6 +103,14 @@ type RoutingConfig struct {
 
 	// Rules is evaluated in priority order (highest priority first).
 	Rules []RouteRule `yaml:"rules" json:"rules"`
+
+	// GameProfiles are Prism-managed process/application profiles used before
+	// generic route rules.
+	GameProfiles []routing.GameProfile `yaml:"game_profiles,omitempty" json:"game_profiles,omitempty"`
+
+	// Launchers controls well-known launcher heuristics, such as Steam child
+	// process detection. If omitted, routing package defaults are used.
+	Launchers *routing.LauncherPolicy `yaml:"launchers,omitempty" json:"launchers,omitempty"`
 }
 
 // RouteRule is a single routing rule. Exactly one match field should be set.
@@ -353,12 +362,30 @@ func (c *Config) Validate() error {
 		if c.Client.Proxy.ServerAddr == "" {
 			return fmt.Errorf("client.proxy.server_addr is required in client mode")
 		}
+		if err := validateGameProfiles(c.Client.Routing.GameProfiles); err != nil {
+			return err
+		}
 	}
 	if c.TGP.FEC.DataShards < 1 {
 		return fmt.Errorf("tgp.fec.data_shards must be >= 1")
 	}
 	if c.TGP.Pacing.InitialRatePPS <= 0 {
 		return fmt.Errorf("tgp.pacing.initial_rate_pps must be > 0")
+	}
+	return nil
+}
+
+func validateGameProfiles(profiles []routing.GameProfile) error {
+	seen := make(map[string]struct{}, len(profiles))
+	for _, profile := range profiles {
+		if err := routing.ValidateProfile(profile); err != nil {
+			return fmt.Errorf("client.routing.game_profiles: %w", err)
+		}
+		key := strings.ToLower(strings.TrimSpace(profile.ID))
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("client.routing.game_profiles: duplicate id %q", profile.ID)
+		}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

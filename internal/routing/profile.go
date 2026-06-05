@@ -37,33 +37,33 @@ const (
 )
 
 type MatchRule struct {
-	ProcessNames []string `json:"processNames"`
-	Paths        []string `json:"paths"`
-	PathPrefixes []string `json:"pathPrefixes"`
-	SHA256       []string `json:"sha256"`
-	SteamAppIDs  []uint32 `json:"steamAppIds"`
+	ProcessNames []string `json:"processNames" yaml:"processNames"`
+	Paths        []string `json:"paths" yaml:"paths"`
+	PathPrefixes []string `json:"pathPrefixes" yaml:"pathPrefixes"`
+	SHA256       []string `json:"sha256" yaml:"sha256"`
+	SteamAppIDs  []uint32 `json:"steamAppIds" yaml:"steamAppIds"`
 }
 
 type GameProfile struct {
-	ID          string    `json:"id"`
-	DisplayName string    `json:"displayName"`
-	Enabled     bool      `json:"enabled"`
-	Manual      bool      `json:"manual"`
-	Priority    int       `json:"priority"`
-	Match       MatchRule `json:"match"`
-	UDPPolicy   UDPPolicy `json:"udpPolicy"`
-	TCPPolicy   TCPPolicy `json:"tcpPolicy"`
+	ID          string    `json:"id" yaml:"id"`
+	DisplayName string    `json:"displayName" yaml:"displayName"`
+	Enabled     bool      `json:"enabled" yaml:"enabled"`
+	Manual      bool      `json:"manual" yaml:"manual"`
+	Priority    int       `json:"priority" yaml:"priority"`
+	Match       MatchRule `json:"match" yaml:"match"`
+	UDPPolicy   UDPPolicy `json:"udpPolicy" yaml:"udpPolicy"`
+	TCPPolicy   TCPPolicy `json:"tcpPolicy" yaml:"tcpPolicy"`
 }
 
 type SteamPolicy struct {
-	Enabled                  bool `json:"enabled"`
-	TrackChildProcesses      bool `json:"trackChildProcesses"`
-	AccelerateGameUDP        bool `json:"accelerateGameUdp"`
-	AccelerateSteamDownloads bool `json:"accelerateSteamDownloads"`
+	Enabled                  bool `json:"enabled" yaml:"enabled"`
+	TrackChildProcesses      bool `json:"trackChildProcesses" yaml:"trackChildProcesses"`
+	AccelerateGameUDP        bool `json:"accelerateGameUdp" yaml:"accelerateGameUdp"`
+	AccelerateSteamDownloads bool `json:"accelerateSteamDownloads" yaml:"accelerateSteamDownloads"`
 }
 
 type LauncherPolicy struct {
-	Steam SteamPolicy `json:"steam"`
+	Steam SteamPolicy `json:"steam" yaml:"steam"`
 }
 
 type Engine struct {

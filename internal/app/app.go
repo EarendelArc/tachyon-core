@@ -111,7 +111,7 @@ func (a *App) runClient(ctx context.Context) error {
 	}
 	a.logger.Info("PID tracker ready")
 
-	routingService := routing.NewService(routing.NewFileStore(defaultRoutingStorePath()))
+	routingService := routing.NewService(routing.NewMemoryStore(routingRuntimeConfig(a.cfg.Client.Routing)))
 	gameEngine, err := routingService.Engine(ctx)
 	if err != nil {
 		return fmt.Errorf("load routing profiles: %w", err)
@@ -258,6 +258,17 @@ func defaultRoutingStorePath() string {
 		return filepath.Join(dir, "tachyon", "routing.json")
 	}
 	return filepath.Join(".", "tachyon-routing.json")
+}
+
+func routingRuntimeConfig(cfg config.RoutingConfig) routing.Config {
+	runtimeCfg := routing.DefaultConfig()
+	if cfg.GameProfiles != nil {
+		runtimeCfg.GameProfiles = append([]routing.GameProfile(nil), cfg.GameProfiles...)
+	}
+	if cfg.Launchers != nil {
+		runtimeCfg.Launchers = *cfg.Launchers
+	}
+	return runtimeCfg
 }
 
 func refreshRoutingEngine(ctx context.Context, service *routing.Service, router *pipeline.Router, logger *slog.Logger) {

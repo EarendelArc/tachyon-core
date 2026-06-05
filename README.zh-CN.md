@@ -2,9 +2,7 @@
 
 [English](README.md)
 
-Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：
-是一个独立网络核心，使用显式 JSON 配置，但它的协议面向低延迟、低丢包的游戏
-流量，而不是通用 TCP 代理。
+Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：是一个独立网络核心，使用显式 JSON 配置，但协议目标是低延迟、低丢包的游戏 UDP 流量，而不是通用 TCP 代理。
 
 ```bash
 tachyon-core run --config client.json
@@ -13,13 +11,12 @@ tachyon-core run --config server.json
 
 ## 边界划分
 
-- Prism 负责订阅获取、订阅解析、节点选择、Xray 生命周期、Xray JSON 生成和桌面端
-  总控编排。
-- Core 负责 Tachyon 协议传输：流量接管、基于进程的游戏路由、TGP 客户端传输和
-  服务端 TGP Relay 行为。
-- Tachyon Core 内部不再有 Xray 的运行时或编译期依赖。
+- Prism 负责订阅获取、订阅解析、节点选择、Xray 生命周期、Xray JSON 生成、游戏配置管理、启动器扫描和桌面端总控编排。
+- Core 负责 Tachyon 协议传输：流量接管、基于进程的游戏路由、TGP 客户端传输和服务端 TGP Relay 行为。
+- Tachyon Core 内部没有 Xray 的运行时或编译期依赖。
 - TCP 代理流量属于 Prism/Xray，UDP 游戏流量属于 Tachyon Core/TGP。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
+- Prism 生成的游戏配置会内嵌在 `client.routing.game_profiles` 中，启动器策略在 `client.routing.launchers` 中。
 - Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析。
 
 ## 架构
@@ -36,17 +33,15 @@ tachyon-core run --config server.json
 
 ## 当前进度
 
-Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alpha 集成，
-但 Windows TUN 和 macOS PID 追踪仍需要真实实现，Prism 才能提供完整的跨平台
-自动游戏模式体验。
+Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alpha 集成，但 Windows TUN 和 macOS PID 追踪仍需要真实实现，Prism 才能提供完整的跨平台自动游戏模式体验。
 
 | 模块 | 状态 |
 | --- | --- |
 | 客户端/服务端统一 CLI | 已完成 |
 | JSON 配置读取与生成 | 已完成 |
+| Core JSON 内嵌 Prism 游戏配置 | 已完成 |
 | 基于进程的游戏路由配置 | 已完成 |
-| 手动游戏模式配置 API | 已完成 |
-| Steam 游戏库扫描 API | 已完成 |
+| 本地 HTTP 路由桥兼容层 | 已完成 |
 | Linux TUN 与 PID 追踪 | 已完成 |
 | Windows PID 追踪 | 已完成 |
 | macOS TUN | 已完成 |
@@ -75,7 +70,4 @@ sudo bash scripts/install-server.sh --port 443
 sudo bash scripts/install-server-docker.sh --port 443
 ```
 
-Prism/Core IPC 设计见 [docs/ipc-api.md](docs/ipc-api.md) 和
-[docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)，TGP 协议格式见
-[docs/tgp-spec.md](docs/tgp-spec.md)。供 Prism 下载的 GitHub release 资产约定见
-[docs/release.zh-CN.md](docs/release.zh-CN.md)。
+Prism/Core IPC 设计见 [docs/ipc-api.md](docs/ipc-api.md) 和 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)。TGP 协议格式见 [docs/tgp-spec.md](docs/tgp-spec.md)。供 Prism 下载的 GitHub release 资产约定见 [docs/release.zh-CN.md](docs/release.zh-CN.md)。

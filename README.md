@@ -42,9 +42,9 @@ Server mode
 ## Implementation Status
 
 Tachyon Core is not a production-complete release yet. The protocol and
-pipeline are ready for alpha integration, but Windows TUN still needs a real
-Wintun implementation before Prism can provide a fully automatic Windows
-game-mode experience.
+pipeline are ready for alpha integration. Windows TUN now has an alpha dynamic
+`wintun.dll` backend, but it still requires runtime validation with elevated
+adapter creation on real Windows hosts.
 
 | Area | Status |
 | --- | --- |
@@ -56,7 +56,7 @@ game-mode experience.
 | Linux TUN and PID tracking | Done |
 | Windows PID tracking | Done |
 | macOS TUN | Done |
-| Windows TUN | Stub |
+| Windows TUN | Alpha dynamic Wintun backend |
 | macOS PID tracking | Alpha lsof/ps backend |
 | TGP X25519 handshake and AEAD | Done |
 | TGP UDP relay skeleton | Done |

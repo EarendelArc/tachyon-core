@@ -1,9 +1,9 @@
 # Release Process
 
 Tachyon Core releases are published by GitHub Actions from this repository.
-Releases are currently alpha-quality because Windows TUN is not complete yet,
-but the artifacts are useful for Prism-managed downloads and integration
-testing.
+Releases are currently alpha-quality: Windows TUN has a dynamic `wintun.dll`
+backend, but it still needs real elevated-host validation. The artifacts are
+useful for Prism-managed downloads and integration testing.
 
 ## Trigger
 

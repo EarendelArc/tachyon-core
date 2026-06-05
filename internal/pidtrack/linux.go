@@ -3,7 +3,6 @@
 package pidtrack
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -27,10 +26,7 @@ func newProvider() (Provider, error) {
 
 // LookupByFlow resolves a FlowKey to a ProcessInfo using /proc pseudo-files.
 func (p *linuxProvider) LookupByFlow(_ context.Context, flow FlowKey) (ProcessInfo, error) {
-	procFile := "/proc/net/tcp6"
-	if flow.Transport == TransportUDP {
-		procFile = "/proc/net/udp6"
-	}
+	procFile := procNetFile(flow.Transport, flow.LocalIP)
 
 	inode, err := findInodeInProcNet(procFile, flow.LocalIP, flow.LocalPort)
 	if err != nil {
@@ -61,56 +57,6 @@ func (p *linuxProvider) LookupPID(_ context.Context, pid int) (ProcessInfo, erro
 		Name:           name,
 		ExecutablePath: exePath,
 	}, nil
-}
-
-// ---------------------------------------------------------------------------
-// /proc/net parsing helpers
-// ---------------------------------------------------------------------------
-
-// findInodeInProcNet parses /proc/net/tcp6 (or udp6) to find the socket inode
-// for a given local IP + port.
-//
-// The relevant columns (space-separated):
-//
-//	sl  local_address rem_address st tx:rx ... uid timeout inode
-//
-// local_address is hex IPv6 (or IPv4-in-IPv6) followed by :hex-port.
-func findInodeInProcNet(path, localIP string, localPort uint16) (uint64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	wantHex := ipToHex(localIP)
-	wantPort := uint32(localPort)
-
-	scanner := bufio.NewScanner(f)
-	scanner.Scan() // skip header
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 10 {
-			continue
-		}
-		// fields[1] = "hexIP:hexPort"
-		parts := strings.SplitN(fields[1], ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		if !strings.EqualFold(parts[0], wantHex) {
-			continue
-		}
-		port, err := strconv.ParseUint(parts[1], 16, 16)
-		if err != nil || uint32(port) != wantPort {
-			continue
-		}
-		inode, err := strconv.ParseUint(fields[9], 10, 64)
-		if err != nil {
-			continue
-		}
-		return inode, nil
-	}
-	return 0, fmt.Errorf("socket %s:%d not found in %s", localIP, localPort, path)
 }
 
 // findPIDByInode walks /proc/*/fd to find which process has a symlink to
@@ -167,25 +113,4 @@ func parseParentPID(status string) int {
 		}
 	}
 	return 0
-}
-
-// ipToHex converts a dotted-decimal IPv4 or colon-hex IPv6 string to the
-// hex representation used in /proc/net/tcp6.
-// For IPv4, the kernel stores it as a little-endian 32-bit word padded to
-// 128 bits (IPv4-in-IPv6).
-func ipToHex(ip string) string {
-	// Handle IPv4 dotted-decimal
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		var b [4]byte
-		for i, p := range parts {
-			v, _ := strconv.ParseUint(p, 10, 8)
-			b[i] = byte(v)
-		}
-		// Little-endian word + zero-padded to 32 hex chars (128-bit IPv4-in-IPv6)
-		return fmt.Sprintf("%08X000000000000000000000000",
-			uint32(b[3])<<24|uint32(b[2])<<16|uint32(b[1])<<8|uint32(b[0]))
-	}
-	// IPv6: not implemented here — return empty to trigger not-found.
-	return ""
 }

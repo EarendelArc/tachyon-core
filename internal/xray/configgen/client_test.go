@@ -29,9 +29,23 @@ func TestBuildClientConfig(t *testing.T) {
 	if proxy["protocol"] != "vless" {
 		t.Fatalf("unexpected outbound: %#v", proxy)
 	}
+	settings := proxy["settings"].(map[string]any)
+	if settings["address"] != "vpn.example.com" ||
+		settings["port"].(float64) != 443 ||
+		settings["id"] != "00000000-0000-0000-0000-000000000000" ||
+		settings["encryption"] != "none" {
+		t.Fatalf("unexpected vless settings: %#v", settings)
+	}
+	if _, ok := settings["vnext"]; ok {
+		t.Fatalf("unexpected legacy vnext settings: %#v", settings)
+	}
 	stream := proxy["streamSettings"].(map[string]any)
-	if stream["security"] != "reality" {
+	if stream["network"] != "raw" || stream["security"] != "tls" {
 		t.Fatalf("unexpected stream settings: %#v", stream)
+	}
+	tls := stream["tlsSettings"].(map[string]any)
+	if tls["serverName"] != "front.example.com" {
+		t.Fatalf("unexpected tls settings: %#v", tls)
 	}
 }
 

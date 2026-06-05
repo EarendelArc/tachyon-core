@@ -54,24 +54,16 @@ func BuildClientConfig(opts ClientOptions) ([]byte, error) {
 				"tag":      "tachyon-proxy",
 				"protocol": "vless",
 				"settings": map[string]any{
-					"vnext": []any{
-						map[string]any{
-							"address": serverHost,
-							"port":    serverPort,
-							"users": []any{
-								map[string]any{
-									"id":         opts.VLESSUID,
-									"encryption": "none",
-									"flow":       "xtls-rprx-vision",
-								},
-							},
-						},
-					},
+					"address":    serverHost,
+					"port":       serverPort,
+					"id":         opts.VLESSUID,
+					"encryption": "none",
+					"flow":       "xtls-rprx-vision",
 				},
 				"streamSettings": map[string]any{
-					"network":  "tcp",
-					"security": "reality",
-					"realitySettings": map[string]any{
+					"network":  "raw",
+					"security": "tls",
+					"tlsSettings": map[string]any{
 						"serverName":  sni,
 						"fingerprint": "chrome",
 					},

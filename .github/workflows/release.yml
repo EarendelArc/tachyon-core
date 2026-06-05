@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0-alpha.1"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: "386"
+            asset_os: windows
+            asset_arch: "386"
+            ext: ".exe"
+          - goos: windows
+            goarch: amd64
+            asset_os: windows
+            asset_arch: amd64
+            ext: ".exe"
+          - goos: windows
+            goarch: arm64
+            asset_os: windows
+            asset_arch: arm64
+            ext: ".exe"
+          - goos: darwin
+            goarch: amd64
+            asset_os: darwin
+            asset_arch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            asset_os: darwin
+            asset_arch: arm64
+            ext: ""
+          - goos: linux
+            goarch: amd64
+            asset_os: linux
+            asset_arch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            asset_os: linux
+            asset_arch: arm64
+            ext: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.tag }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
+          echo "go_version=$(go version | awk '{print $3}')" >> "${GITHUB_OUTPUT}"
+
+      - name: Build binaries
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
+          GO_VERSION: ${{ steps.meta.outputs.go_version }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.GoVersion=${GO_VERSION}"
+          go build -trimpath -ldflags "${ldflags}" -o "build/tachyon-core${EXT}" ./cmd/tachyon-core
+          go build -trimpath -ldflags "${ldflags}" -o "build/tachyonctl${EXT}" ./cmd/tachyonctl
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+          asset="tachyon-core_${VERSION}_${ASSET_OS}_${ASSET_ARCH}.zip"
+          cp README.md README.zh-CN.md build/
+          (cd build && zip -9 "../${asset}" ./*)
+          mkdir -p dist
+          mv "${asset}" dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: tachyon-core-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7.0.0
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.tag }}"
+            prerelease="${{ inputs.prerelease }}"
+          else
+            version="${GITHUB_REF_NAME}"
+            prerelease="true"
+          fi
+          mkdir -p release
+          find artifacts -name "*.zip" -type f -exec cp {} release/ \;
+          (cd release && sha256sum *.zip > SHA256SUMS.txt)
+          {
+            echo "Tachyon Core ${version}"
+            echo
+            echo "This is an automated Tachyon Core release for Prism-managed downloads."
+            echo
+            echo "Current implementation status: alpha. Windows TUN and macOS PID tracking are still incomplete."
+            echo
+            echo "Artifacts:"
+            for file in release/*.zip; do
+              echo "- $(basename "${file}")"
+            done
+            echo
+            echo "Verify downloads with SHA256SUMS.txt."
+          } > release/RELEASE_NOTES.md
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}" \
+              --title "Tachyon Core ${VERSION}" \
+              --notes-file release/RELEASE_NOTES.md \
+              "${prerelease_flag[@]}"
+          else
+            gh release create "${VERSION}" \
+              --title "Tachyon Core ${VERSION}" \
+              --notes-file release/RELEASE_NOTES.md \
+              "${prerelease_flag[@]}"
+          fi
+          gh release upload "${VERSION}" release/*.zip release/SHA256SUMS.txt --clobber

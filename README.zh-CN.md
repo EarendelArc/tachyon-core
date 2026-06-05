@@ -36,6 +36,10 @@ tachyon-core run --config server.json
 
 ## 当前进度
 
+Tachyon Core 还不是生产完成版。协议与主管道已经可以进入 alpha 集成，
+但 Windows TUN 和 macOS PID 追踪仍需要真实实现，Prism 才能提供完整的跨平台
+自动游戏模式体验。
+
 | 模块 | 状态 |
 | --- | --- |
 | 客户端/服务端统一 CLI | 已完成 |
@@ -73,4 +77,5 @@ sudo bash scripts/install-server-docker.sh --port 443
 
 Prism/Core IPC 设计见 [docs/ipc-api.md](docs/ipc-api.md) 和
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)，TGP 协议格式见
-[docs/tgp-spec.md](docs/tgp-spec.md)。
+[docs/tgp-spec.md](docs/tgp-spec.md)。供 Prism 下载的 GitHub release 资产约定见
+[docs/release.zh-CN.md](docs/release.zh-CN.md)。

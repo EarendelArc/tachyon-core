@@ -40,6 +40,11 @@ Server mode
 
 ## Implementation Status
 
+Tachyon Core is not a production-complete release yet. The protocol and
+pipeline are ready for alpha integration, but Windows TUN and macOS PID
+tracking still need real implementations before Prism can provide a fully
+automatic cross-platform game-mode experience.
+
 | Area | Status |
 | --- | --- |
 | Unified client/server CLI | Done |
@@ -78,3 +83,4 @@ sudo bash scripts/install-server-docker.sh --port 443
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.
 See [docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.
+See [docs/release.md](docs/release.md) for GitHub release assets used by Prism.

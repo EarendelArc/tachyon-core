@@ -8,8 +8,16 @@ JSON configuration, but its protocol is designed for low-latency, low-loss game
 traffic instead of general TCP proxying.
 
 ```bash
+# Validate config without starting the daemon
+tachyon-core validate --config client.json
+
+# Start the core daemon
 tachyon-core run --config client.json
 tachyon-core run --config server.json
+
+# Check if a running Core is healthy
+tachyonctl health
+tachyonctl health --addr 127.0.0.1:55123
 ```
 
 ## Design Boundary
@@ -53,6 +61,8 @@ adapter creation on real Windows hosts.
 | Embedded Prism game profiles in Core JSON | Done |
 | Process-aware routing profiles | Done |
 | Local HTTP routing bridge compatibility | Done |
+| tachyonctl health CLI | Done |
+| tachyon-core validate (dry-run) | Done |
 | Linux TUN and PID tracking | Done |
 | Windows PID tracking | Done |
 | macOS TUN | Done |

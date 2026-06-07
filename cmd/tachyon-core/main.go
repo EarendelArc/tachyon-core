@@ -71,12 +71,7 @@ func cmdRun(args []string) error {
 		fmt.Fprint(os.Stderr, cli.Usage())
 		return nil
 	}
-	configPath := "config.json"
-	for i, a := range args {
-		if (a == "--config" || a == "-c") && i+1 < len(args) {
-			configPath = args[i+1]
-		}
-	}
+	configPath := cli.FlagValue(args, "--config", "-c", "config.json")
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -113,12 +108,7 @@ func cmdValidateConfig(args []string) error {
 		fmt.Fprint(os.Stderr, cli.Usage())
 		return nil
 	}
-	configPath := "config.json"
-	for i, a := range args {
-		if (a == "--config" || a == "-c") && i+1 < len(args) {
-			configPath = args[i+1]
-		}
-	}
+	configPath := cli.FlagValue(args, "--config", "-c", "config.json")
 	mode, err := cli.ValidateConfig(configPath)
 	if err != nil {
 		return err
@@ -132,12 +122,7 @@ func cmdGenerateConfig(args []string) error {
 		fmt.Fprint(os.Stderr, cli.Usage())
 		return nil
 	}
-	mode := config.ModeClient
-	for i, a := range args {
-		if (a == "--mode" || a == "-m") && i+1 < len(args) {
-			mode = config.Mode(args[i+1])
-		}
-	}
+	mode := config.Mode(cli.FlagValue(args, "--mode", "-m", "client"))
 
 	tmpl, err := cli.GenerateConfig(mode)
 	if err != nil {

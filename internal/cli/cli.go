@@ -110,6 +110,17 @@ func Usage() string {
 		"  tachyon-core generate-config --mode client > client.json\n"
 }
 
+// FlagValue returns the value of a CLI flag from args, or fallback when absent.
+// Both long (--flag) and short (-f) forms are recognised.
+func FlagValue(args []string, long, short, fallback string) string {
+	for i, a := range args {
+		if (a == long || a == short) && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return fallback
+}
+
 // HasHelp returns true when the argument list contains -h or --help.
 func HasHelp(args []string) bool {
 	for _, a := range args {

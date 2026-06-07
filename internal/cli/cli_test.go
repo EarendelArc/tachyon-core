@@ -249,6 +249,52 @@ func TestGenerateConfigProducesParseableConfig(t *testing.T) {
 	}
 }
 
+func TestFlagValueReturnsLongFlag(t *testing.T) {
+	value := FlagValue([]string{"--config", "client.json"}, "--config", "-c", "config.json")
+	if value != "client.json" {
+		t.Fatalf("expected client.json, got %q", value)
+	}
+}
+
+func TestFlagValueReturnsShortFlag(t *testing.T) {
+	value := FlagValue([]string{"-c", "custom.json"}, "--config", "-c", "config.json")
+	if value != "custom.json" {
+		t.Fatalf("expected custom.json, got %q", value)
+	}
+}
+
+func TestFlagValueReturnsFallbackWhenAbsent(t *testing.T) {
+	value := FlagValue([]string{"other", "args"}, "--config", "-c", "fallback.json")
+	if value != "fallback.json" {
+		t.Fatalf("expected fallback.json, got %q", value)
+	}
+}
+
+func TestFlagValueReturnsFallbackWhenFlagMissingValue(t *testing.T) {
+	value := FlagValue([]string{"--config"}, "--config", "-c", "default.json")
+	if value != "default.json" {
+		t.Fatalf("expected default.json when flag has no value, got %q", value)
+	}
+}
+
+func TestFlagValueReturnsFallbackForEmptyArgs(t *testing.T) {
+	value := FlagValue(nil, "--config", "-c", "default.json")
+	if value != "default.json" {
+		t.Fatalf("expected default.json for nil args, got %q", value)
+	}
+	value = FlagValue([]string{}, "--config", "-c", "default.json")
+	if value != "default.json" {
+		t.Fatalf("expected default.json for empty args, got %q", value)
+	}
+}
+
+func TestFlagValuePicksFirstMatch(t *testing.T) {
+	value := FlagValue([]string{"--config", "first.json", "-c", "second.json"}, "--config", "-c", "fallback.json")
+	if value != "first.json" {
+		t.Fatalf("expected first.json, got %q", value)
+	}
+}
+
 func TestHasHelpDetectsShortFlag(t *testing.T) {
 	if !HasHelp([]string{"-h"}) {
 		t.Error("expected -h to be detected")

@@ -44,12 +44,7 @@ func cmdHealth(args []string) {
 		fmt.Fprint(os.Stderr, cli.CtlUsage())
 		return
 	}
-	addr := "127.0.0.1:55123"
-	for i, a := range args {
-		if (a == "--addr" || a == "-a") && i+1 < len(args) {
-			addr = args[i+1]
-		}
-	}
+	addr := cli.FlagValue(args, "--addr", "-a", "127.0.0.1:55123")
 
 	resp, err := cli.HealthCheck(addr)
 	if err != nil {

@@ -1,9 +1,10 @@
-// tachyon-core: cross-platform network daemon for the Tachyon system.
+﻿// tachyon-core: cross-platform network daemon for the Tachyon system.
 //
 // Usage:
 //
 //	tachyon-core run --config /etc/tachyon/config.json
 //	tachyon-core version
+//	tachyon-core validate --config config.json
 //	tachyon-core generate-config --mode client > config.json
 //	tachyon-core generate-config --mode server > config.json
 package main
@@ -47,6 +48,9 @@ func run(args []string) error {
 
 	case "generate-config":
 		return cmdGenerateConfig(args[1:])
+
+	case "validate":
+		return cmdValidateConfig(args[1:])
 
 	case "run":
 		return cmdRun(args[1:])
@@ -96,6 +100,22 @@ func cmdRun(args []string) error {
 	return nil
 }
 
+// cmdValidateConfig loads a config file and reports whether it is valid.
+func cmdValidateConfig(args []string) error {
+	configPath := "config.json"
+	for i, a := range args {
+		if (a == "--config" || a == "-c") && i+1 < len(args) {
+			configPath = args[i+1]
+		}
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("invalid config %q: %w", configPath, err)
+	}
+	fmt.Printf("config %q is valid (mode: %s)\n", configPath, cfg.Mode)
+	return nil
+}
+
 // cmdGenerateConfig prints a JSON config template to stdout.
 func cmdGenerateConfig(args []string) error {
 	mode := config.ModeClient
@@ -142,30 +162,24 @@ func buildLogger(level, logFile string) *slog.Logger {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `tachyon-core - Tachyon network daemon
-
-USAGE:
-  tachyon-core <command> [options]
-
-COMMANDS:
-  run               Start the daemon (client or server mode)
-    --config/-c     Path to config file (default: config.json)
-
-  generate-config   Print a JSON config template to stdout
-    --mode/-m       "client" or "server" (default: client)
-
-  version           Print version information
-
-EXAMPLES:
-  # Start as a client daemon
-  tachyon-core run --config /etc/tachyon/client.json
-
-  # Start as a server
-  tachyon-core run --config /etc/tachyon/server.json
-
-  # Generate a client config template
-  tachyon-core generate-config --mode client > client.json
-`)
+	fmt.Fprint(os.Stderr, "tachyon-core - Tachyon network daemon\n\n"+
+		"USAGE:\n"+
+		"  tachyon-core <command> [options]\n\n"+
+		"COMMANDS:\n"+
+		"  run               Start the daemon (client or server mode)\n"+
+		"    --config/-c     Path to config file (default: config.json)\n\n"+
+		"  validate          Validate a config file (does not start daemon)\n"+
+		"    --config/-c     Path to config file (default: config.json)\n\n"+
+		"  generate-config   Print a JSON config template to stdout\n"+
+		"    --mode/-m       \"client\" or \"server\" (default: client)\n\n"+
+		"  version           Print version information\n\n"+
+		"EXAMPLES:\n"+
+		"  # Start as a client daemon\n"+
+		"  tachyon-core run --config /etc/tachyon/client.json\n\n"+
+		"  # Validate a config file\n"+
+		"  tachyon-core validate --config client.json\n\n"+
+		"  # Generate a client config template\n"+
+		"  tachyon-core generate-config --mode client > client.json\n")
 }
 
 const clientConfigTemplate = `{
@@ -240,7 +254,7 @@ const clientConfigTemplate = `{
     "session_idle_timeout": "60s"
   },
   "ipc": {
-    "websocket_addr": "127.0.0.1:9999",
+    "websocket_addr": "127.0.0.1:55123",
     "grpc_addr": "127.0.0.1:50051",
     "telemetry_interval_ms": 500
   },

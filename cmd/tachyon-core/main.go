@@ -1,4 +1,4 @@
-﻿// tachyon-core: cross-platform network daemon for the Tachyon system.
+// tachyon-core: cross-platform network daemon for the Tachyon system.
 //
 // Usage:
 //
@@ -18,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/tachyon-space/tachyon-core/internal/app"
+	"github.com/tachyon-space/tachyon-core/internal/cli"
 	"github.com/tachyon-space/tachyon-core/internal/config"
 )
 
@@ -37,7 +38,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		printUsage()
+		fmt.Fprint(os.Stderr, cli.Usage())
 		return nil
 	}
 
@@ -56,12 +57,11 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 
 	default:
-		printUsage()
+		fmt.Fprint(os.Stderr, cli.Usage())
 		return fmt.Errorf("unknown command: %q", args[0])
 	}
 }
 
-// cmdRun is the primary subcommand that starts the daemon.
 func cmdRun(args []string) error {
 	configPath := "config.json"
 	for i, a := range args {
@@ -75,7 +75,7 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := buildLogger(cfg.Observability.LogLevel, cfg.Observability.LogFile)
+	logger := cli.BuildLogger(cfg.Observability.LogLevel, cfg.Observability.LogFile)
 	slog.SetDefault(logger)
 
 	slog.Info("tachyon-core starting",
@@ -100,7 +100,6 @@ func cmdRun(args []string) error {
 	return nil
 }
 
-// cmdValidateConfig loads a config file and reports whether it is valid.
 func cmdValidateConfig(args []string) error {
 	configPath := "config.json"
 	for i, a := range args {
@@ -108,15 +107,14 @@ func cmdValidateConfig(args []string) error {
 			configPath = args[i+1]
 		}
 	}
-	cfg, err := config.Load(configPath)
+	mode, err := cli.ValidateConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("invalid config %q: %w", configPath, err)
+		return err
 	}
-	fmt.Printf("config %q is valid (mode: %s)\n", configPath, cfg.Mode)
+	fmt.Printf("config %q is valid (mode: %s)\n", configPath, mode)
 	return nil
 }
 
-// cmdGenerateConfig prints a JSON config template to stdout.
 func cmdGenerateConfig(args []string) error {
 	mode := config.ModeClient
 	for i, a := range args {
@@ -125,175 +123,10 @@ func cmdGenerateConfig(args []string) error {
 		}
 	}
 
-	var tmpl string
-	switch mode {
-	case config.ModeClient:
-		tmpl = clientConfigTemplate
-	case config.ModeServer:
-		tmpl = serverConfigTemplate
-	default:
-		return fmt.Errorf("unknown mode %q; use 'client' or 'server'", mode)
+	tmpl, err := cli.GenerateConfig(mode)
+	if err != nil {
+		return err
 	}
 	fmt.Print(tmpl)
 	return nil
 }
-
-func buildLogger(level, logFile string) *slog.Logger {
-	var lvl slog.Level
-	switch level {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
-	}
-
-	opts := &slog.HandlerOptions{Level: lvl}
-	if logFile != "" {
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err == nil {
-			return slog.New(slog.NewJSONHandler(f, opts))
-		}
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, opts))
-}
-
-func printUsage() {
-	fmt.Fprint(os.Stderr, "tachyon-core - Tachyon network daemon\n\n"+
-		"USAGE:\n"+
-		"  tachyon-core <command> [options]\n\n"+
-		"COMMANDS:\n"+
-		"  run               Start the daemon (client or server mode)\n"+
-		"    --config/-c     Path to config file (default: config.json)\n\n"+
-		"  validate          Validate a config file (does not start daemon)\n"+
-		"    --config/-c     Path to config file (default: config.json)\n\n"+
-		"  generate-config   Print a JSON config template to stdout\n"+
-		"    --mode/-m       \"client\" or \"server\" (default: client)\n\n"+
-		"  version           Print version information\n\n"+
-		"EXAMPLES:\n"+
-		"  # Start as a client daemon\n"+
-		"  tachyon-core run --config /etc/tachyon/client.json\n\n"+
-		"  # Validate a config file\n"+
-		"  tachyon-core validate --config client.json\n\n"+
-		"  # Generate a client config template\n"+
-		"  tachyon-core generate-config --mode client > client.json\n")
-}
-
-const clientConfigTemplate = `{
-  "mode": "client",
-  "client": {
-    "tun": {
-      "name": "",
-      "address": "198.18.0.1/16",
-      "mtu": 9000,
-      "auto_route": true,
-      "dns_hijack": true
-    },
-    "routing": {
-      "default_action": "direct",
-      "game_profiles": [
-        {
-          "id": "cs2",
-          "displayName": "Counter-Strike 2",
-          "enabled": true,
-          "manual": true,
-          "priority": 100,
-          "match": {
-            "processNames": ["cs2.exe"],
-            "paths": [],
-            "pathPrefixes": [],
-            "sha256": [],
-            "steamAppIds": [730]
-          },
-          "udpPolicy": "tgp",
-          "tcpPolicy": "auto"
-        }
-      ],
-      "launchers": {
-        "steam": {
-          "enabled": true,
-          "trackChildProcesses": true,
-          "accelerateGameUdp": true,
-          "accelerateSteamDownloads": false
-        }
-      },
-      "rules": [
-        {
-          "cidr": "192.168.0.0/16",
-          "action": "direct",
-          "priority": 50
-        },
-        {
-          "geoip": "CN",
-          "action": "direct",
-          "priority": 10
-        }
-      ]
-    },
-    "proxy": {
-      "server_addr": "your-game-relay.example.com:443",
-      "tgp_server_addr": "your-game-relay.example.com:443"
-    }
-  },
-  "tgp": {
-    "fec": {
-      "data_shards": 4,
-      "parity_shards": 2,
-      "group_timeout": "20ms"
-    },
-    "pacing": {
-      "initial_rate_pps": 128,
-      "max_rate_pps": 1000
-    },
-    "connection_migration": true,
-    "multipath": false,
-    "handshake_timeout": "5s",
-    "session_idle_timeout": "60s"
-  },
-  "ipc": {
-    "websocket_addr": "127.0.0.1:55123",
-    "grpc_addr": "127.0.0.1:50051",
-    "telemetry_interval_ms": 500
-  },
-  "observability": {
-    "log_level": "info",
-    "log_file": "",
-    "metrics_addr": ""
-  }
-}
-`
-
-const serverConfigTemplate = `{
-  "mode": "server",
-  "server": {
-    "listen": ":443",
-    "relay": {
-      "dial_timeout": "5s",
-      "idle_timeout": "60s"
-    }
-  },
-  "tgp": {
-    "fec": {
-      "data_shards": 4,
-      "parity_shards": 2,
-      "group_timeout": "20ms"
-    },
-    "pacing": {
-      "initial_rate_pps": 128,
-      "max_rate_pps": 1000
-    },
-    "connection_migration": true,
-    "multipath": true,
-    "handshake_timeout": "5s",
-    "session_idle_timeout": "300s"
-  },
-  "observability": {
-    "log_level": "info",
-    "log_file": "/var/log/tachyon/tachyon-core.log",
-    "metrics_addr": "127.0.0.1:19090"
-  }
-}
-`

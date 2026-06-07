@@ -23,10 +23,15 @@ func main() {
 	}
 
 	switch args[0] {
+	case "help", "-h", "--help":
+		fmt.Fprint(os.Stderr, cli.CtlUsage())
+
 	case "version", "-v", "--version":
 		fmt.Printf("tachyonctl %s (built %s with %s)\n", Version, BuildTime, GoVersion)
+
 	case "health":
 		cmdHealth(args[1:])
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %q\n", args[0])
 		fmt.Fprint(os.Stderr, cli.CtlUsage())
@@ -35,6 +40,10 @@ func main() {
 }
 
 func cmdHealth(args []string) {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.CtlUsage())
+		return
+	}
 	addr := "127.0.0.1:55123"
 	for i, a := range args {
 		if (a == "--addr" || a == "-a") && i+1 < len(args) {

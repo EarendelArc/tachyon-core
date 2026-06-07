@@ -110,6 +110,16 @@ func Usage() string {
 		"  tachyon-core generate-config --mode client > client.json\n"
 }
 
+// HasHelp returns true when the argument list contains -h or --help.
+func HasHelp(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
 // CtlUsage returns the tachyonctl usage string.
 func CtlUsage() string {
 	return "tachyonctl - Tachyon Core control CLI\n\n" +

@@ -249,6 +249,48 @@ func TestGenerateConfigProducesParseableConfig(t *testing.T) {
 	}
 }
 
+func TestHasHelpDetectsShortFlag(t *testing.T) {
+	if !HasHelp([]string{"-h"}) {
+		t.Error("expected -h to be detected")
+	}
+}
+
+func TestHasHelpDetectsLongFlag(t *testing.T) {
+	if !HasHelp([]string{"--help"}) {
+		t.Error("expected --help to be detected")
+	}
+}
+
+func TestHasHelpDetectsFlagAmongOtherArgs(t *testing.T) {
+	if !HasHelp([]string{"--config", "client.json", "-h"}) {
+		t.Error("expected -h among other args to be detected")
+	}
+}
+
+func TestHasHelpReturnsFalseWhenAbsent(t *testing.T) {
+	if HasHelp([]string{"--config", "client.json"}) {
+		t.Error("expected false when no help flag")
+	}
+}
+
+func TestHasHelpReturnsFalseForEmptyArgs(t *testing.T) {
+	if HasHelp(nil) {
+		t.Error("expected false for nil args")
+	}
+	if HasHelp([]string{}) {
+		t.Error("expected false for empty args")
+	}
+}
+
+func TestHasHelpIsCaseSensitive(t *testing.T) {
+	if HasHelp([]string{"-H"}) {
+		t.Error("expected -H (uppercase) to not match")
+	}
+	if HasHelp([]string{"--HELP"}) {
+		t.Error("expected --HELP to not match")
+	}
+}
+
 func writeFile(t *testing.T, path string, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

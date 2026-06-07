@@ -43,6 +43,10 @@ func run(args []string) error {
 	}
 
 	switch args[0] {
+	case "help", "-h", "--help":
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+
 	case "version", "-v", "--version":
 		fmt.Printf("tachyon-core %s (built %s with %s)\n", Version, BuildTime, GoVersion)
 		return nil
@@ -63,6 +67,10 @@ func run(args []string) error {
 }
 
 func cmdRun(args []string) error {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+	}
 	configPath := "config.json"
 	for i, a := range args {
 		if (a == "--config" || a == "-c") && i+1 < len(args) {
@@ -101,6 +109,10 @@ func cmdRun(args []string) error {
 }
 
 func cmdValidateConfig(args []string) error {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+	}
 	configPath := "config.json"
 	for i, a := range args {
 		if (a == "--config" || a == "-c") && i+1 < len(args) {
@@ -116,6 +128,10 @@ func cmdValidateConfig(args []string) error {
 }
 
 func cmdGenerateConfig(args []string) error {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+	}
 	mode := config.ModeClient
 	for i, a := range args {
 		if (a == "--mode" || a == "-m") && i+1 < len(args) {

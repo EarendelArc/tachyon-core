@@ -48,7 +48,7 @@ type Config struct {
 	// TGP contains settings shared between client and server TGP paths.
 	TGP TGPConfig `yaml:"tgp" json:"tgp"`
 
-	// IPC controls the Prism â†” Core communication endpoints.
+	// IPC controls the Prism â†?Core communication endpoints.
 	// Only meaningful in client mode.
 	IPC IPCConfig `yaml:"ipc" json:"ipc"`
 
@@ -366,11 +366,19 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	if c.Mode == ModeServer {
+		if c.Server.Listen == "" {
+			return fmt.Errorf("server.listen is required in server mode")
+		}
+	}
 	if c.TGP.FEC.DataShards < 1 {
 		return fmt.Errorf("tgp.fec.data_shards must be >= 1")
 	}
 	if c.TGP.Pacing.InitialRatePPS <= 0 {
 		return fmt.Errorf("tgp.pacing.initial_rate_pps must be > 0")
+	}
+	if c.TGP.Pacing.MaxRatePPS < 0 {
+		return fmt.Errorf("tgp.pacing.max_rate_pps must be >= 0")
 	}
 	return nil
 }

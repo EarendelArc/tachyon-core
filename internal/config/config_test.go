@@ -208,3 +208,156 @@ func quoteJSON(value string) string {
 	}
 	return string(data)
 }
+
+func TestValidateClientRequiresProxyServerAddr(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing server_addr")
+	}
+}
+
+func TestValidateServerRequiresListen(t *testing.T) {
+	cfg := Config{
+		Mode:   ModeServer,
+		Server: ServerConfig{},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing server.listen")
+	}
+}
+
+func TestValidateRejectsInvalidMode(t *testing.T) {
+	cfg := Config{
+		Mode: "unknown",
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestValidateRejectsInsufficientDataShards(t *testing.T) {
+	cfg := Config{
+		Mode: ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 0},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for zero data_shards")
+	}
+}
+
+func TestValidateRejectsZeroInitialRatePPS(t *testing.T) {
+	cfg := Config{
+		Mode: ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 0},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for zero initial_rate_pps")
+	}
+}
+
+func TestValidateRejectsNegativeMaxRatePPS(t *testing.T) {
+	cfg := Config{
+		Mode: ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128, MaxRatePPS: -1},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative max_rate_pps")
+	}
+}
+
+func TestValidateClientWithProfilesAndServerAddr(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{ServerAddr: "game.example.com:443"},
+			Routing: RoutingConfig{
+				GameProfiles: []routing.GameProfile{
+					{
+						ID:          "test",
+						DisplayName: "Test",
+						Match:       routing.MatchRule{ProcessNames: []string{"test.exe"}},
+					},
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config, got error: %v", err)
+	}
+}
+
+func TestValidateServerWithListen(t *testing.T) {
+	cfg := Config{
+		Mode:   ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid server config, got error: %v", err)
+	}
+}
+
+func TestValidateClientDuplicateProfileIDs(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{ServerAddr: "game.example.com:443"},
+			Routing: RoutingConfig{
+				GameProfiles: []routing.GameProfile{
+					{ID: "dup", DisplayName: "A", Match: routing.MatchRule{ProcessNames: []string{"a.exe"}}},
+					{ID: "DUP", DisplayName: "B", Match: routing.MatchRule{ProcessNames: []string{"b.exe"}}},
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for duplicate profile IDs")
+	}
+}

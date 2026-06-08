@@ -16,7 +16,7 @@ import (
 
 func TestHTTPGameProfileLifecycle(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`{
 		"id": "manual",
@@ -69,7 +69,7 @@ func TestHTTPGameProfileLifecycle(t *testing.T) {
 
 func TestHTTPOptionsCORS(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	req := httptest.NewRequest(http.MethodOptions, "/v1/routing/game-profiles", nil)
 	rec := httptest.NewRecorder()
@@ -105,7 +105,7 @@ func TestHTTPScanSteam(t *testing.T) {
 }`)
 
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 	req := httptest.NewRequest(http.MethodGet, "/v1/launchers/steam/scan?root="+url.QueryEscape(root), nil)
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -130,7 +130,7 @@ func TestHTTPScanSteam(t *testing.T) {
 
 func TestHTTPHealth(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
 	rec := httptest.NewRecorder()
@@ -151,7 +151,7 @@ func TestHTTPHealth(t *testing.T) {
 
 func TestHTTPUpdateGameProfile(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	addBody := bytes.NewBufferString(`{
 		"id": "update-me",
@@ -208,7 +208,7 @@ func TestHTTPUpdateGameProfile(t *testing.T) {
 
 func TestHTTPPostDuplicateID(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`{
 		"id": "dup",
@@ -236,7 +236,7 @@ func TestHTTPPostDuplicateID(t *testing.T) {
 
 func TestHTTPDeleteNotFound(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	req := httptest.NewRequest(http.MethodDelete, "/v1/routing/game-profiles/nonexistent", nil)
 	rec := httptest.NewRecorder()
@@ -249,7 +249,7 @@ func TestHTTPDeleteNotFound(t *testing.T) {
 
 func TestHTTPPutNotFound(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`{
 		"id": "nonexistent",
@@ -271,7 +271,7 @@ func TestHTTPPutNotFound(t *testing.T) {
 
 func TestHTTPPostInvalidJSON(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`not json`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/routing/game-profiles", body)
@@ -285,7 +285,7 @@ func TestHTTPPostInvalidJSON(t *testing.T) {
 
 func TestHTTPPostMissingRequiredFields(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`{
 		"id": "",
@@ -303,7 +303,7 @@ func TestHTTPPostMissingRequiredFields(t *testing.T) {
 
 func TestHTTPGetEmptyProfiles(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/routing/game-profiles", nil)
 	rec := httptest.NewRecorder()
@@ -326,7 +326,7 @@ func TestHTTPGetEmptyProfiles(t *testing.T) {
 
 func TestHTTPPutEmptyID(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
-	server := NewHTTPServer(routingService)
+	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
 	body := bytes.NewBufferString(`{
 		"id": "",
@@ -358,3 +358,4 @@ func writeFile(t *testing.T, path string, content string) {
 func escapeVDFPath(path string) string {
 	return strings.ReplaceAll(path, `\`, `\\`)
 }
+

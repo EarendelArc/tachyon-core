@@ -148,3 +148,14 @@ func (m *ClientManager) readLoop(session Session) {
 		}
 	}
 }
+
+// ActiveSessions returns 1 if a TGP session is currently active, 0 otherwise.
+// Satisfies the observability.SessionCounter interface.
+func (m *ClientManager) ActiveSessions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.session != nil && m.session.State() != SessionClosed {
+		return 1
+	}
+	return 0
+}

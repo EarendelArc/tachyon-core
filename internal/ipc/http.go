@@ -10,18 +10,27 @@ import (
 	"strings"
 
 	"github.com/tachyon-space/tachyon-core/internal/launcher"
+	"github.com/tachyon-space/tachyon-core/internal/observability"
 	"github.com/tachyon-space/tachyon-core/internal/routing"
 )
 
 type HTTPServer struct {
-	routing *routing.Service
-	mux     *http.ServeMux
+	routing      *routing.Service
+	broadcaster  *observability.Broadcaster
+	mux          *http.ServeMux
 }
 
-func NewHTTPServer(routingService *routing.Service) *HTTPServer {
+// HTTPOptions configures the IPC HTTP server.
+type HTTPOptions struct {
+	Routing     *routing.Service
+	Broadcaster *observability.Broadcaster
+}
+
+func NewHTTPServer(opts HTTPOptions) *HTTPServer {
 	server := &HTTPServer{
-		routing: routingService,
-		mux:     http.NewServeMux(),
+		routing:     opts.Routing,
+		broadcaster: opts.Broadcaster,
+		mux:         http.NewServeMux(),
 	}
 	server.routes()
 	return server
@@ -47,6 +56,9 @@ func (s *HTTPServer) routes() {
 	s.mux.HandleFunc("PUT /v1/routing/game-profiles/", s.handleUpdateGameProfile)
 	s.mux.HandleFunc("DELETE /v1/routing/game-profiles/", s.handleRemoveGameProfile)
 	s.mux.HandleFunc("GET /v1/launchers/steam/scan", s.handleScanSteam)
+	if s.broadcaster != nil {
+		s.mux.Handle("GET /v1/telemetry/sse", s.broadcaster)
+	}
 }
 
 func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {

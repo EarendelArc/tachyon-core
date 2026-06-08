@@ -31,6 +31,7 @@ import (
 
 	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/ipc"
+	"github.com/tachyon-space/tachyon-core/internal/observability"
 	"github.com/tachyon-space/tachyon-core/internal/pidtrack"
 	"github.com/tachyon-space/tachyon-core/internal/pipeline"
 	"github.com/tachyon-space/tachyon-core/internal/routing"
@@ -119,23 +120,6 @@ func (a *App) runClient(ctx context.Context) error {
 	packetRouter := pipeline.NewRouter(a.cfg.Client.Routing, gameEngine)
 	a.logger.Info("routing engine ready", "profiles", len(gameEngine.Profiles), "config_rules", len(a.cfg.Client.Routing.Rules))
 
-	ipcHTTP := ipc.NewHTTPServer(routingService)
-	httpServer := &http.Server{
-		Addr:              clientHTTPAddr(a.cfg.IPC),
-		Handler:           ipcHTTP.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	errCh := make(chan error, 3)
-	go func() {
-		a.logger.Info("IPC HTTP bridge listening", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("IPC HTTP bridge: %w", err)
-		}
-	}()
-
-	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
-
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
 		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
@@ -167,6 +151,37 @@ func (a *App) runClient(ctx context.Context) error {
 		},
 		Logger: a.logger,
 	})
+
+	telemetryCollector := observability.NewCollector(packetPipeline, tgpManager)
+	telemetryBroadcaster := observability.NewBroadcaster(observability.BroadcasterOptions{
+		Collector:         telemetryCollector,
+		Logger:            a.logger,
+		Version:           "dev",
+		ConfigPath:        "",
+		TelemetryInterval: time.Duration(a.cfg.IPC.TelemetryIntervalMS) * time.Millisecond,
+	})
+	go telemetryBroadcaster.Start(ctx)
+
+	ipcHTTP := ipc.NewHTTPServer(ipc.HTTPOptions{
+		Routing:     routingService,
+		Broadcaster: telemetryBroadcaster,
+	})
+	httpServer := &http.Server{
+		Addr:              clientHTTPAddr(a.cfg.IPC),
+		Handler:           ipcHTTP.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	errCh := make(chan error, 3)
+	go func() {
+		a.logger.Info("IPC HTTP bridge listening", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("IPC HTTP bridge: %w", err)
+		}
+	}()
+
+	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
+
 	go func() {
 		a.logger.Info("TUN packet pipeline running")
 		if err := packetPipeline.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -189,6 +204,7 @@ func (a *App) runClient(ctx context.Context) error {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
 	}
+	telemetryBroadcaster.Close()
 	if err := a.shutdownClient(shutdownCtx); err != nil {
 		return err
 	}
@@ -351,3 +367,5 @@ func (a *App) shutdownServer(ctx context.Context) error {
 	a.logger.Info("server shutdown complete")
 	return nil
 }
+
+

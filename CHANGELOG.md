@@ -5,6 +5,10 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Real-time SSE telemetry stream at `/v1/telemetry/sse` with hello, telemetry, route_event, tgp_session, and error events.
+- `internal/observability` package: event types, stats collector, SSE broadcaster (16 tests).
+- `Pipeline` stats accessor methods satisfying `observability.PipelineStats` interface.
+- `ClientManager.ActiveSessions()` for telemetry session counting.
 - Config validation: `server.listen` required in server mode, negative `max_rate_pps` rejected.
 - Routing store validation and config tests (13 tests).
 - Routing engine profile matching coverage (8 new edge-case tests).
@@ -38,3 +42,4 @@ All notable changes to Tachyon Core will be documented in this file.
 - GitHub Actions CI (test + cross-compile) and release workflow (7 platform binaries + SHA256SUMS).
 - Comprehensive documentation: IPC API, TGP spec, game-mode routing, architecture, development.
 - 136 tests across 29 test files.
+

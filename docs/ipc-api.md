@@ -22,6 +22,7 @@ new Prism builds persist profiles locally and regenerate Core JSON instead.
 | `PUT` | `/v1/routing/game-profiles/{id}` | Compatibility: replace an in-memory game profile |
 | `DELETE` | `/v1/routing/game-profiles/{id}` | Compatibility: remove an in-memory game profile |
 | `GET` | `/v1/launchers/steam/scan?root=...` | Compatibility: legacy Steam scan endpoint |
+| `GET` | `/v1/telemetry/sse` | Real-time telemetry stream (SSE) |
 
 ## Route Decisions
 
@@ -36,9 +37,15 @@ Core route actions are intentionally limited:
 There is no `xray` action in Core. Prism is responsible for any Xray process,
 TCP proxy, and subscription-derived outbound selection.
 
-## Future Telemetry Events
+## Telemetry Stream (SSE)
 
-The planned WebSocket telemetry stream should only include Core-owned state:
+The telemetry stream is implemented as Server-Sent Events (SSE) at
+`/v1/telemetry/sse`. Clients connect with a standard HTTP GET request and
+receive a continuous stream of `text/event-stream` data. A `hello` event is
+sent immediately on connect, followed by periodic `telemetry` snapshots at
+the interval configured in `ipc.telemetry_interval_ms` (default 500ms).
+
+The stream only includes Core-owned state:
 
 | Event | Direction | Description |
 | --- | --- | --- |
@@ -88,3 +95,4 @@ service CoreControl {
 | `INVALID_PROFILE` | Game profile payload is invalid |
 | `TUN_PERMISSION_DENIED` | Insufficient OS privileges to create TUN device |
 | `TGP_SESSION_FAILED` | TGP session handshake or transport failed |
+

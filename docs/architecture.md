@@ -25,3 +25,32 @@ Prism-managed game profiles are embedded in Core JSON under
 `client.routing.launchers`. The legacy local HTTP routing bridge is kept only as
 an integration compatibility surface; a Prism-generated `client.json` is enough
 to start Core with the intended game routing policy.
+
+## Telemetry Stream
+
+Core exposes a real-time Server-Sent Events (SSE) endpoint at
+GET /v1/telemetry/sse on the same HTTP bridge used for IPC. No external
+dependencies are required ¡ª the internal/observability package implements
+the broadcaster using only the Go standard library.
+
+**Event types:**
+
+| Event | Description |
+| --- | --- |
+| hello | Sent once on connect: Core version, platform, config path |
+| 	elemetry | Periodic snapshot: packet counters, TGP sessions, goroutine count |
+| oute_event | Fired per packet: process name, flow 4-tuple, decision, matched rule |
+| 	gp_session | TGP session lifecycle: opened, closed, migrated |
+| error | Non-fatal Core error |
+
+**Data flow:**
+
+`	ext
+pipeline.handlePacket()
+  ©À©¤ router.Decide() ¡ú onDecision callback ¡ú broadcaster.Broadcast(route_event)
+  ©À©¤ pipeline.Snapshot() ¡û collector.Snapshot() ¡ú broadcaster(telemetry, periodic)
+  ©¸©¤ tgpManager.ActiveSessions() ¡û collector.Snapshot()
+`
+
+The broadcast interval is controlled by ipc.telemetry_interval_ms (default 500ms).
+Slow clients have events dropped rather than blocking the pipeline.

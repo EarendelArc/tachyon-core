@@ -150,6 +150,19 @@ func (a *App) runClient(ctx context.Context) error {
 			tgp:    tgpManager,
 		},
 		Logger: a.logger,
+		OnDecision: func(d pipeline.Decision) {
+			routeEvent := observability.NewRouteEvent(observability.RouteEventData{
+				ProcessName: d.Process.Name,
+				PID:         uint32(d.Process.PID),
+				Src:         fmt.Sprintf("%s:%d", d.Flow.LocalIP, d.Flow.LocalPort),
+				Dst:         fmt.Sprintf("%s:%d", d.Flow.RemoteIP, d.Flow.RemotePort),
+				Proto:       string(d.Flow.Transport),
+				Decision:    string(d.Action),
+				RuleMatched: d.Reason,
+			})
+			routeEvent.Seq = telemetryCollector.NextSeq()
+			telemetryBroadcaster.Broadcast(routeEvent)
+		},
 	})
 
 	telemetryCollector := observability.NewCollector(packetPipeline, tgpManager)
@@ -367,5 +380,6 @@ func (a *App) shutdownServer(ctx context.Context) error {
 	a.logger.Info("server shutdown complete")
 	return nil
 }
+
 
 

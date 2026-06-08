@@ -36,13 +36,19 @@ type Stats struct {
 }
 
 type Pipeline struct {
-	device  tun.Device
-	tracker Tracker
-	router  *Router
-	handler Handler
-	logger  *slog.Logger
-	stats   Stats
+	device      tun.Device
+	tracker     Tracker
+	router      *Router
+	handler     Handler
+	logger      *slog.Logger
+	onDecision  DecisionCallback
+	stats       Stats
 }
+
+// DecisionCallback is called after each routing decision with the flow,
+// process info, and chosen action. Implementations must be fast and
+// non-blocking since it runs on the hot packet path.
+type DecisionCallback func(decision Decision)
 
 type Options struct {
 	Device  tun.Device
@@ -50,6 +56,9 @@ type Options struct {
 	Router  *Router
 	Handler Handler
 	Logger  *slog.Logger
+
+	// OnDecision, if set, is called for every routing decision.
+	OnDecision DecisionCallback
 }
 
 func New(opts Options) *Pipeline {
@@ -62,11 +71,12 @@ func New(opts Options) *Pipeline {
 		handler = HandlerFunc(func(context.Context, Decision, []byte) error { return nil })
 	}
 	return &Pipeline{
-		device:  opts.Device,
-		tracker: opts.Tracker,
-		router:  opts.Router,
-		handler: handler,
-		logger:  logger,
+		device:     opts.Device,
+		tracker:    opts.Tracker,
+		router:     opts.Router,
+		handler:    handler,
+		logger:     logger,
+		onDecision: opts.OnDecision,
 	}
 }
 
@@ -123,6 +133,9 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 
 	decision := p.router.Decide(flow, proc)
 	p.countDecision(decision.Action)
+	if p.onDecision != nil {
+		p.onDecision(decision)
+	}
 
 	if err := p.handler.HandlePacket(ctx, decision, packet); err != nil {
 		atomic.AddUint64(&p.stats.HandlerErrors, 1)
@@ -165,3 +178,4 @@ func (h LoggingHandler) HandlePacket(ctx context.Context, decision Decision, pac
 	)
 	return nil
 }
+

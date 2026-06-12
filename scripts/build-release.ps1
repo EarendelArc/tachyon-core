@@ -26,20 +26,41 @@ if ($goCommand) {
     $goExecutable = $goCommand.Source
 }
 else {
-    $miseCommand = Get-Command mise -ErrorAction SilentlyContinue
-    if (-not $miseCommand) {
-        throw "go is not on PATH and mise is not available"
+    $goVersionFromTools = $null
+    $toolVersionsPath = Join-Path $root ".tool-versions"
+    if (Test-Path -LiteralPath $toolVersionsPath) {
+        $goLine = Get-Content -LiteralPath $toolVersionsPath |
+            Where-Object { $_ -match '^\s*go\s+(.+?)\s*$' } |
+            Select-Object -First 1
+        if ($goLine -match '^\s*go\s+(.+?)\s*$') {
+            $goVersionFromTools = $Matches[1]
+        }
     }
-    $miseGoRoot = (& mise where go).Trim()
-    if ([string]::IsNullOrWhiteSpace($miseGoRoot)) {
-        throw "mise did not return a Go install path"
+
+    if ($goVersionFromTools) {
+        $candidate = Join-Path $env:USERPROFILE "AppData\Local\mise\installs\go\$goVersionFromTools\bin\go.exe"
+        if (Test-Path -LiteralPath $candidate) {
+            $goExecutable = $candidate
+        }
     }
-    $goExecutable = Join-Path $miseGoRoot "bin\go.exe"
+
+    if (-not $goExecutable) {
+        $miseCommand = Get-Command mise -ErrorAction SilentlyContinue
+        if (-not $miseCommand) {
+            throw "go is not on PATH and mise is not available"
+        }
+        $miseGoRoot = (& mise exec -- go env GOROOT).Trim()
+        if ([string]::IsNullOrWhiteSpace($miseGoRoot)) {
+            throw "mise did not return a Go install path"
+        }
+        $goExecutable = Join-Path $miseGoRoot "bin\go.exe"
+        if (-not (Test-Path -LiteralPath $goExecutable)) {
+            $goExecutable = Join-Path $miseGoRoot "bin/go"
+        }
+    }
+
     if (-not (Test-Path -LiteralPath $goExecutable)) {
-        $goExecutable = Join-Path $miseGoRoot "bin/go"
-    }
-    if (-not (Test-Path -LiteralPath $goExecutable)) {
-        throw "go executable not found under $miseGoRoot"
+        throw "go executable not found"
     }
 }
 

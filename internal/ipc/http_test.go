@@ -127,7 +127,6 @@ func TestHTTPScanSteam(t *testing.T) {
 	}
 }
 
-
 func TestHTTPHealth(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
 	server := NewHTTPServer(HTTPOptions{Routing: routingService})
@@ -210,7 +209,7 @@ func TestHTTPPostDuplicateID(t *testing.T) {
 	routingService := routing.NewService(routing.NewMemoryStore(routing.DefaultConfig()))
 	server := NewHTTPServer(HTTPOptions{Routing: routingService})
 
-	body := bytes.NewBufferString(`{
+	body := `{
 		"id": "dup",
 		"displayName": "Dup",
 		"enabled": true,
@@ -218,15 +217,15 @@ func TestHTTPPostDuplicateID(t *testing.T) {
 		"match": {"processNames": ["dup.exe"]},
 		"udpPolicy": "tgp",
 		"tcpPolicy": "auto"
-	}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/routing/game-profiles", body)
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/routing/game-profiles", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("first add: %d %s", rec.Code, rec.Body.String())
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/v1/routing/game-profiles", body)
+	req = httptest.NewRequest(http.MethodPost, "/v1/routing/game-profiles", bytes.NewBufferString(body))
 	rec = httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
@@ -358,4 +357,3 @@ func writeFile(t *testing.T, path string, content string) {
 func escapeVDFPath(path string) string {
 	return strings.ReplaceAll(path, `\`, `\\`)
 }
-

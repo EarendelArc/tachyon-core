@@ -53,10 +53,24 @@ func BuildLogger(level, logFile string) *slog.Logger {
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err == nil {
-			return slog.New(slog.NewJSONHandler(f, opts))
+			_ = f.Close()
+			return slog.New(slog.NewJSONHandler(appendFileWriter{path: logFile}, opts))
 		}
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+}
+
+type appendFileWriter struct {
+	path string
+}
+
+func (w appendFileWriter) Write(p []byte) (int, error) {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.Write(p)
 }
 
 // HealthResponse is the parsed health endpoint response.

@@ -48,7 +48,7 @@ type Config struct {
 	// TGP contains settings shared between client and server TGP paths.
 	TGP TGPConfig `yaml:"tgp" json:"tgp"`
 
-	// IPC controls the Prism â†?Core communication endpoints.
+	// IPC controls the Prism-to-Core communication endpoints.
 	// Only meaningful in client mode.
 	IPC IPCConfig `yaml:"ipc" json:"ipc"`
 

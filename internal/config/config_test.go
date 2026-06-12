@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tachyon-space/tachyon-core/internal/routing"
 )
 
 func TestLoadJSONConfig(t *testing.T) {
@@ -257,7 +259,7 @@ func TestValidateRejectsInvalidMode(t *testing.T) {
 
 func TestValidateRejectsInsufficientDataShards(t *testing.T) {
 	cfg := Config{
-		Mode: ModeServer,
+		Mode:   ModeServer,
 		Server: ServerConfig{Listen: ":443"},
 		TGP: TGPConfig{
 			FEC:    FECConfig{DataShards: 0},
@@ -272,7 +274,7 @@ func TestValidateRejectsInsufficientDataShards(t *testing.T) {
 
 func TestValidateRejectsZeroInitialRatePPS(t *testing.T) {
 	cfg := Config{
-		Mode: ModeServer,
+		Mode:   ModeServer,
 		Server: ServerConfig{Listen: ":443"},
 		TGP: TGPConfig{
 			FEC:    FECConfig{DataShards: 4},
@@ -287,7 +289,7 @@ func TestValidateRejectsZeroInitialRatePPS(t *testing.T) {
 
 func TestValidateRejectsNegativeMaxRatePPS(t *testing.T) {
 	cfg := Config{
-		Mode: ModeServer,
+		Mode:   ModeServer,
 		Server: ServerConfig{Listen: ":443"},
 		TGP: TGPConfig{
 			FEC:    FECConfig{DataShards: 4},

@@ -141,6 +141,8 @@ func (a *App) runClient(ctx context.Context) error {
 		}
 	}()
 
+	var telemetryCollector *observability.Collector
+	var telemetryBroadcaster *observability.Broadcaster
 	packetPipeline := pipeline.New(pipeline.Options{
 		Device:  tunDevice,
 		Tracker: tracker,
@@ -160,13 +162,15 @@ func (a *App) runClient(ctx context.Context) error {
 				Decision:    string(d.Action),
 				RuleMatched: d.Reason,
 			})
-			routeEvent.Seq = telemetryCollector.NextSeq()
-			telemetryBroadcaster.Broadcast(routeEvent)
+			if telemetryCollector != nil && telemetryBroadcaster != nil {
+				routeEvent.Seq = telemetryCollector.NextSeq()
+				telemetryBroadcaster.Broadcast(routeEvent)
+			}
 		},
 	})
 
-	telemetryCollector := observability.NewCollector(packetPipeline, tgpManager)
-	telemetryBroadcaster := observability.NewBroadcaster(observability.BroadcasterOptions{
+	telemetryCollector = observability.NewCollector(packetPipeline, tgpManager)
+	telemetryBroadcaster = observability.NewBroadcaster(observability.BroadcasterOptions{
 		Collector:         telemetryCollector,
 		Logger:            a.logger,
 		Version:           "dev",
@@ -380,6 +384,3 @@ func (a *App) shutdownServer(ctx context.Context) error {
 	a.logger.Info("server shutdown complete")
 	return nil
 }
-
-
-

@@ -10,16 +10,16 @@ import (
 )
 
 func TestGenerateConfigClient(t *testing.T) {
-	json, err := GenerateConfig(config.ModeClient)
+	rendered, err := GenerateConfig(config.ModeClient)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if json == "" {
+	if rendered == "" {
 		t.Fatal("empty client template")
 	}
 
 	var parsed map[string]any
-	if err := json.Unmarshal([]byte(json), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(rendered), &parsed); err != nil {
 		t.Fatalf("client template is not valid JSON: %v", err)
 	}
 
@@ -41,13 +41,13 @@ func TestGenerateConfigClient(t *testing.T) {
 }
 
 func TestGenerateConfigServer(t *testing.T) {
-	json, err := GenerateConfig(config.ModeServer)
+	rendered, err := GenerateConfig(config.ModeServer)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var parsed map[string]any
-	if err := json.Unmarshal([]byte(json), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(rendered), &parsed); err != nil {
 		t.Fatalf("server template is not valid JSON: %v", err)
 	}
 

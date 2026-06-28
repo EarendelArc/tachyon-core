@@ -4,6 +4,21 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.1.0-alpha.5] - 2026-06-28
+
+### Added
+- Byte-level telemetry counters for pipeline read bytes, TGP-routed bytes, direct bytes, and dropped bytes.
+- TGP session byte counters exposed through the observability collector for Prism dual-core traffic charts.
+- Tests covering pipeline byte accounting, observability snapshots, and telemetry event serialization.
+
+### Changed
+- Telemetry SSE payloads now include byte fields while preserving existing packet and decision counters.
+
+## [v0.1.0-alpha.4] - 2026-06-28
+
+### Changed
+- Hardened the local release script's Go tool discovery for mise-managed environments.
+
 ### Added
 - Real-time SSE telemetry stream at `/v1/telemetry/sse` with hello, telemetry, route_event, tgp_session, and error events.
 - `internal/observability` package: event types, stats collector, SSE broadcaster (16 tests).

@@ -65,7 +65,6 @@ func TestSteamGameProcessAcceleratesUDP(t *testing.T) {
 	}
 }
 
-
 func TestDisabledProfileDoesNotMatch(t *testing.T) {
 	engine := Engine{
 		Profiles: []GameProfile{
@@ -198,6 +197,54 @@ func TestPathPrefixMatching(t *testing.T) {
 	)
 	if decision.ProfileID != "prefix-match" {
 		t.Fatalf("expected prefix match, got %q decision", decision.Kind)
+	}
+}
+
+func TestPathPrefixMatchingWithNormalizedSlashes(t *testing.T) {
+	engine := Engine{
+		Profiles: []GameProfile{
+			{
+				ID:          "prefix-match",
+				DisplayName: "Prefix Match",
+				Enabled:     true,
+				Manual:      true,
+				Priority:    100,
+				Match:       MatchRule{PathPrefixes: []string{`C:\Games`}},
+				UDPPolicy:   UDPPolicyTGP,
+			},
+		},
+	}
+
+	decision := engine.Decide(
+		pidtrack.ProcessInfo{ExecutablePath: `C:/Games/sub/game.exe`},
+		pidtrack.FlowKey{Transport: pidtrack.TransportUDP},
+	)
+	if decision.ProfileID != "prefix-match" {
+		t.Fatalf("expected prefix match, got %q decision", decision.Kind)
+	}
+}
+
+func TestPathPrefixRequiresBoundary(t *testing.T) {
+	engine := Engine{
+		Profiles: []GameProfile{
+			{
+				ID:          "prefix-match",
+				DisplayName: "Prefix Match",
+				Enabled:     true,
+				Manual:      true,
+				Priority:    100,
+				Match:       MatchRule{PathPrefixes: []string{`C:\Games`}},
+				UDPPolicy:   UDPPolicyTGP,
+			},
+		},
+	}
+
+	decision := engine.Decide(
+		pidtrack.ProcessInfo{ExecutablePath: `C:\Games2\game.exe`},
+		pidtrack.FlowKey{Transport: pidtrack.TransportUDP},
+	)
+	if decision.Kind != DecisionDefault {
+		t.Fatalf("expected default decision, got %q", decision.Kind)
 	}
 }
 

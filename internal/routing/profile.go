@@ -1,7 +1,7 @@
 package routing
 
 import (
-	"path/filepath"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -248,7 +248,8 @@ func pathEqualsAny(values []string, target string) bool {
 func pathHasPrefixAny(prefixes []string, target string) bool {
 	normalizedTarget := normalizePath(target)
 	for _, prefix := range prefixes {
-		if strings.HasPrefix(normalizedTarget, normalizePath(prefix)) {
+		normalizedPrefix := normalizePath(prefix)
+		if pathPrefixMatch(normalizedPrefix, normalizedTarget) {
 			return true
 		}
 	}
@@ -256,7 +257,21 @@ func pathHasPrefixAny(prefixes []string, target string) bool {
 }
 
 func normalizePath(path string) string {
-	cleaned := filepath.Clean(path)
-	cleaned = filepath.ToSlash(cleaned)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	cleaned := pathpkg.Clean(strings.ReplaceAll(path, "\\", "/"))
 	return strings.ToLower(cleaned)
+}
+
+func pathPrefixMatch(prefix string, target string) bool {
+	if prefix == "" || target == "" {
+		return false
+	}
+	if prefix == target {
+		return true
+	}
+	prefix = strings.TrimSuffix(prefix, "/")
+	return strings.HasPrefix(target, prefix+"/")
 }

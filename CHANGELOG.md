@@ -4,6 +4,12 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.1.0-alpha.6] - 2026-06-28
+
+### Fixed
+- Made executable path matching independent of the CI runner OS by normalizing Windows and POSIX separators with portable path semantics.
+- Prevented path-prefix game rules from matching adjacent sibling directories such as `C:\Games2`.
+
 ## [v0.1.0-alpha.5] - 2026-06-28
 
 ### Added

@@ -75,7 +75,7 @@ func TestPipelineReadsLooksUpAndDecides(t *testing.T) {
 	if got.Action != ActionTGP {
 		t.Fatalf("expected tgp decision, got %#v", got)
 	}
-	if stats := p.Snapshot(); stats.PacketsRead != 1 || stats.DecidedTGP != 1 {
+	if stats := p.Snapshot(); stats.PacketsRead != 1 || stats.DecidedTGP != 1 || stats.BytesRead != uint64(len(packet)) || stats.BytesTGP != uint64(len(packet)) {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
 }

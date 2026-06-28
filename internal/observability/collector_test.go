@@ -6,6 +6,10 @@ import (
 
 type mockPipelineStats struct {
 	packetsRead   uint64
+	bytesRead     uint64
+	bytesTGP      uint64
+	bytesDirect   uint64
+	bytesDrop     uint64
 	unsupported   uint64
 	lookupErrors  uint64
 	decidedTGP    uint64
@@ -15,20 +19,34 @@ type mockPipelineStats struct {
 }
 
 func (m *mockPipelineStats) PacketsRead() uint64   { return m.packetsRead }
-func (m *mockPipelineStats) Unsupported() uint64    { return m.unsupported }
-func (m *mockPipelineStats) LookupErrors() uint64   { return m.lookupErrors }
-func (m *mockPipelineStats) DecidedTGP() uint64     { return m.decidedTGP }
-func (m *mockPipelineStats) DecidedDirect() uint64   { return m.decidedDirect }
-func (m *mockPipelineStats) DecidedDrop() uint64     { return m.decidedDrop }
-func (m *mockPipelineStats) HandlerErrors() uint64   { return m.handlerErrors }
+func (m *mockPipelineStats) BytesRead() uint64     { return m.bytesRead }
+func (m *mockPipelineStats) BytesTGP() uint64      { return m.bytesTGP }
+func (m *mockPipelineStats) BytesDirect() uint64   { return m.bytesDirect }
+func (m *mockPipelineStats) BytesDrop() uint64     { return m.bytesDrop }
+func (m *mockPipelineStats) Unsupported() uint64   { return m.unsupported }
+func (m *mockPipelineStats) LookupErrors() uint64  { return m.lookupErrors }
+func (m *mockPipelineStats) DecidedTGP() uint64    { return m.decidedTGP }
+func (m *mockPipelineStats) DecidedDirect() uint64 { return m.decidedDirect }
+func (m *mockPipelineStats) DecidedDrop() uint64   { return m.decidedDrop }
+func (m *mockPipelineStats) HandlerErrors() uint64 { return m.handlerErrors }
 
-type mockSessionCounter struct{ count int }
+type mockSessionCounter struct {
+	count         int
+	bytesSent     uint64
+	bytesReceived uint64
+}
 
-func (m *mockSessionCounter) ActiveSessions() int { return m.count }
+func (m *mockSessionCounter) ActiveSessions() int          { return m.count }
+func (m *mockSessionCounter) SessionBytesSent() uint64     { return m.bytesSent }
+func (m *mockSessionCounter) SessionBytesReceived() uint64 { return m.bytesReceived }
 
 func TestCollectorSnapshot(t *testing.T) {
 	pipeline := &mockPipelineStats{
 		packetsRead:   1000,
+		bytesRead:     64000,
+		bytesTGP:      48000,
+		bytesDirect:   12000,
+		bytesDrop:     4000,
 		unsupported:   5,
 		lookupErrors:  10,
 		decidedTGP:    600,
@@ -36,7 +54,7 @@ func TestCollectorSnapshot(t *testing.T) {
 		decidedDrop:   85,
 		handlerErrors: 2,
 	}
-	sessions := &mockSessionCounter{count: 1}
+	sessions := &mockSessionCounter{count: 1, bytesSent: 32768, bytesReceived: 65536}
 	c := NewCollector(pipeline, sessions)
 
 	snap := c.Snapshot()
@@ -48,6 +66,12 @@ func TestCollectorSnapshot(t *testing.T) {
 	}
 	if snap.DecidedTGP != 600 {
 		t.Fatalf("expected 600 tgp, got %d", snap.DecidedTGP)
+	}
+	if snap.BytesRead != 64000 || snap.BytesTGP != 48000 || snap.BytesDirect != 12000 || snap.BytesDrop != 4000 {
+		t.Fatalf("unexpected byte counters: %#v", snap)
+	}
+	if snap.TGPBytesSent != 32768 || snap.TGPBytesReceived != 65536 {
+		t.Fatalf("unexpected tgp byte counters: %#v", snap)
 	}
 	if snap.TGPSessions != 1 {
 		t.Fatalf("expected 1 session, got %d", snap.TGPSessions)

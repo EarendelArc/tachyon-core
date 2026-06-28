@@ -27,6 +27,10 @@ func (f HandlerFunc) HandlePacket(ctx context.Context, decision Decision, packet
 
 type Stats struct {
 	PacketsRead   uint64
+	BytesRead     uint64
+	BytesTGP      uint64
+	BytesDirect   uint64
+	BytesDrop     uint64
 	Unsupported   uint64
 	LookupErrors  uint64
 	DecidedTGP    uint64
@@ -36,13 +40,13 @@ type Stats struct {
 }
 
 type Pipeline struct {
-	device      tun.Device
-	tracker     Tracker
-	router      *Router
-	handler     Handler
-	logger      *slog.Logger
-	onDecision  DecisionCallback
-	stats       Stats
+	device     tun.Device
+	tracker    Tracker
+	router     *Router
+	handler    Handler
+	logger     *slog.Logger
+	onDecision DecisionCallback
+	stats      Stats
 }
 
 // DecisionCallback is called after each routing decision with the flow,
@@ -100,6 +104,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 		packet := append([]byte(nil), buf[:n]...)
 		atomic.AddUint64(&p.stats.PacketsRead, 1)
+		atomic.AddUint64(&p.stats.BytesRead, uint64(len(packet)))
 		if err := p.handlePacket(ctx, packet); err != nil && ctx.Err() == nil {
 			p.logger.Warn("packet pipeline handler error", "error", err)
 		}
@@ -109,6 +114,10 @@ func (p *Pipeline) Run(ctx context.Context) error {
 func (p *Pipeline) Snapshot() Stats {
 	return Stats{
 		PacketsRead:   atomic.LoadUint64(&p.stats.PacketsRead),
+		BytesRead:     atomic.LoadUint64(&p.stats.BytesRead),
+		BytesTGP:      atomic.LoadUint64(&p.stats.BytesTGP),
+		BytesDirect:   atomic.LoadUint64(&p.stats.BytesDirect),
+		BytesDrop:     atomic.LoadUint64(&p.stats.BytesDrop),
 		Unsupported:   atomic.LoadUint64(&p.stats.Unsupported),
 		LookupErrors:  atomic.LoadUint64(&p.stats.LookupErrors),
 		DecidedTGP:    atomic.LoadUint64(&p.stats.DecidedTGP),
@@ -132,7 +141,7 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 	}
 
 	decision := p.router.Decide(flow, proc)
-	p.countDecision(decision.Action)
+	p.countDecision(decision.Action, len(packet))
 	if p.onDecision != nil {
 		p.onDecision(decision)
 	}
@@ -144,14 +153,18 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 	return nil
 }
 
-func (p *Pipeline) countDecision(action Action) {
+func (p *Pipeline) countDecision(action Action, packetBytes int) {
+	bytes := uint64(packetBytes)
 	switch action {
 	case ActionTGP:
 		atomic.AddUint64(&p.stats.DecidedTGP, 1)
+		atomic.AddUint64(&p.stats.BytesTGP, bytes)
 	case ActionDirect:
 		atomic.AddUint64(&p.stats.DecidedDirect, 1)
+		atomic.AddUint64(&p.stats.BytesDirect, bytes)
 	case ActionDrop:
 		atomic.AddUint64(&p.stats.DecidedDrop, 1)
+		atomic.AddUint64(&p.stats.BytesDrop, bytes)
 	}
 }
 
@@ -178,4 +191,3 @@ func (h LoggingHandler) HandlePacket(ctx context.Context, decision Decision, pac
 	)
 	return nil
 }
-

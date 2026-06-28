@@ -46,15 +46,21 @@ type HelloData struct {
 
 // TelemetryData contains periodic pipeline and session metrics.
 type TelemetryData struct {
-	PacketsRead   uint64  `json:"packets_read"`
-	Unsupported   uint64  `json:"unsupported"`
-	LookupErrors  uint64  `json:"lookup_errors"`
-	DecidedTGP    uint64  `json:"decided_tgp"`
-	DecidedDirect uint64  `json:"decided_direct"`
-	DecidedDrop   uint64  `json:"decided_drop"`
-	HandlerErrors uint64  `json:"handler_errors"`
-	TGPSessions   int     `json:"tgp_sessions"`
-	Goroutines    int     `json:"goroutines"`
+	PacketsRead      uint64 `json:"packets_read"`
+	BytesRead        uint64 `json:"bytes_read"`
+	BytesTGP         uint64 `json:"bytes_tgp"`
+	BytesDirect      uint64 `json:"bytes_direct"`
+	BytesDrop        uint64 `json:"bytes_drop"`
+	TGPBytesSent     uint64 `json:"tgp_bytes_sent"`
+	TGPBytesReceived uint64 `json:"tgp_bytes_received"`
+	Unsupported      uint64 `json:"unsupported"`
+	LookupErrors     uint64 `json:"lookup_errors"`
+	DecidedTGP       uint64 `json:"decided_tgp"`
+	DecidedDirect    uint64 `json:"decided_direct"`
+	DecidedDrop      uint64 `json:"decided_drop"`
+	HandlerErrors    uint64 `json:"handler_errors"`
+	TGPSessions      int    `json:"tgp_sessions"`
+	Goroutines       int    `json:"goroutines"`
 }
 
 // RouteEventData describes a single routing decision.

@@ -159,3 +159,21 @@ func (m *ClientManager) ActiveSessions() int {
 	}
 	return 0
 }
+
+func (m *ClientManager) SessionBytesSent() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.session == nil {
+		return 0
+	}
+	return m.session.Stats().BytesSent
+}
+
+func (m *ClientManager) SessionBytesReceived() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.session == nil {
+		return 0
+	}
+	return m.session.Stats().BytesReceived
+}

@@ -8,6 +8,22 @@ func (p *Pipeline) PacketsRead() uint64 {
 	return atomic.LoadUint64(&p.stats.PacketsRead)
 }
 
+func (p *Pipeline) BytesRead() uint64 {
+	return atomic.LoadUint64(&p.stats.BytesRead)
+}
+
+func (p *Pipeline) BytesTGP() uint64 {
+	return atomic.LoadUint64(&p.stats.BytesTGP)
+}
+
+func (p *Pipeline) BytesDirect() uint64 {
+	return atomic.LoadUint64(&p.stats.BytesDirect)
+}
+
+func (p *Pipeline) BytesDrop() uint64 {
+	return atomic.LoadUint64(&p.stats.BytesDrop)
+}
+
 func (p *Pipeline) Unsupported() uint64 {
 	return atomic.LoadUint64(&p.stats.Unsupported)
 }

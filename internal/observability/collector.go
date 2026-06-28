@@ -8,6 +8,10 @@ import (
 // PipelineStats is the interface the pipeline exposes for telemetry collection.
 type PipelineStats interface {
 	PacketsRead() uint64
+	BytesRead() uint64
+	BytesTGP() uint64
+	BytesDirect() uint64
+	BytesDrop() uint64
 	Unsupported() uint64
 	LookupErrors() uint64
 	DecidedTGP() uint64
@@ -19,6 +23,8 @@ type PipelineStats interface {
 // SessionCounter reports the current number of active TGP sessions.
 type SessionCounter interface {
 	ActiveSessions() int
+	SessionBytesSent() uint64
+	SessionBytesReceived() uint64
 }
 
 // Collector gathers telemetry data from various subsystems.
@@ -41,6 +47,10 @@ func (c *Collector) Snapshot() TelemetryData {
 	var data TelemetryData
 	if c.pipeline != nil {
 		data.PacketsRead = c.pipeline.PacketsRead()
+		data.BytesRead = c.pipeline.BytesRead()
+		data.BytesTGP = c.pipeline.BytesTGP()
+		data.BytesDirect = c.pipeline.BytesDirect()
+		data.BytesDrop = c.pipeline.BytesDrop()
 		data.Unsupported = c.pipeline.Unsupported()
 		data.LookupErrors = c.pipeline.LookupErrors()
 		data.DecidedTGP = c.pipeline.DecidedTGP()
@@ -50,6 +60,8 @@ func (c *Collector) Snapshot() TelemetryData {
 	}
 	if c.sessions != nil {
 		data.TGPSessions = c.sessions.ActiveSessions()
+		data.TGPBytesSent = c.sessions.SessionBytesSent()
+		data.TGPBytesReceived = c.sessions.SessionBytesReceived()
 	}
 	data.Goroutines = runtime.NumGoroutine()
 	return data

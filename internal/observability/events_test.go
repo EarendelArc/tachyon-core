@@ -30,11 +30,15 @@ func TestNewHelloEvent(t *testing.T) {
 
 func TestNewTelemetryEvent(t *testing.T) {
 	data := TelemetryData{
-		PacketsRead:   100,
-		DecidedTGP:    60,
-		DecidedDirect: 30,
-		DecidedDrop:   10,
-		Goroutines:    42,
+		PacketsRead:      100,
+		BytesRead:        8192,
+		BytesTGP:         4096,
+		TGPBytesSent:     2048,
+		TGPBytesReceived: 1024,
+		DecidedTGP:       60,
+		DecidedDirect:    30,
+		DecidedDrop:      10,
+		Goroutines:       42,
 	}
 	event := NewTelemetry(data)
 	if event.Type != EventTelemetry {
@@ -46,6 +50,12 @@ func TestNewTelemetryEvent(t *testing.T) {
 	}
 	if td.PacketsRead != 100 {
 		t.Fatalf("expected 100 packets, got %d", td.PacketsRead)
+	}
+	if td.BytesRead != 8192 || td.BytesTGP != 4096 {
+		t.Fatalf("unexpected packet bytes: %#v", td)
+	}
+	if td.TGPBytesSent != 2048 || td.TGPBytesReceived != 1024 {
+		t.Fatalf("unexpected tgp bytes: %#v", td)
 	}
 	if td.Goroutines != 42 {
 		t.Fatalf("expected 42 goroutines, got %d", td.Goroutines)

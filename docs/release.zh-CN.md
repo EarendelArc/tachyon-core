@@ -4,6 +4,12 @@ Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 al
 质量：Windows TUN 已经具备动态 `wintun.dll` 后端，但仍需要真实管理员环境验证。
 这些产物已经可以用于 Prism 托管下载和集成测试。
 
+## 当前预览版本
+
+当前预览版是
+[`v0.1.0-alpha.7`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.7)。
+该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重，以及同步后的协议文档。
+
 ## 触发方式
 
 推送版本 tag：

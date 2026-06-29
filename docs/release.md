@@ -5,6 +5,13 @@ Releases are currently alpha-quality: Windows TUN has a dynamic `wintun.dll`
 backend, but it still needs real elevated-host validation. The artifacts are
 useful for Prism-managed downloads and integration testing.
 
+## Current Preview
+
+The current preview release is
+[`v0.1.0-alpha.7`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.7).
+It includes authenticated TGP path migration, receive-side packet
+deduplication for multipath duplicates, and updated protocol documentation.
+
 ## Trigger
 
 Push a version tag:

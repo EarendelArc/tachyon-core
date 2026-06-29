@@ -201,6 +201,7 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			continue
 		}
 		packet.SourceAddr = from
+		s.migrateIfNeeded(from)
 		s.stats.bytesReceived.Add(uint64(len(packet.Payload)))
 		ch := s.streamWithSize(packet.Inner.StreamID, queueSize)
 		select {
@@ -209,6 +210,27 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			// Prefer dropping a stale game datagram over adding queue latency.
 		}
 	}
+}
+
+func (s *DatagramSession) migrateIfNeeded(from net.Addr) {
+	if from == nil {
+		return
+	}
+	s.mu.RLock()
+	remote := s.remote
+	closed := s.state == SessionClosed
+	s.mu.RUnlock()
+	if closed || sameAddr(remote, from) {
+		return
+	}
+	_ = s.Migrate(s.ctx, from)
+}
+
+func sameAddr(left, right net.Addr) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Network() == right.Network() && left.String() == right.String()
 }
 
 func (s *DatagramSession) stream(streamID StreamID) <-chan []byte {

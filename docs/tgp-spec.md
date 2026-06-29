@@ -10,11 +10,11 @@
 
 **Implementation status:** Core currently implements X25519/HKDF traffic-key
 derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
-primitives, token-bucket pacing, UDP session handshake, client/relay session
-plumbing, authenticated source-address migration, and a sliding receive-side
-packet deduplication window in `internal/tgp`. Migration confirmation control
-packets, dynamic FEC grouping inside the live session path, and true multi-
-transport fan-out are planned next.
+primitives, receive-side FEC recovery in the live session path, token-bucket
+pacing, UDP session handshake, client/relay session plumbing, authenticated
+source-address migration, and a sliding receive-side packet deduplication
+window in `internal/tgp`. Migration confirmation control packets, send-side
+dynamic FEC grouping, and true multi-transport fan-out are planned next.
 
 ---
 
@@ -148,17 +148,22 @@ Client                                    Server
 ### 4.1 Encoding (Client)
 
 1. Accumulate `FECDataShards` (e.g. 4) game UDP payloads.
-2. Zero-pad all payloads to the length of the longest one.
-3. Call `RS.Encode(data, dataShards, parityShards)` → produces parity shards.
+2. Prefix every data shard with a 2-byte original payload length, then zero-pad
+   all shards to the length of the longest framed payload.
+3. Call `RS.Encode(data, dataShards, parityShards)` to produce parity shards.
 4. Send all data + parity shards with the same `FECGroup` number.
 5. Each shard has `FECIndex` 0…(FECTotal-1) and `FECDataShards` set.
 
 ### 4.2 Reconstruction (Server)
 
 1. Buffer shards by `(SessionID, FECGroup)`.
-2. If all `FECDataShards` data shards arrive → deliver immediately, skip RS.
-3. If any shard is missing but `received_count >= FECDataShards` → reconstruct.
-4. If group timeout (20 ms) expires and `received_count < FECDataShards` → deliver partial.
+2. Data shards are delivered immediately after their length prefix is stripped;
+   this avoids adding group-fill latency to game traffic.
+3. Parity shards are retained. If any data shard is missing but
+   `received_count >= FECDataShards`, reconstruct and deliver only the missing
+   original payloads.
+4. Completed groups stay in a bounded receive window so late originals or
+   multipath duplicates are suppressed instead of delivered twice.
 
 ### 4.3 Dynamic FEC Rate Adjustment
 

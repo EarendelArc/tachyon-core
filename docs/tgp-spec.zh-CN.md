@@ -8,7 +8,7 @@
 
 **目标读者:** Tachyon Core 与服务端实现者
 
-**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 数据包封包/解包、Reed-Solomon FEC 基础编解码、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、基于认证包来源地址变化的自动迁移，以及接收侧滑动窗口去重。显式迁移确认控制包、把动态 FEC 分组接入实时 session 路径，以及真正的多 transport fan-out 仍属于下一阶段。
+**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 数据包封包/解包、Reed-Solomon FEC 基础编解码、接收侧实时 FEC 恢复、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、基于认证包来源地址变化的自动迁移，以及接收侧滑动窗口去重。显式迁移确认控制包、发送侧动态 FEC 分组，以及真正的多 transport fan-out 仍属于下一阶段。
 
 ---
 
@@ -73,7 +73,7 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 
 - `crypto.go`: 生成 X25519 key pair，并从 shared secret 派生双向流量密钥。
 - `codec.go`: 生成 DTLS-like 外层头，使用 ChaCha20-Poly1305 封包/解包。
-- `fec.go`: 基于 `github.com/klauspost/reedsolomon` 的 FEC 编解码器。
+- `fec.go`: 基于 `github.com/klauspost/reedsolomon` 的 FEC 编解码器和接收侧恢复缓冲。data shard 会先去掉 2 字节原始长度前缀并立即交付；parity shard 用于恢复缺失的原始 payload。
 - `pacer.go`: 深度为 1 的 token bucket pacer，用于平滑发包。
 - `handshake.go`: 基于 UDP 的 HELLO/HELLO_ACK 握手与会话密钥协商。
 - `session.go`: TGP datagram session，包含自动源地址迁移和滑动去重窗口。
@@ -84,6 +84,6 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 ## 4. 下一阶段
 
 - 增加显式迁移确认控制包，区分“已接受新路径”和“已确认切换”。
-- 将动态 FEC 分组、恢复与超时交付接入实时 session 收发路径。
+- 将发送侧动态 FEC 分组与超时 flush 接入实时 session 发包路径。
 - 实现真正的多 transport fan-out，并把 `FlagMultipath` 接入发送路径。
 - 为迁移、去重、FEC 恢复补充更细粒度的遥测事件。

@@ -27,6 +27,7 @@ type SessionOptions struct {
 	RecvKey     [trafficKeySize]byte
 	Pacer       Pacer
 	StreamQueue int
+	FECBuffer   *FECReceiveBuffer
 }
 
 type DatagramSession struct {
@@ -45,6 +46,7 @@ type DatagramSession struct {
 	remote  net.Addr
 	streams map[StreamID]chan []byte
 	dedup   *packetDedupWindow
+	fecRx   *FECReceiveBuffer
 
 	packetNo atomic.Uint64
 	stats    sessionCounters
@@ -53,6 +55,7 @@ type DatagramSession struct {
 type sessionCounters struct {
 	bytesSent     atomic.Uint64
 	bytesReceived atomic.Uint64
+	fecRecovered  atomic.Uint64
 	migrations    atomic.Uint32
 }
 
@@ -79,6 +82,10 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	if queueSize <= 0 {
 		queueSize = defaultStreamQueue
 	}
+	fecRx := opts.FECBuffer
+	if fecRx == nil {
+		fecRx = NewFECReceiveBuffer(nil, 0)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &DatagramSession{
@@ -94,6 +101,7 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		remote:    opts.RemoteAddr,
 		streams:   make(map[StreamID]chan []byte),
 		dedup:     newPacketDedupWindow(defaultDedupWindow),
+		fecRx:     fecRx,
 	}
 	s.streams[0] = make(chan []byte, queueSize)
 
@@ -187,6 +195,7 @@ func (s *DatagramSession) Stats() SessionStats {
 	return SessionStats{
 		BytesSent:     s.stats.bytesSent.Load(),
 		BytesReceived: s.stats.bytesReceived.Load(),
+		FECRecovered:  s.stats.fecRecovered.Load(),
 		Migrations:    s.stats.migrations.Load(),
 	}
 }
@@ -210,12 +219,21 @@ func (s *DatagramSession) readLoop(queueSize int) {
 		if !s.dedup.SeenFirst(packet.Inner.PacketNumber) {
 			continue
 		}
-		s.stats.bytesReceived.Add(uint64(len(packet.Payload)))
-		ch := s.streamWithSize(packet.Inner.StreamID, queueSize)
-		select {
-		case ch <- packet.Payload:
-		default:
-			// Prefer dropping a stale game datagram over adding queue latency.
+		result, err := s.fecRx.AddPacket(packet)
+		if err != nil || !result.Ready {
+			continue
+		}
+		if result.RecoveredShards > 0 {
+			s.stats.fecRecovered.Add(uint64(result.RecoveredShards))
+		}
+		for _, payload := range result.Payloads {
+			s.stats.bytesReceived.Add(uint64(len(payload)))
+			ch := s.streamWithSize(packet.Inner.StreamID, queueSize)
+			select {
+			case ch <- payload:
+			default:
+				// Prefer dropping a stale game datagram over adding queue latency.
+			}
 		}
 	}
 }

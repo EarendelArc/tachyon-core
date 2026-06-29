@@ -193,6 +193,98 @@ func TestDatagramSessionDropsDuplicatePacketNumbers(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionRecoversFECMissingShard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("fec-session-test"))
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	for i := range sendKey {
+		sendKey[i] = byte(91 + i)
+		recvKey[i] = byte(123 + i)
+	}
+
+	remoteAddr := mustUDPAddr(t, "127.0.0.1:32000")
+	transport := newMigrationTestTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  transport,
+		RemoteAddr: remoteAddr,
+		SendKey:    sendKey,
+		RecvKey:    recvKey,
+		Pacer:      NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer session.Close()
+
+	fecCodec := NewReedSolomonCodec()
+	data := [][]byte{[]byte("alpha"), []byte("bravo")}
+	shards, err := fecCodec.Encode(data, 2, 1)
+	if err != nil {
+		t.Fatalf("encode fec: %v", err)
+	}
+	wireCodec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatalf("wire codec: %v", err)
+	}
+
+	dataHeader, err := NewDataHeader(sessionID, 21, 1, len(shards[0]))
+	if err != nil {
+		t.Fatalf("data header: %v", err)
+	}
+	dataHeader.FECGroup = 77
+	dataHeader.FECIndex = 0
+	dataHeader.FECTotal = 3
+	dataHeader.FECDataShards = 2
+	dataWire, err := wireCodec.Seal(1, dataHeader, shards[0])
+	if err != nil {
+		t.Fatalf("seal data: %v", err)
+	}
+
+	parityHeader, err := NewDataHeader(sessionID, 21, 3, len(shards[2]))
+	if err != nil {
+		t.Fatalf("parity header: %v", err)
+	}
+	parityHeader.Flags |= FlagFEC
+	parityHeader.FECGroup = 77
+	parityHeader.FECIndex = 2
+	parityHeader.FECTotal = 3
+	parityHeader.FECDataShards = 2
+	parityWire, err := wireCodec.Seal(3, parityHeader, shards[2])
+	if err != nil {
+		t.Fatalf("seal parity: %v", err)
+	}
+
+	transport.inject(dataWire, remoteAddr)
+	got, err := session.RecvPacket(ctx, 21)
+	if err != nil {
+		t.Fatalf("recv data shard: %v", err)
+	}
+	if !bytes.Equal(got, data[0]) {
+		t.Fatalf("first payload mismatch: %q != %q", got, data[0])
+	}
+
+	transport.inject(parityWire, remoteAddr)
+	got, err = session.RecvPacket(ctx, 21)
+	if err != nil {
+		t.Fatalf("recv recovered shard: %v", err)
+	}
+	if !bytes.Equal(got, data[1]) {
+		t.Fatalf("recovered payload mismatch: %q != %q", got, data[1])
+	}
+	stats := session.Stats()
+	if stats.FECRecovered != 1 {
+		t.Fatalf("expected one recovered shard, got %#v", stats)
+	}
+	if stats.BytesReceived != uint64(len(data[0])+len(data[1])) {
+		t.Fatalf("unexpected received bytes after FEC recovery: %#v", stats)
+	}
+}
+
 type migrationRead struct {
 	packet []byte
 	from   net.Addr

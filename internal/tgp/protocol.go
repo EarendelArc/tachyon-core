@@ -107,6 +107,7 @@ type FECGroupState struct {
 	DataShards int
 	// Shards is indexed by FECIndex. A nil entry means not yet received.
 	Shards     [][]byte
+	Delivered  []bool
 	ReceivedAt time.Time
 	// Recovered is true once Reed-Solomon reconstruction has been applied.
 	Recovered bool

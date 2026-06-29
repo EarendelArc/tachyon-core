@@ -130,6 +130,69 @@ func TestDatagramSessionMigratesOnAuthenticatedSourceChange(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionDropsDuplicatePacketNumbers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("dedup-window-test"))
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	for i := range sendKey {
+		sendKey[i] = byte(32 + i)
+		recvKey[i] = byte(64 + i)
+	}
+
+	remoteAddr := mustUDPAddr(t, "127.0.0.1:31000")
+	transport := newMigrationTestTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  transport,
+		RemoteAddr: remoteAddr,
+		SendKey:    sendKey,
+		RecvKey:    recvKey,
+		Pacer:      NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer session.Close()
+
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatalf("codec: %v", err)
+	}
+	payload := []byte("multipath duplicate")
+	header, err := NewDataHeader(sessionID, 12, 99, len(payload))
+	if err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	wire, err := codec.Seal(99, header, payload)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	transport.inject(wire, remoteAddr)
+	transport.inject(wire, remoteAddr)
+
+	got, err := session.RecvPacket(ctx, 12)
+	if err != nil {
+		t.Fatalf("recv first packet: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %q, want %q", got, payload)
+	}
+
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer shortCancel()
+	if _, err := session.RecvPacket(shortCtx, 12); err == nil {
+		t.Fatal("duplicate packet was delivered")
+	}
+	if stats := session.Stats(); stats.BytesReceived != uint64(len(payload)) {
+		t.Fatalf("duplicate counted as received bytes: %#v", stats)
+	}
+}
+
 type migrationRead struct {
 	packet []byte
 	from   net.Addr

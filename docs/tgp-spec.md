@@ -9,9 +9,12 @@
 **Target audience:** Core and Server implementers
 
 **Implementation status:** Core currently implements X25519/HKDF traffic-key
-derivation, ChaCha20-Poly1305 packet sealing/opening, and Reed-Solomon FEC in
-`internal/tgp`. Full session relay, migration confirmation, and multipath
-deduplication are planned next.
+derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
+primitives, token-bucket pacing, UDP session handshake, client/relay session
+plumbing, authenticated source-address migration, and a sliding receive-side
+packet deduplication window in `internal/tgp`. Migration confirmation control
+packets, dynamic FEC grouping inside the live session path, and true multi-
+transport fan-out are planned next.
 
 ---
 
@@ -179,8 +182,10 @@ When the client detects a local IP change (e.g., Wi-Fi → 5G):
 2. Server sees packets from a new source addr with a known `SessionID`.
 3. Server validates the packet (AEAD decrypt succeeds → proves ownership of session key).
 4. Server updates its routing table: `SessionID → newAddr`.
-5. Server echoes back a control packet with `FlagMigrate=1` to confirm.
-6. Client drops the old path.
+5. Current implementation immediately updates the session return path after
+   authenticated decrypt succeeds. A future control packet with `FlagMigrate=1`
+   will make the confirmation explicit.
+6. Client drops the old path after it observes traffic on the new path.
 
 **Migration is zero-downtime**: during the migration window (≤100 ms), packets
 from both old and new paths are accepted (dedup buffer prevents doubles).
@@ -193,8 +198,11 @@ When the client has both Wi-Fi and cellular available:
 
 1. Both `Transport` instances are registered with `MultipathTransport`.
 2. `MultipathTransport.WritePacket()` fans out to all paths simultaneously with `FlagMultipath=1`.
-3. The server's `DeduplicateBuffer` tracks `(SessionID, PacketNumber)` in a
-   sliding window of 1024 entries. Duplicates are silently dropped.
+3. The receiver tracks authenticated `PacketNumber` values in a sliding window.
+   Duplicates are silently dropped before delivery to the game socket.
+
+Current Core exposes the receive-side dedup window in `DatagramSession`.
+`MultipathTransport` fan-out is still an integration target.
 
 ---
 

@@ -9,7 +9,10 @@ import (
 	"sync/atomic"
 )
 
-const defaultStreamQueue = 64
+const (
+	defaultStreamQueue = 64
+	defaultDedupWindow = 4096
+)
 
 var (
 	ErrSessionClosed     = errors.New("tgp session closed")
@@ -41,6 +44,7 @@ type DatagramSession struct {
 	state   SessionState
 	remote  net.Addr
 	streams map[StreamID]chan []byte
+	dedup   *packetDedupWindow
 
 	packetNo atomic.Uint64
 	stats    sessionCounters
@@ -89,6 +93,7 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		state:     SessionEstablished,
 		remote:    opts.RemoteAddr,
 		streams:   make(map[StreamID]chan []byte),
+		dedup:     newPacketDedupWindow(defaultDedupWindow),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
 
@@ -202,6 +207,9 @@ func (s *DatagramSession) readLoop(queueSize int) {
 		}
 		packet.SourceAddr = from
 		s.migrateIfNeeded(from)
+		if !s.dedup.SeenFirst(packet.Inner.PacketNumber) {
+			continue
+		}
 		s.stats.bytesReceived.Add(uint64(len(packet.Payload)))
 		ch := s.streamWithSize(packet.Inner.StreamID, queueSize)
 		select {
@@ -231,6 +239,40 @@ func sameAddr(left, right net.Addr) bool {
 		return left == right
 	}
 	return left.Network() == right.Network() && left.String() == right.String()
+}
+
+type packetDedupWindow struct {
+	max   int
+	seen  map[uint64]struct{}
+	order []uint64
+}
+
+func newPacketDedupWindow(max int) *packetDedupWindow {
+	if max <= 0 {
+		max = defaultDedupWindow
+	}
+	return &packetDedupWindow{
+		max:  max,
+		seen: make(map[uint64]struct{}, max),
+	}
+}
+
+func (w *packetDedupWindow) SeenFirst(packetNumber uint64) bool {
+	if w == nil {
+		return true
+	}
+	if _, ok := w.seen[packetNumber]; ok {
+		return false
+	}
+	w.seen[packetNumber] = struct{}{}
+	w.order = append(w.order, packetNumber)
+	if len(w.order) > w.max {
+		evicted := w.order[0]
+		copy(w.order, w.order[1:])
+		w.order = w.order[:len(w.order)-1]
+		delete(w.seen, evicted)
+	}
+	return true
 }
 
 func (s *DatagramSession) stream(streamID StreamID) <-chan []byte {

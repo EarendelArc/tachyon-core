@@ -88,10 +88,12 @@ type TUNConfig struct {
 	MTU int `yaml:"mtu" json:"mtu"`
 
 	// AutoRoute adds a default route pointing at the TUN interface so all
-	// traffic is captured. Disable if using policy routing instead.
+	// traffic is captured. It defaults to false because Tachyon Core only
+	// accelerates selected UDP game flows; Prism/Xray owns general proxy traffic.
 	AutoRoute bool `yaml:"auto_route" json:"auto_route"`
 
-	// DNSHijack intercepts DNS UDP/53 traffic and forwards it through the proxy.
+	// DNSHijack intercepts DNS UDP/53 traffic. It should only be enabled in
+	// deployments that intentionally route DNS through the Core TUN pipeline.
 	DNSHijack bool `yaml:"dns_hijack" json:"dns_hijack"`
 }
 
@@ -315,8 +317,8 @@ func defaults() *Config {
 			TUN: TUNConfig{
 				Address:   "198.18.0.1/16",
 				MTU:       9000,
-				AutoRoute: true,
-				DNSHijack: true,
+				AutoRoute: false,
+				DNSHijack: false,
 			},
 			Routing: RoutingConfig{
 				DefaultAction: "direct",

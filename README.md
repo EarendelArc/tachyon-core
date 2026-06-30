@@ -30,6 +30,8 @@ tachyonctl health --addr 127.0.0.1:55123
 - Xray has no runtime or build-time dependency inside Tachyon Core.
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.
+- Client TUN defaults to TGP-only safe mode: `auto_route` and `dns_hijack` are
+  off unless explicitly enabled by Prism or a hand-written config.
 - JSON is the canonical Core config format. Legacy YAML is accepted only for
   early developer compatibility.
 - Relative file paths in Core JSON are resolved from the directory that contains

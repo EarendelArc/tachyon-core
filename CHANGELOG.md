@@ -8,6 +8,9 @@ All notable changes to Tachyon Core will be documented in this file.
 - Replaced the server's one-shot UDP forwarder with a persistent per-session,
   per-flow UDP relay pool. Upstream game sockets are now reused and background
   read loops can forward asynchronous game responses back over the TGP session.
+- Changed client TUN defaults to TGP-only safe mode: `auto_route` and
+  `dns_hijack` now default to `false` so Core does not capture unrelated
+  Prism/Xray traffic unless explicitly configured.
 
 ### Added
 - Tests covering asynchronous server UDP relay responses, TGP relay echo, and

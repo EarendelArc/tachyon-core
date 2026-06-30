@@ -8,8 +8,8 @@ const ClientConfigTemplate = `{
       "name": "",
       "address": "198.18.0.1/16",
       "mtu": 9000,
-      "auto_route": true,
-      "dns_hijack": true
+      "auto_route": false,
+      "dns_hijack": false
     },
     "routing": {
       "default_action": "direct",

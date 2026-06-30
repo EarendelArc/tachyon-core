@@ -58,6 +58,12 @@ func TestLoadJSONConfig(t *testing.T) {
 	if cfg.TGP.FEC.AdaptWindow != 32 {
 		t.Fatalf("adapt window = %d, want 32", cfg.TGP.FEC.AdaptWindow)
 	}
+	if cfg.Client.TUN.AutoRoute {
+		t.Fatal("client.tun.auto_route should default to false in TGP-only mode")
+	}
+	if cfg.Client.TUN.DNSHijack {
+		t.Fatal("client.tun.dns_hijack should default to false in TGP-only mode")
+	}
 }
 
 func TestLoadJSONRejectsYAML(t *testing.T) {

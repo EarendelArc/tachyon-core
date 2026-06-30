@@ -38,6 +38,16 @@ func TestGenerateConfigClient(t *testing.T) {
 	if _, ok := client["routing"]; !ok {
 		t.Fatal("missing client.routing")
 	}
+	tun, ok := client["tun"].(map[string]any)
+	if !ok {
+		t.Fatal("client.tun must be an object")
+	}
+	if tun["auto_route"] != false {
+		t.Fatalf("client template should default auto_route to false, got %#v", tun["auto_route"])
+	}
+	if tun["dns_hijack"] != false {
+		t.Fatalf("client template should default dns_hijack to false, got %#v", tun["dns_hijack"])
+	}
 }
 
 func TestGenerateConfigServer(t *testing.T) {

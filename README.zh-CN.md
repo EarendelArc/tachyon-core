@@ -23,6 +23,8 @@ tachyonctl health --addr 127.0.0.1:55123
 - Core 负责 Tachyon 协议传输：数据包接管、基于进程的游戏路由、TGP 客户端传输和 TGP 服务端 Relay 行为。
 - Tachyon Core 内部没有 Xray 的运行时或编译期依赖。
 - TCP 代理流量属于 Prism/Xray；UDP 游戏流量属于 Tachyon Core/TGP。
+- 客户端 TUN 默认采用 TGP-only 安全模式：`auto_route` 和 `dns_hijack`
+  默认关闭，只有 Prism 或手写配置显式启用时才会接管全局路由/DNS。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
 - Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析。
 

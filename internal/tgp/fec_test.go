@@ -109,6 +109,37 @@ func TestFECReceiveBufferReconstructsMissingDataShard(t *testing.T) {
 	}
 }
 
+func TestFECReceiveBufferReconstructsWithUnpaddedDataShard(t *testing.T) {
+	codec := NewReedSolomonCodec()
+	data := [][]byte{
+		[]byte("a"),
+		[]byte("second payload is longer"),
+	}
+	shards, err := codec.Encode(data, 2, 1)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	shortFirstShard, err := frameFECData(data[0], len(data[0])+fecLengthPrefixSize)
+	if err != nil {
+		t.Fatalf("frame short shard: %v", err)
+	}
+
+	buffer := NewFECReceiveBuffer(codec, 0)
+	if result, err := buffer.AddPacket(fecPacket(31, 0, 3, 2, shortFirstShard)); err != nil || !result.Ready {
+		t.Fatalf("short data shard ready=%v err=%v", result.Ready, err)
+	}
+	result, err := buffer.AddPacket(fecPacket(31, 2, 3, 2, shards[2]))
+	if err != nil {
+		t.Fatalf("parity shard: %v", err)
+	}
+	if !result.Ready || result.RecoveredShards != 1 {
+		t.Fatalf("expected one recovered shard: %#v", result)
+	}
+	if !bytes.Equal(result.Payloads[0], data[1]) {
+		t.Fatalf("recovered payload mismatch: %q != %q", result.Payloads[0], data[1])
+	}
+}
+
 func TestFECReceiveBufferSuppressesDuplicateAndLateRecoveredShard(t *testing.T) {
 	codec := NewReedSolomonCodec()
 	data := [][]byte{

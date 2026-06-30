@@ -18,6 +18,7 @@ type ClientManagerOptions struct {
 	RemoteAddr       string
 	LocalAddr        string
 	PacerPPS         float64
+	FEC              FECOptions
 	HandshakeTimeout time.Duration
 	Dial             DialFunc
 	OnDatagram       func(ctx context.Context, datagram TunnelDatagram) error
@@ -27,6 +28,7 @@ type ClientManager struct {
 	remoteAddr       string
 	localAddr        string
 	pacerPPS         float64
+	fec              FECOptions
 	handshakeTimeout time.Duration
 	dial             DialFunc
 	onDatagram       func(ctx context.Context, datagram TunnelDatagram) error
@@ -52,8 +54,12 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	}
 	dial := opts.Dial
 	if dial == nil {
+		fec := opts.FEC
 		dial = func(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (Session, error) {
-			return DialSession(ctx, localAddr, remoteAddr, pacerPPS)
+			return DialSessionWithOptions(ctx, localAddr, remoteAddr, SessionRuntimeOptions{
+				PacerPPS: pacerPPS,
+				FEC:      fec,
+			})
 		}
 	}
 	managerCtx, cancel := context.WithCancel(context.Background())
@@ -61,6 +67,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 		remoteAddr:       remote,
 		localAddr:        local,
 		pacerPPS:         opts.PacerPPS,
+		fec:              opts.FEC,
 		handshakeTimeout: timeout,
 		dial:             dial,
 		onDatagram:       opts.OnDatagram,

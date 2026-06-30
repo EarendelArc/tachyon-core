@@ -28,12 +28,14 @@ type RelayOptions struct {
 	ListenAddr string
 	Transport  Transport
 	PacerPPS   float64
+	FEC        FECOptions
 	Handler    RelayHandler
 }
 
 type Relay struct {
 	listenAddr string
 	pacerPPS   float64
+	fec        FECOptions
 	handler    RelayHandler
 
 	mu        sync.Mutex
@@ -52,6 +54,7 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 	return &Relay{
 		listenAddr: opts.ListenAddr,
 		pacerPPS:   opts.PacerPPS,
+		fec:        opts.FEC,
 		handler:    handler,
 		transport:  opts.Transport,
 	}, nil
@@ -68,7 +71,10 @@ func (r *Relay) ListenAndServe(ctx context.Context) error {
 		r.setTransport(transport)
 	}
 
-	session, err := AcceptSession(ctx, transport, r.pacerPPS)
+	session, err := AcceptSessionWithOptions(ctx, transport, SessionRuntimeOptions{
+		PacerPPS: r.pacerPPS,
+		FEC:      r.fec,
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil

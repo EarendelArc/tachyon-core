@@ -71,6 +71,7 @@ func (c *ReedSolomonCodec) Reconstruct(shards [][]byte, dataShards, parityShards
 	if len(shards) != dataShards+parityShards {
 		return fmt.Errorf("%w: shard count %d does not match data+parity %d", ErrInvalidFECParams, len(shards), dataShards+parityShards)
 	}
+	normalizeFECShardLengths(shards)
 
 	encoder, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
@@ -276,6 +277,23 @@ func decodeFECDataShard(shard []byte) ([]byte, error) {
 	}
 	payload := shard[fecLengthPrefixSize : fecLengthPrefixSize+payloadLen]
 	return append([]byte(nil), payload...), nil
+}
+
+func normalizeFECShardLengths(shards [][]byte) {
+	maxSize := 0
+	for _, shard := range shards {
+		if len(shard) > maxSize {
+			maxSize = len(shard)
+		}
+	}
+	for i, shard := range shards {
+		if shard == nil || len(shard) == maxSize {
+			continue
+		}
+		padded := make([]byte, maxSize)
+		copy(padded, shard)
+		shards[i] = padded
+	}
 }
 
 var _ FECCodec = (*ReedSolomonCodec)(nil)

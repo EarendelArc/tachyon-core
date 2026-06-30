@@ -12,9 +12,11 @@
 derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
-source-address migration, and a sliding receive-side packet deduplication
-window in `internal/tgp`. Migration confirmation control packets, send-side
-dynamic FEC grouping, and true multi-transport fan-out are planned next.
+source-address migration, send-side systematic FEC parity generation for full
+groups, and a sliding receive-side packet deduplication window in
+`internal/tgp`. Migration confirmation control packets, low-traffic FEC timeout
+flush, dynamic FEC ratio adjustment, and true multi-transport fan-out are
+planned next.
 
 ---
 
@@ -147,12 +149,17 @@ Client                                    Server
 
 ### 4.1 Encoding (Client)
 
-1. Accumulate `FECDataShards` (e.g. 4) game UDP payloads.
-2. Prefix every data shard with a 2-byte original payload length, then zero-pad
-   all shards to the length of the longest framed payload.
+1. Each data shard is sent immediately with a 2-byte original payload length
+   prefix. This keeps game input packets from waiting for the rest of the FEC
+   group.
+2. The sender keeps a copy of data shards until `FECDataShards` payloads are
+   collected.
 3. Call `RS.Encode(data, dataShards, parityShards)` to produce parity shards.
-4. Send all data + parity shards with the same `FECGroup` number.
+4. Send parity shards with the same `FECGroup` number.
 5. Each shard has `FECIndex` 0…(FECTotal-1) and `FECDataShards` set.
+
+Current implementation emits parity when a group becomes full. Timeout-based
+flush for low packet-rate games is still planned.
 
 ### 4.2 Reconstruction (Server)
 

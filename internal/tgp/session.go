@@ -28,6 +28,17 @@ type SessionOptions struct {
 	Pacer       Pacer
 	StreamQueue int
 	FECBuffer   *FECReceiveBuffer
+	FEC         FECOptions
+}
+
+type FECOptions struct {
+	DataShards       int
+	ParityShards     int
+	MaxReceiveGroups int
+}
+
+func (o FECOptions) enabled() bool {
+	return o.DataShards > 0 && o.ParityShards > 0
 }
 
 type DatagramSession struct {
@@ -41,15 +52,24 @@ type DatagramSession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu      sync.RWMutex
-	state   SessionState
-	remote  net.Addr
-	streams map[StreamID]chan []byte
-	dedup   *packetDedupWindow
-	fecRx   *FECReceiveBuffer
+	mu       sync.RWMutex
+	state    SessionState
+	remote   net.Addr
+	streams  map[StreamID]chan []byte
+	dedup    *packetDedupWindow
+	fecRx    *FECReceiveBuffer
+	fec      FECOptions
+	fecMu    sync.Mutex
+	fecTx    map[StreamID]*fecSendGroup
+	fecGroup uint32
 
 	packetNo atomic.Uint64
 	stats    sessionCounters
+}
+
+type fecSendGroup struct {
+	id       uint32
+	payloads [][]byte
 }
 
 type sessionCounters struct {
@@ -84,7 +104,7 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	}
 	fecRx := opts.FECBuffer
 	if fecRx == nil {
-		fecRx = NewFECReceiveBuffer(nil, 0)
+		fecRx = NewFECReceiveBuffer(nil, opts.FEC.MaxReceiveGroups)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -102,6 +122,8 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		streams:   make(map[StreamID]chan []byte),
 		dedup:     newPacketDedupWindow(defaultDedupWindow),
 		fecRx:     fecRx,
+		fec:       opts.FEC,
+		fecTx:     make(map[StreamID]*fecSendGroup),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
 
@@ -123,6 +145,87 @@ func (s *DatagramSession) SendPacket(ctx context.Context, streamID StreamID, pay
 	if s.State() == SessionClosed {
 		return ErrSessionClosed
 	}
+	if s.fec.enabled() {
+		return s.sendPacketWithFEC(ctx, streamID, payload)
+	}
+	return s.sendWirePayload(ctx, streamID, payload, nil, uint64(len(payload)))
+}
+
+func (s *DatagramSession) sendPacketWithFEC(ctx context.Context, streamID StreamID, payload []byte) error {
+	dataPayload, parityPayloads, groupID, index, total, dataShards, err := s.nextFECShards(streamID, payload)
+	if err != nil {
+		return err
+	}
+	configureData := func(header *InnerHeader) {
+		header.FECGroup = groupID
+		header.FECIndex = uint8(index)
+		header.FECTotal = uint8(total)
+		header.FECDataShards = uint8(dataShards)
+	}
+	if err := s.sendWirePayload(ctx, streamID, dataPayload, configureData, uint64(len(payload))); err != nil {
+		return err
+	}
+	for parityOffset, parityPayload := range parityPayloads {
+		parityIndex := dataShards + parityOffset
+		configureParity := func(header *InnerHeader) {
+			header.Flags |= FlagFEC
+			header.FECGroup = groupID
+			header.FECIndex = uint8(parityIndex)
+			header.FECTotal = uint8(total)
+			header.FECDataShards = uint8(dataShards)
+		}
+		if err := s.sendWirePayload(ctx, streamID, parityPayload, configureParity, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *DatagramSession) nextFECShards(streamID StreamID, payload []byte) ([]byte, [][]byte, uint32, int, int, int, error) {
+	s.fecMu.Lock()
+	defer s.fecMu.Unlock()
+
+	dataShards := s.fec.DataShards
+	parityShards := s.fec.ParityShards
+	if err := validateFECParams(dataShards, parityShards); err != nil {
+		return nil, nil, 0, 0, 0, 0, err
+	}
+	if dataShards+parityShards > 0xff {
+		return nil, nil, 0, 0, 0, 0, fmt.Errorf("%w: total fec shards exceed 255", ErrInvalidFECParams)
+	}
+	group := s.fecTx[streamID]
+	if group == nil {
+		s.fecGroup++
+		group = &fecSendGroup{id: s.fecGroup}
+		s.fecTx[streamID] = group
+	}
+	if len(group.payloads) >= dataShards {
+		s.fecGroup++
+		group = &fecSendGroup{id: s.fecGroup}
+		s.fecTx[streamID] = group
+	}
+
+	index := len(group.payloads)
+	group.payloads = append(group.payloads, append([]byte(nil), payload...))
+	dataPayload, err := frameFECData(payload, len(payload)+fecLengthPrefixSize)
+	if err != nil {
+		return nil, nil, 0, 0, 0, 0, err
+	}
+
+	var parityPayloads [][]byte
+	if len(group.payloads) == dataShards {
+		codec := NewReedSolomonCodec()
+		shards, err := codec.Encode(group.payloads, dataShards, parityShards)
+		if err != nil {
+			return nil, nil, 0, 0, 0, 0, err
+		}
+		parityPayloads = cloneShardRange(shards[dataShards:])
+		delete(s.fecTx, streamID)
+	}
+	return dataPayload, parityPayloads, group.id, index, dataShards + parityShards, dataShards, nil
+}
+
+func (s *DatagramSession) sendWirePayload(ctx context.Context, streamID StreamID, payload []byte, configure func(*InnerHeader), accountedBytes uint64) error {
 	if err := s.pacer.Consume(ctx); err != nil {
 		return err
 	}
@@ -130,6 +233,9 @@ func (s *DatagramSession) SendPacket(ctx context.Context, streamID StreamID, pay
 	header, err := NewDataHeader(s.id, streamID, packetNo, len(payload))
 	if err != nil {
 		return err
+	}
+	if configure != nil {
+		configure(&header)
 	}
 	wire, err := s.sendCodec.Seal(packetNo, header, payload)
 	if err != nil {
@@ -142,7 +248,9 @@ func (s *DatagramSession) SendPacket(ctx context.Context, streamID StreamID, pay
 	if err := s.transport.WritePacket(ctx, wire, remote); err != nil {
 		return err
 	}
-	s.stats.bytesSent.Add(uint64(len(payload)))
+	if accountedBytes > 0 {
+		s.stats.bytesSent.Add(accountedBytes)
+	}
 	return nil
 }
 
@@ -257,6 +365,14 @@ func sameAddr(left, right net.Addr) bool {
 		return left == right
 	}
 	return left.Network() == right.Network() && left.String() == right.String()
+}
+
+func cloneShardRange(shards [][]byte) [][]byte {
+	out := make([][]byte, len(shards))
+	for i, shard := range shards {
+		out[i] = append([]byte(nil), shard...)
+	}
+	return out
 }
 
 type packetDedupWindow struct {

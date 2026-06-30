@@ -123,6 +123,7 @@ func (a *App) runClient(ctx context.Context) error {
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
 		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
+		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
 		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
 			packet, err := buildIPv4UDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
@@ -283,6 +284,13 @@ func clientTGPRemoteAddr(cfg config.ProxyConfig) string {
 	return strings.TrimSpace(cfg.ServerAddr)
 }
 
+func tgpFECOptions(cfg config.FECConfig) tgp.FECOptions {
+	return tgp.FECOptions{
+		DataShards:   cfg.DataShards,
+		ParityShards: cfg.ParityShards,
+	}
+}
+
 func defaultRoutingStorePath() string {
 	if value := strings.TrimSpace(os.Getenv("TACHYON_ROUTING_STORE")); value != "" {
 		return value
@@ -333,6 +341,7 @@ func (a *App) runServer(ctx context.Context) error {
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
 		ListenAddr: a.cfg.Server.Listen,
 		PacerPPS:   a.cfg.TGP.Pacing.InitialRatePPS,
+		FEC:        tgpFECOptions(a.cfg.TGP.FEC),
 		Handler: serverRelayHandler{
 			logger: a.logger,
 			forwarder: netUDPForwarder{

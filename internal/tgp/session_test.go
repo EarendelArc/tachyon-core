@@ -285,25 +285,107 @@ func TestDatagramSessionRecoversFECMissingShard(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionSendSideFECParityRecoversDroppedDataShard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("fec-send-test!!!"))
+	var clientToServerKey [trafficKeySize]byte
+	var serverToClientKey [trafficKeySize]byte
+	for i := range clientToServerKey {
+		clientToServerKey[i] = byte(11 + i)
+		serverToClientKey[i] = byte(211 - i)
+	}
+
+	clientTransport := newMigrationTestTransport()
+	serverTransport := newMigrationTestTransport()
+	serverAddr := mustUDPAddr(t, "127.0.0.1:33000")
+	clientAddr := mustUDPAddr(t, "127.0.0.1:33001")
+
+	client, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  clientTransport,
+		RemoteAddr: serverAddr,
+		SendKey:    clientToServerKey,
+		RecvKey:    serverToClientKey,
+		Pacer:      NewTokenBucketPacer(100000),
+		FEC:        FECOptions{DataShards: 2, ParityShards: 1},
+	})
+	if err != nil {
+		t.Fatalf("new client session: %v", err)
+	}
+	defer client.Close()
+	server, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  serverTransport,
+		RemoteAddr: clientAddr,
+		SendKey:    serverToClientKey,
+		RecvKey:    clientToServerKey,
+		Pacer:      NewTokenBucketPacer(100000),
+		FEC:        FECOptions{DataShards: 2, ParityShards: 1},
+	})
+	if err != nil {
+		t.Fatalf("new server session: %v", err)
+	}
+	defer server.Close()
+
+	if err := client.SendPacket(ctx, 23, []byte("alpha")); err != nil {
+		t.Fatalf("send alpha: %v", err)
+	}
+	data0 := clientTransport.nextWritePacket(ctx)
+	if err := client.SendPacket(ctx, 23, []byte("bravo is longer")); err != nil {
+		t.Fatalf("send bravo: %v", err)
+	}
+	_ = clientTransport.nextWritePacket(ctx) // Drop data1 to force FEC recovery.
+	parity := clientTransport.nextWritePacket(ctx)
+
+	serverTransport.inject(data0, clientAddr)
+	got, err := server.RecvPacket(ctx, 23)
+	if err != nil {
+		t.Fatalf("recv first data: %v", err)
+	}
+	if !bytes.Equal(got, []byte("alpha")) {
+		t.Fatalf("first payload mismatch: %q", got)
+	}
+
+	serverTransport.inject(parity, clientAddr)
+	got, err = server.RecvPacket(ctx, 23)
+	if err != nil {
+		t.Fatalf("recv recovered data: %v", err)
+	}
+	if !bytes.Equal(got, []byte("bravo is longer")) {
+		t.Fatalf("recovered payload mismatch: %q", got)
+	}
+	if stats := server.Stats(); stats.FECRecovered != 1 {
+		t.Fatalf("expected one recovered shard, got %#v", stats)
+	}
+	if stats := client.Stats(); stats.BytesSent != uint64(len("alpha")+len("bravo is longer")) {
+		t.Fatalf("parity should not inflate application bytes sent: %#v", stats)
+	}
+}
+
 type migrationRead struct {
 	packet []byte
 	from   net.Addr
 }
 
 type migrationTestTransport struct {
-	reads     chan migrationRead
-	writes    chan net.Addr
-	localAddr net.Addr
-	closed    chan struct{}
-	closeOnce sync.Once
+	reads       chan migrationRead
+	writes      chan net.Addr
+	writePacket chan []byte
+	localAddr   net.Addr
+	closed      chan struct{}
+	closeOnce   sync.Once
 }
 
 func newMigrationTestTransport() *migrationTestTransport {
 	return &migrationTestTransport{
-		reads:     make(chan migrationRead, 4),
-		writes:    make(chan net.Addr, 4),
-		localAddr: mustUDPAddr(nil, "127.0.0.1:0"),
-		closed:    make(chan struct{}),
+		reads:       make(chan migrationRead, 8),
+		writes:      make(chan net.Addr, 8),
+		writePacket: make(chan []byte, 8),
+		localAddr:   mustUDPAddr(nil, "127.0.0.1:0"),
+		closed:      make(chan struct{}),
 	}
 }
 
@@ -311,9 +393,16 @@ func (t *migrationTestTransport) inject(packet []byte, from net.Addr) {
 	t.reads <- migrationRead{packet: append([]byte(nil), packet...), from: from}
 }
 
-func (t *migrationTestTransport) WritePacket(ctx context.Context, _ []byte, addr net.Addr) error {
+func (t *migrationTestTransport) WritePacket(ctx context.Context, packet []byte, addr net.Addr) error {
 	select {
 	case t.writes <- addr:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.closed:
+		return ErrSessionClosed
+	}
+	select {
+	case t.writePacket <- append([]byte(nil), packet...):
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -348,6 +437,15 @@ func (t *migrationTestTransport) nextWriteAddr(ctx context.Context) net.Addr {
 	select {
 	case addr := <-t.writes:
 		return addr
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+func (t *migrationTestTransport) nextWritePacket(ctx context.Context) []byte {
+	select {
+	case packet := <-t.writePacket:
+		return packet
 	case <-ctx.Done():
 		return nil
 	}

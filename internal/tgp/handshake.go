@@ -25,7 +25,16 @@ const (
 	handshakeHelloAck
 )
 
+type SessionRuntimeOptions struct {
+	PacerPPS float64
+	FEC      FECOptions
+}
+
 func DialSession(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (*DatagramSession, error) {
+	return DialSessionWithOptions(ctx, localAddr, remoteAddr, SessionRuntimeOptions{PacerPPS: pacerPPS})
+}
+
+func DialSessionWithOptions(ctx context.Context, localAddr string, remoteAddr net.Addr, opts SessionRuntimeOptions) (*DatagramSession, error) {
 	if remoteAddr == nil {
 		return nil, errors.New("remote address is required")
 	}
@@ -78,12 +87,17 @@ func DialSession(ctx context.Context, localAddr string, remoteAddr net.Addr, pac
 			RemoteAddr: from,
 			SendKey:    keys.SendKey,
 			RecvKey:    keys.RecvKey,
-			Pacer:      NewTokenBucketPacer(pacerPPS),
+			Pacer:      NewTokenBucketPacer(opts.PacerPPS),
+			FEC:        opts.FEC,
 		})
 	}
 }
 
 func AcceptSession(ctx context.Context, transport Transport, pacerPPS float64) (*DatagramSession, error) {
+	return AcceptSessionWithOptions(ctx, transport, SessionRuntimeOptions{PacerPPS: pacerPPS})
+}
+
+func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts SessionRuntimeOptions) (*DatagramSession, error) {
 	if transport == nil {
 		return nil, errors.New("transport is required")
 	}
@@ -122,7 +136,8 @@ func AcceptSession(ctx context.Context, transport Transport, pacerPPS float64) (
 			RemoteAddr: from,
 			SendKey:    keys.SendKey,
 			RecvKey:    keys.RecvKey,
-			Pacer:      NewTokenBucketPacer(pacerPPS),
+			Pacer:      NewTokenBucketPacer(opts.PacerPPS),
+			FEC:        opts.FEC,
 		})
 	}
 }

@@ -67,3 +67,15 @@ Prism 应按规范化平台选择资产：
 
 Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制文件，并安装到
 自己的托管 `bin` 目录。
+
+## 服务端安装脚本约定
+
+`scripts/install-server.sh` 与 `scripts/install-server-docker.sh` 都从
+`EarendelArc/tachyon-core` GitHub Releases 下载匹配的 Linux ZIP 资产。
+脚本的 `--version latest` 会读取 release 列表中的最新 tag，因此包含 alpha
+预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.8`
+或更新后的固定 tag。
+
+裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把
+下载的静态二进制放入 `/opt/tachyon-docker/bin`，再挂载到
+`debian:bookworm-slim` 容器中运行，避免依赖尚未发布的 GHCR 镜像。

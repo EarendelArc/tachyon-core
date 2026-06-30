@@ -73,3 +73,19 @@ Prism should select assets by normalized platform:
 
 Prism must download `SHA256SUMS.txt`, verify the selected archive, extract the
 binary, and install it into its managed `bin` directory.
+
+## Server Installer Contract
+
+The bare-metal and Docker server installers consume the same release ZIP assets:
+
+- `scripts/install-server.sh` downloads `tachyon-core_<tag>_linux_<arch>.zip`,
+  extracts `tachyon-core`, installs it under `/opt/tachyon`, and creates a
+  systemd service.
+- `scripts/install-server-docker.sh` downloads the same Linux ZIP, stores the
+  binary under `/opt/tachyon-docker/bin`, and mounts it into a
+  `debian:bookworm-slim` container. The Docker deployment does not require a
+  GHCR image.
+
+Both scripts resolve `--version latest` from the releases list instead of the
+GitHub `latest` endpoint so alpha prereleases remain deployable during the
+current development phase.

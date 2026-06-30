@@ -23,7 +23,8 @@ INSTALL_DIR="/opt/tachyon"
 CONFIG_DIR="/etc/tachyon"
 LOG_DIR="/var/log/tachyon"
 TACHYON_USER="tachyon"
-GITHUB_CORE="https://api.github.com/repos/tachyon-space/tachyon-core/releases"
+GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
+GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,19 +40,19 @@ check_root() {
 }
 
 resolve_latest() {
-  curl -fsSL "$1/latest" | grep '"tag_name"' | head -1 \
-    | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+  curl -fsSL "$1?per_page=20" | jq -r '.[0].tag_name'
 }
 
 get_asset_url() {
-  curl -fsSL "$1/tags/$2" | grep '"browser_download_url"' | grep -i "$3" \
-    | head -1 | sed 's/.*": *"\([^"]*\)".*/\1/'
+  curl -fsSL "$1/tags/$2" \
+    | jq -r --arg marker "$3" '.assets[] | select(.name | contains($marker)) | .browser_download_url' \
+    | head -1
 }
 
 install_deps() {
   info "Installing dependencies..."
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl wget tar jq ufw
+  apt-get install -y -qq ca-certificates curl jq unzip ufw
   success "Dependencies installed."
 }
 
@@ -67,13 +68,13 @@ install_tachyon() {
   info "Installing tachyon-core $TACHYON_VERSION..."
 
   arch=$(dpkg --print-architecture)
-  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "tachyon-core_linux_${arch}.tar.gz")
+  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "tachyon-core_${TACHYON_VERSION}_linux_${arch}.zip")
   [[ -n "$url" ]] || die "No tachyon-core asset for linux_${arch}"
 
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
-  wget -q --show-progress -O "$tmp/tachyon-core.tar.gz" "$url"
-  tar -xzf "$tmp/tachyon-core.tar.gz" -C "$tmp"
+  curl -fL --progress-bar -o "$tmp/tachyon-core.zip" "$url"
+  unzip -q "$tmp/tachyon-core.zip" -d "$tmp"
   install -m 755 "$tmp/tachyon-core" "$INSTALL_DIR/tachyon-core"
 
   cat > "$CONFIG_DIR/server.json" <<JSON

@@ -15,6 +15,8 @@ PORT=443
 TACHYON_VERSION="latest"
 UNINSTALL=false
 COMPOSE_DIR="/opt/tachyon-docker"
+GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
+GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +36,39 @@ install_docker() {
   curl -fsSL https://get.docker.com | sh
   systemctl enable --now docker
   success "Docker installed."
+}
+
+install_deps() {
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl jq unzip
+  success "Dependencies installed."
+}
+
+resolve_latest() {
+  curl -fsSL "$1?per_page=20" | jq -r '.[0].tag_name'
+}
+
+get_asset_url() {
+  curl -fsSL "$1/tags/$2" \
+    | jq -r --arg marker "$3" '.assets[] | select(.name | contains($marker)) | .browser_download_url' \
+    | head -1
+}
+
+install_tachyon_binary() {
+  [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
+  info "Installing tachyon-core $TACHYON_VERSION for Docker..."
+
+  arch=$(dpkg --print-architecture)
+  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "tachyon-core_${TACHYON_VERSION}_linux_${arch}.zip")
+  [[ -n "$url" ]] || die "No tachyon-core asset for linux_${arch}"
+
+  mkdir -p "$COMPOSE_DIR/bin"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  curl -fL --progress-bar -o "$tmp/tachyon-core.zip" "$url"
+  unzip -q "$tmp/tachyon-core.zip" -d "$tmp"
+  install -m 755 "$tmp/tachyon-core" "$COMPOSE_DIR/bin/tachyon-core"
+  success "tachyon-core binary installed."
 }
 
 write_configs() {
@@ -79,14 +114,15 @@ write_compose() {
   cat > "$COMPOSE_DIR/docker-compose.yaml" <<YAML
 services:
   tachyon-core:
-    image: ghcr.io/tachyon-space/tachyon-core:$TACHYON_VERSION
+    image: debian:bookworm-slim
     container_name: tachyon-core
     restart: unless-stopped
     network_mode: host
     volumes:
+      - $COMPOSE_DIR/bin/tachyon-core:/opt/tachyon/tachyon-core:ro
       - $COMPOSE_DIR/config/server.json:/etc/tachyon/server.json:ro
       - $COMPOSE_DIR/logs:/var/log/tachyon
-    command: ["tachyon-core", "run", "--config", "/etc/tachyon/server.json"]
+    command: ["/opt/tachyon/tachyon-core", "run", "--config", "/etc/tachyon/server.json"]
     ulimits:
       nofile:
         soft: 1048576
@@ -134,7 +170,9 @@ main() {
     uninstall
     exit 0
   fi
+  install_deps
   install_docker
+  install_tachyon_binary
   write_configs
   write_compose
   start_services

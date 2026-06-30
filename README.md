@@ -91,6 +91,13 @@ sudo bash scripts/install-server.sh --port 443
 sudo bash scripts/install-server-docker.sh --port 443
 ```
 
+Both installers download the matching Linux ZIP asset from
+`EarendelArc/tachyon-core` GitHub Releases. `--version latest` selects the
+newest release entry, including alpha prereleases; pass an explicit tag such as
+`--version v0.1.0-alpha.8` for reproducible deployment. The Docker path mounts
+the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
+container and does not depend on a GHCR image.
+
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.
 See [docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.

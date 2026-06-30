@@ -341,15 +341,20 @@ func refreshRoutingEngine(ctx context.Context, service *routing.Service, router 
 func (a *App) runServer(ctx context.Context) error {
 	a.logger.Info("starting in server mode", "listen", a.cfg.Server.Listen)
 
+	udpRelay := newUDPRelayPool(a.logger, a.cfg.Server.Relay.DialTimeout, a.cfg.Server.Relay.IdleTimeout)
+	defer func() {
+		if err := udpRelay.Close(); err != nil {
+			a.logger.Warn("close UDP relay pool", "error", err)
+		}
+	}()
+
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
 		ListenAddr: a.cfg.Server.Listen,
 		PacerPPS:   a.cfg.TGP.Pacing.InitialRatePPS,
 		FEC:        tgpFECOptions(a.cfg.TGP.FEC),
 		Handler: serverRelayHandler{
 			logger: a.logger,
-			forwarder: netUDPForwarder{
-				timeout: a.cfg.Server.Relay.DialTimeout,
-			},
+			relay:  udpRelay,
 		},
 	})
 	if err != nil {

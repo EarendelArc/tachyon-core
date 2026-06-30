@@ -4,6 +4,15 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Replaced the server's one-shot UDP forwarder with a persistent per-session,
+  per-flow UDP relay pool. Upstream game sockets are now reused and background
+  read loops can forward asynchronous game responses back over the TGP session.
+
+### Added
+- Tests covering asynchronous server UDP relay responses, TGP relay echo, and
+  TUN writeback through the persistent relay path.
+
 ## [v0.1.0-alpha.6] - 2026-06-28
 
 ### Fixed

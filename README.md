@@ -69,7 +69,7 @@ adapter creation on real Windows hosts.
 | Windows TUN | Alpha dynamic Wintun backend |
 | macOS PID tracking | Alpha lsof/ps backend |
 | TGP X25519 handshake and AEAD | Done |
-| TGP UDP relay skeleton | Done |
+| Persistent TGP UDP relay pool | Done |
 | Client TUN -> routing -> TGP writeback test | Done |
 
 ## Development

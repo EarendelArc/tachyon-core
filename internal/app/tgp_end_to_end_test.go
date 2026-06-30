@@ -33,11 +33,13 @@ func TestTGPRelayEndToEndUDPEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen relay: %v", err)
 	}
+	udpRelay := newUDPRelayPool(nil, time.Second, time.Second)
+	defer udpRelay.Close()
 	relay, err := tgp.NewRelay(tgp.RelayOptions{
 		Transport: relayTransport,
 		PacerPPS:  100000,
 		Handler: serverRelayHandler{
-			forwarder: netUDPForwarder{timeout: time.Second},
+			relay: udpRelay,
 		},
 	})
 	if err != nil {

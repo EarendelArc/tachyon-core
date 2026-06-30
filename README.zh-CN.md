@@ -57,7 +57,7 @@ Tachyon Core 还不是生产完成版本。协议和管道已经可以用于 alp
 | Windows TUN | Alpha 动态 Wintun 后端 |
 | macOS PID 追踪 | Alpha lsof/ps 后端 |
 | TGP X25519 握手和 AEAD | 完成 |
-| TGP UDP Relay 骨架 | 完成 |
+| 持久 TGP UDP Relay 会话池 | 完成 |
 | Client TUN -> routing -> TGP writeback 测试 | 完成 |
 
 ## 开发

@@ -152,7 +152,7 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 	}
 	group.Shards[index] = append([]byte(nil), packet.Payload...)
 
-	if index < group.DataShards {
+	if index < group.DataShards && header.Flags&FlagFEC == 0 {
 		payload, err := decodeFECDataShard(group.Shards[index])
 		if err != nil {
 			return FECReceiveResult{}, err

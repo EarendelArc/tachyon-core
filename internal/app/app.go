@@ -288,6 +288,7 @@ func tgpFECOptions(cfg config.FECConfig) tgp.FECOptions {
 	return tgp.FECOptions{
 		DataShards:   cfg.DataShards,
 		ParityShards: cfg.ParityShards,
+		GroupTimeout: cfg.GroupTimeout,
 	}
 }
 

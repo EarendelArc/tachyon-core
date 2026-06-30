@@ -12,11 +12,10 @@
 derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
-source-address migration, send-side systematic FEC parity generation for full
-groups, and a sliding receive-side packet deduplication window in
-`internal/tgp`. Migration confirmation control packets, low-traffic FEC timeout
-flush, dynamic FEC ratio adjustment, and true multi-transport fan-out are
-planned next.
+source-address migration, send-side systematic FEC parity generation, low-
+traffic FEC timeout flush, and a sliding receive-side packet deduplication
+window in `internal/tgp`. Migration confirmation control packets, dynamic FEC
+ratio adjustment, and true multi-transport fan-out are planned next.
 
 ---
 
@@ -158,8 +157,10 @@ Client                                    Server
 4. Send parity shards with the same `FECGroup` number.
 5. Each shard has `FECIndex` 0…(FECTotal-1) and `FECDataShards` set.
 
-Current implementation emits parity when a group becomes full. Timeout-based
-flush for low packet-rate games is still planned.
+Current implementation emits parity when a group becomes full. If a group does
+not fill before `GroupTimeout`, the sender emits FEC-only synthetic data shards
+plus parity so the receiver can still recover a lost low-rate game datagram
+without delivering those synthetic shards to the game socket.
 
 ### 4.2 Reconstruction (Server)
 

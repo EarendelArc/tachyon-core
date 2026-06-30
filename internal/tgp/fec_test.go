@@ -170,9 +170,31 @@ func TestFECReceiveBufferSuppressesDuplicateAndLateRecoveredShard(t *testing.T) 
 	}
 }
 
+func TestFECReceiveBufferDoesNotDeliverFECOnlyDataShard(t *testing.T) {
+	codec := NewReedSolomonCodec()
+	data := [][]byte{[]byte("alpha"), nil}
+	shards, err := codec.Encode(data, 2, 1)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	buffer := NewFECReceiveBuffer(codec, 0)
+	result, err := buffer.AddPacket(fecPacketWithFlags(41, 1, 3, 2, shards[1], FlagFEC))
+	if err != nil {
+		t.Fatalf("add fec-only data shard: %v", err)
+	}
+	if result.Ready || len(result.Payloads) != 0 {
+		t.Fatalf("fec-only data shard was delivered: %#v", result)
+	}
+}
+
 func fecPacket(group uint32, index int, total int, dataShards int, payload []byte) Packet {
+	return fecPacketWithFlags(group, index, total, dataShards, payload, 0)
+}
+
+func fecPacketWithFlags(group uint32, index int, total int, dataShards int, payload []byte, flags uint8) Packet {
 	return Packet{
 		Inner: InnerHeader{
+			Flags:         flags,
 			FECGroup:      group,
 			FECIndex:      uint8(index),
 			FECTotal:      uint8(total),

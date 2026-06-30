@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -35,6 +36,7 @@ type FECOptions struct {
 	DataShards       int
 	ParityShards     int
 	MaxReceiveGroups int
+	GroupTimeout     time.Duration
 }
 
 func (o FECOptions) enabled() bool {
@@ -68,8 +70,22 @@ type DatagramSession struct {
 }
 
 type fecSendGroup struct {
-	id       uint32
-	payloads [][]byte
+	id        uint32
+	createdAt time.Time
+	payloads  [][]byte
+}
+
+type fecRepairBatch struct {
+	streamID   StreamID
+	groupID    uint32
+	total      int
+	dataShards int
+	shards     []fecRepairShard
+}
+
+type fecRepairShard struct {
+	index   int
+	payload []byte
 }
 
 type sessionCounters struct {
@@ -128,6 +144,9 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	s.streams[0] = make(chan []byte, queueSize)
 
 	go s.readLoop(queueSize)
+	if s.fec.enabled() && s.fec.GroupTimeout > 0 {
+		go s.fecFlushLoop()
+	}
 	return s, nil
 }
 
@@ -196,12 +215,12 @@ func (s *DatagramSession) nextFECShards(streamID StreamID, payload []byte) ([]by
 	group := s.fecTx[streamID]
 	if group == nil {
 		s.fecGroup++
-		group = &fecSendGroup{id: s.fecGroup}
+		group = &fecSendGroup{id: s.fecGroup, createdAt: time.Now()}
 		s.fecTx[streamID] = group
 	}
 	if len(group.payloads) >= dataShards {
 		s.fecGroup++
-		group = &fecSendGroup{id: s.fecGroup}
+		group = &fecSendGroup{id: s.fecGroup, createdAt: time.Now()}
 		s.fecTx[streamID] = group
 	}
 
@@ -223,6 +242,97 @@ func (s *DatagramSession) nextFECShards(streamID StreamID, payload []byte) ([]by
 		delete(s.fecTx, streamID)
 	}
 	return dataPayload, parityPayloads, group.id, index, dataShards + parityShards, dataShards, nil
+}
+
+func (s *DatagramSession) fecFlushLoop() {
+	interval := s.fec.GroupTimeout / 2
+	if interval <= 0 {
+		interval = s.fec.GroupTimeout
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-ticker.C:
+			batches := s.expiredFECRepairBatches(now)
+			for _, batch := range batches {
+				_ = s.sendFECRepairBatch(s.ctx, batch)
+			}
+		}
+	}
+}
+
+func (s *DatagramSession) expiredFECRepairBatches(now time.Time) []fecRepairBatch {
+	s.fecMu.Lock()
+	defer s.fecMu.Unlock()
+
+	if !s.fec.enabled() || s.fec.GroupTimeout <= 0 {
+		return nil
+	}
+	dataShards := s.fec.DataShards
+	parityShards := s.fec.ParityShards
+	if err := validateFECParams(dataShards, parityShards); err != nil {
+		return nil
+	}
+
+	var batches []fecRepairBatch
+	for streamID, group := range s.fecTx {
+		if len(group.payloads) == 0 || len(group.payloads) >= dataShards {
+			continue
+		}
+		if now.Sub(group.createdAt) < s.fec.GroupTimeout {
+			continue
+		}
+		shards, err := NewReedSolomonCodec().Encode(group.payloads, dataShards, parityShards)
+		if err != nil {
+			continue
+		}
+		repair := make([]fecRepairShard, 0, dataShards-len(group.payloads)+parityShards)
+		for index := len(group.payloads); index < dataShards; index++ {
+			repair = append(repair, fecRepairShard{
+				index:   index,
+				payload: append([]byte(nil), shards[index]...),
+			})
+		}
+		for index := dataShards; index < len(shards); index++ {
+			repair = append(repair, fecRepairShard{
+				index:   index,
+				payload: append([]byte(nil), shards[index]...),
+			})
+		}
+		batches = append(batches, fecRepairBatch{
+			streamID:   streamID,
+			groupID:    group.id,
+			total:      dataShards + parityShards,
+			dataShards: dataShards,
+			shards:     repair,
+		})
+		delete(s.fecTx, streamID)
+	}
+	return batches
+}
+
+func (s *DatagramSession) sendFECRepairBatch(ctx context.Context, batch fecRepairBatch) error {
+	for _, shard := range batch.shards {
+		index := shard.index
+		configure := func(header *InnerHeader) {
+			header.Flags |= FlagFEC
+			header.FECGroup = batch.groupID
+			header.FECIndex = uint8(index)
+			header.FECTotal = uint8(batch.total)
+			header.FECDataShards = uint8(batch.dataShards)
+		}
+		if err := s.sendWirePayload(ctx, batch.streamID, shard.payload, configure, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *DatagramSession) sendWirePayload(ctx context.Context, streamID StreamID, payload []byte, configure func(*InnerHeader), accountedBytes uint64) error {

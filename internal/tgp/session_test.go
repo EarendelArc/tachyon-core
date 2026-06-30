@@ -365,6 +365,79 @@ func TestDatagramSessionSendSideFECParityRecoversDroppedDataShard(t *testing.T) 
 	}
 }
 
+func TestDatagramSessionFlushesPartialFECGroupOnTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("fec-timeout-test"))
+	var clientToServerKey [trafficKeySize]byte
+	var serverToClientKey [trafficKeySize]byte
+	for i := range clientToServerKey {
+		clientToServerKey[i] = byte(71 + i)
+		serverToClientKey[i] = byte(171 - i)
+	}
+
+	clientTransport := newMigrationTestTransport()
+	serverTransport := newMigrationTestTransport()
+	serverAddr := mustUDPAddr(t, "127.0.0.1:34000")
+	clientAddr := mustUDPAddr(t, "127.0.0.1:34001")
+
+	client, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  clientTransport,
+		RemoteAddr: serverAddr,
+		SendKey:    clientToServerKey,
+		RecvKey:    serverToClientKey,
+		Pacer:      NewTokenBucketPacer(100000),
+		FEC:        FECOptions{DataShards: 2, ParityShards: 1, GroupTimeout: 20 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("new client session: %v", err)
+	}
+	defer client.Close()
+	server, err := NewDatagramSession(SessionOptions{
+		ID:         sessionID,
+		Transport:  serverTransport,
+		RemoteAddr: clientAddr,
+		SendKey:    serverToClientKey,
+		RecvKey:    clientToServerKey,
+		Pacer:      NewTokenBucketPacer(100000),
+		FEC:        FECOptions{DataShards: 2, ParityShards: 1, GroupTimeout: 20 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("new server session: %v", err)
+	}
+	defer server.Close()
+
+	if err := client.SendPacket(ctx, 24, []byte("lonely tick")); err != nil {
+		t.Fatalf("send lonely tick: %v", err)
+	}
+	_ = clientTransport.nextWritePacket(ctx) // Drop the real data shard.
+	repairData := clientTransport.nextWritePacket(ctx)
+	parity := clientTransport.nextWritePacket(ctx)
+
+	serverTransport.inject(repairData, clientAddr)
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	if _, err := server.RecvPacket(shortCtx, 24); err == nil {
+		shortCancel()
+		t.Fatal("fec-only repair shard was delivered")
+	}
+	shortCancel()
+
+	serverTransport.inject(parity, clientAddr)
+	got, err := server.RecvPacket(ctx, 24)
+	if err != nil {
+		t.Fatalf("recv recovered timeout payload: %v", err)
+	}
+	if !bytes.Equal(got, []byte("lonely tick")) {
+		t.Fatalf("recovered timeout payload mismatch: %q", got)
+	}
+	if stats := server.Stats(); stats.FECRecovered != 1 {
+		t.Fatalf("expected one timeout FEC recovery, got %#v", stats)
+	}
+}
+
 type migrationRead struct {
 	packet []byte
 	from   net.Addr

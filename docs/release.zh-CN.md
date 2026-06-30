@@ -7,8 +7,8 @@ Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 al
 ## 当前预览版本
 
 当前预览版是
-[`v0.1.0-alpha.7`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.7)。
-该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重，以及同步后的协议文档。
+[`v0.1.0-alpha.8`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.8)。
+该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重、接收侧 Reed-Solomon FEC 恢复、发送侧 parity 生成、低流量 FEC 超时 flush、保守自适应 FEC 调整，以及同步后的协议文档。
 
 ## 触发方式
 

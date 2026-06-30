@@ -52,6 +52,12 @@ func TestLoadJSONConfig(t *testing.T) {
 	if cfg.TGP.FEC.GroupTimeout != 20*time.Millisecond {
 		t.Fatalf("group timeout = %s", cfg.TGP.FEC.GroupTimeout)
 	}
+	if !cfg.TGP.FEC.Dynamic {
+		t.Fatal("expected dynamic FEC to default to enabled")
+	}
+	if cfg.TGP.FEC.AdaptWindow != 32 {
+		t.Fatalf("adapt window = %d, want 32", cfg.TGP.FEC.AdaptWindow)
+	}
 }
 
 func TestLoadJSONRejectsYAML(t *testing.T) {

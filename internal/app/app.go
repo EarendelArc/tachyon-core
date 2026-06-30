@@ -289,6 +289,8 @@ func tgpFECOptions(cfg config.FECConfig) tgp.FECOptions {
 		DataShards:   cfg.DataShards,
 		ParityShards: cfg.ParityShards,
 		GroupTimeout: cfg.GroupTimeout,
+		Dynamic:      cfg.Dynamic,
+		AdaptWindow:  cfg.AdaptWindow,
 	}
 }
 

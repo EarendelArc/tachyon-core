@@ -1,254 +1,226 @@
-# Tachyon Game Protocol (TGP) — Wire Format Specification
+# Tachyon Game Protocol (TGP) - Wire Format Specification
 
-[中文说明](tgp-spec.zh-CN.md)
+[Chinese](tgp-spec.zh-CN.md)
 
 **Version:** TGP/1.0
 
 **Status:** Draft
 
-**Target audience:** Core and Server implementers
+**Target audience:** Tachyon Core implementers
 
 **Implementation status:** Core currently implements X25519/HKDF traffic-key
 derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
-source-address migration, send-side systematic FEC parity generation, low-
-traffic FEC timeout flush, and a sliding receive-side packet deduplication
-window in `internal/tgp`. Migration confirmation control packets, dynamic FEC
-ratio adjustment, and true multi-transport fan-out are planned next.
+source-address migration, send-side systematic FEC parity generation,
+low-traffic FEC timeout flush, conservative dynamic FEC ratio adjustment, and
+a sliding receive-side packet deduplication window in `internal/tgp`.
+Migration confirmation control packets, explicit peer loss feedback, and true
+multi-transport fan-out are planned next.
 
 ---
 
 ## 1. Goals
 
-TGP is a purpose-built UDP transport protocol designed to replace QUIC-based
-game proxies (TUIC, Hysteria 2) for latency-sensitive game traffic.
+TGP is a purpose-built UDP transport protocol for latency-sensitive game
+traffic. Its design goal is not bulk throughput; it is stable pacing, low queue
+depth, fast loss recovery, and connection continuity when the client path
+changes.
 
 | Goal | Mechanism |
-|---|---|
-| Zero jitter | Token-Bucket Pacing (no burst) |
-| 0-RTT loss recovery | Reed-Solomon FEC (20%–50% parity) |
+| --- | --- |
+| Low jitter | Token-bucket pacing with no burst accumulation |
+| 0-RTT loss recovery | Reed-Solomon FEC |
 | Connection migration | 128-bit Session ID |
-| DPI resistance | DTLS 1.0 outer header + ChaCha20-Poly1305 |
-| Multipath | Fan-out write + sliding-window dedup |
+| DPI resistance | DTLS-like outer header plus ChaCha20-Poly1305 |
+| Multipath readiness | Receive-side packet-number deduplication |
 
 ---
 
 ## 2. Packet Structure
 
-All integers are **big-endian** on the wire.
+All integer fields are encoded in big-endian order.
 
-### 2.1 Outer Header (13 bytes, plaintext)
+### 2.1 Outer Header
 
-Mimics a DTLS 1.0 Record header (`RFC 6347 §4.1`):
+The plaintext outer header mimics a DTLS 1.0 application-data record:
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│ ContentType (1) │ Version (2)     │ Epoch (2)                   │
-├─────────────────────────────────────────────────────────────────┤
-│ SequenceNumber (6 bytes)                                        │
-├─────────────────────────────────────────────────────────────────┤
-│ Length (2)                                                      │
-└─────────────────────────────────────────────────────────────────┘
+```text
+0                   1                   2                   3
+0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------+---------------+-------------------------------+
+| ContentType   | Version       | Epoch                         |
++---------------+---------------+-------------------------------+
+| SequenceNumber (48 bits)                                      |
++---------------------------------------------------------------+
+| Length                                                        |
++---------------------------------------------------------------+
 ```
 
 | Field | Size | Value |
-|---|---|---|
-| ContentType | 1 byte | `0x17` (application_data) |
-| Version | 2 bytes | `0xFE 0xFF` (DTLS 1.0) |
-| Epoch | 2 bytes | `0x0000` initially; randomised per session |
-| SequenceNumber | 6 bytes | Random per packet for DPI evasion |
-| Length | 2 bytes | Byte length of the encrypted inner payload |
+| --- | ---: | --- |
+| ContentType | 1 byte | `0x17` application data |
+| Version | 2 bytes | `0xFE 0xFF` DTLS 1.0 |
+| Epoch | 2 bytes | `0x0000` initially |
+| SequenceNumber | 6 bytes | DTLS-style packet sequence |
+| Length | 2 bytes | Encrypted inner payload length |
 
-### 2.2 Inner Header (43 bytes, authenticated encrypted)
+The outer header is used as AEAD additional authenticated data. Tampering with
+it causes packet open to fail.
 
-The inner header and payload are encrypted with **ChaCha20-Poly1305** (IETF).
-Key derivation: `HKDF-SHA256(shared_secret, salt=session_id,
-info="tachyon-tgp-v1 traffic keys")`.
+### 2.2 Inner Header
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-├─────────────────────────────────────────────────────────────────┤
-│ Magic (4 bytes): 0x54 0x47 0x50 0x01  "TGP\x01"                │
-├─────────────────┬─────────────────────────────────────────────-─┤
-│ Flags (1)       │ Reserved (2 bytes)                            │
-├─────────────────────────────────────────────────────────────────┤
-│ SessionID (16 bytes — UUIDv4)                                   │
-│                                                                 │
-│                                                                 │
-│                                                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│ StreamID (2)    │                                               │
-├─────────────────┘                                               │
-│ PacketNumber (8 bytes — monotonic per stream)                   │
-│                                                                 │
-├─────────────────┬───────────────┬───────────────┬──────────────┤
-│ FECGroup (4)    │ FECIdx (1)    │ FECTotal (1)  │ FECData (1)  │
-├─────────────────┴───────────────┴───────────────┴──────────────┤
-│ Reserved (1)    │ PayloadLength (2)                             │
-└─────────────────────────────────────────────────────────────────┘
+The inner header and payload are encrypted with ChaCha20-Poly1305. Traffic
+keys are derived with:
+
+```text
+HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 ```
 
-### 2.3 Flags Byte
+```text
++---------------------------------------------------------------+
+| Magic: 0x54 0x47 0x50 0x01 ("TGP\x01")                       |
++---------------+-----------------------------------------------+
+| Flags         | Reserved                                      |
++---------------------------------------------------------------+
+| SessionID (16 bytes)                                          |
++---------------+-----------------------------------------------+
+| StreamID      | PacketNumber (64 bits)                        |
++---------------+---------------+---------------+---------------+
+| FECGroup      | FECIndex      | FECTotal      | FECDataShards |
++---------------+---------------+---------------+---------------+
+| Reserved      | PayloadLength                                 |
++---------------------------------------------------------------+
+```
+
+| Field | Size | Description |
+| --- | ---: | --- |
+| Magic | 4 bytes | `TGP\x01` |
+| Flags | 1 byte | Control, FEC, migration, close, multipath, encryption |
+| Reserved | 2 bytes | Zero for now |
+| SessionID | 16 bytes | Stable session identifier used for migration |
+| StreamID | 2 bytes | Logical stream ID |
+| PacketNumber | 8 bytes | Monotonic packet number |
+| FECGroup | 4 bytes | FEC group ID |
+| FECIndex | 1 byte | Shard index within the group |
+| FECTotal | 1 byte | Total data plus parity shards |
+| FECDataShards | 1 byte | Original data shard count |
+| Reserved | 1 byte | Zero for now |
+| PayloadLength | 2 bytes | Encrypted payload length |
+
+### 2.3 Flags
 
 | Bit | Name | Meaning |
-|---|---|---|
-| 0 | `FlagControl` | Control plane packet (handshake, keepalive) |
-| 1 | `FlagFEC` | This is a parity shard (not original data) |
-| 2 | `FlagMigrate` | Client is requesting path migration |
-| 3 | `FlagClose` | Orderly session teardown |
-| 4 | `FlagMultipath` | Duplicate sent on a second path; dedup required |
-| 5–6 | Reserved | Must be 0 |
-| 7 | `FlagEncrypted` | Inner payload is ChaCha20 encrypted (always 1) |
+| --- | --- | --- |
+| 0 | `FlagControl` | Control-plane packet |
+| 1 | `FlagFEC` | FEC-only shard; do not deliver as a game payload |
+| 2 | `FlagMigrate` | Path migration marker |
+| 3 | `FlagClose` | Orderly close |
+| 4 | `FlagMultipath` | Multipath duplicate |
+| 5-6 | Reserved | Must be zero |
+| 7 | `FlagEncrypted` | Inner payload is encrypted |
 
 ---
 
 ## 3. Session Lifecycle
 
-```
-Client                                    Server
-  │                                          │
-  │──── HELLO (FlagControl, CID=random) ────►│
-  │                                          │
-  │◄─── HELLO_ACK (FlagControl, same CID) ──│
-  │                                          │
-  │════ Data packets (FlagEncrypted) ═══════►│
-  │◄═══════════════════════════════ Relay ═══│
-  │                                          │
-  │──── CLOSE (FlagClose) ──────────────────►│
-  │◄─── CLOSE_ACK ──────────────────────────│
+```text
+Client                                      Server
+  | ---- HELLO (session id, client key) ----> |
+  | <--- HELLO_ACK (same id, server key) ---- |
+  | ==== encrypted data packets ============> |
+  | <==== encrypted relay packets =========== |
+  | ---- CLOSE -----------------------------> |
 ```
 
-### 3.1 HELLO Packet Control Body (after inner header)
-
-```json
-{
-  "version": 1,
-  "client_pubkey": "<X25519 ephemeral public key, base64>",
-  "timestamp": 1700000000
-}
-```
-
-### 3.2 HELLO_ACK Packet Control Body
-
-```json
-{
-  "server_pubkey": "<X25519 ephemeral public key, base64>",
-  "session_id": "<UUID assigned by server>",
-  "max_streams": 16
-}
-```
+The implemented handshake uses X25519 ephemeral keys. Both sides derive
+directional traffic keys from the shared secret and SessionID.
 
 ---
 
 ## 4. FEC Groups
 
-### 4.1 Encoding (Client)
+### 4.1 Send Path
 
-1. Each data shard is sent immediately with a 2-byte original payload length
-   prefix. This keeps game input packets from waiting for the rest of the FEC
-   group.
-2. The sender keeps a copy of data shards until `FECDataShards` payloads are
-   collected.
-3. Call `RS.Encode(data, dataShards, parityShards)` to produce parity shards.
-4. Send parity shards with the same `FECGroup` number.
-5. Each shard has `FECIndex` 0…(FECTotal-1) and `FECDataShards` set.
+1. Real data shards are sent immediately. They are not held while waiting for a
+   group to fill.
+2. Every data shard payload is prefixed with a 2-byte original payload length.
+   Reed-Solomon padding is therefore stripped safely after recovery.
+3. The sender keeps a copy of data shards until `FECDataShards` payloads are
+   collected or `GroupTimeout` expires.
+4. When the group fills, the sender emits parity shards.
+5. When `GroupTimeout` expires before the group fills, the sender emits
+   FEC-only synthetic data shards for missing data indexes plus parity shards.
 
-Current implementation emits parity when a group becomes full. If a group does
-not fill before `GroupTimeout`, the sender emits FEC-only synthetic data shards
-plus parity so the receiver can still recover a lost low-rate game datagram
-without delivering those synthetic shards to the game socket.
+FEC-only synthetic data shards carry `FlagFEC`, so the receiver can use them for
+reconstruction without delivering empty synthetic datagrams to the game socket.
 
-### 4.2 Reconstruction (Server)
+### 4.2 Receive Path
 
-1. Buffer shards by `(SessionID, FECGroup)`.
-2. Data shards are delivered immediately after their length prefix is stripped;
-   this avoids adding group-fill latency to game traffic.
-3. Parity shards are retained. If any data shard is missing but
-   `received_count >= FECDataShards`, reconstruct and deliver only the missing
-   original payloads.
-4. Completed groups stay in a bounded receive window so late originals or
-   multipath duplicates are suppressed instead of delivered twice.
+1. Shards are buffered by `(SessionID, FECGroup)`.
+2. Real data shards are delivered immediately after stripping the length prefix.
+3. FEC-only shards are retained but not delivered.
+4. If any original data shard is missing and the group has at least
+   `FECDataShards` shards, Core reconstructs and delivers only the missing real
+   payloads.
+5. Completed groups remain in a bounded receive window so late originals or
+   multipath duplicates are suppressed.
 
-### 4.3 Dynamic FEC Rate Adjustment
+### 4.3 Dynamic FEC Ratio
 
-The client adjusts parity ratio based on measured loss rate, computed over a
-30-second sliding window:
+Core adjusts parity ratio based on observed receive-side FEC recovery ratio. The
+current implementation applies that estimate to the session's next outbound
+groups as a conservative symmetry assumption. Explicit peer loss feedback is a
+future control-plane upgrade.
 
-| Loss Rate | ParityShards/DataShards |
-|---|---|
-| 0% | 0/N (FEC disabled) |
-| 1–3% | 1/4 (25%) |
-| 3–10% | 2/4 (50%) |
-| >10% | 4/4 (100%, fallback to ARQ-free max protection) |
+| Observed recovery ratio | ParityShards/DataShards |
+| --- | --- |
+| 0% to 3% | 1/4, kept as a probe/protection floor |
+| 3% to 10% | 2/4 |
+| >10% | 4/4, ARQ-free maximum protection |
 
 ---
 
 ## 5. Connection Migration
 
-When the client detects a local IP change (e.g., Wi-Fi → 5G):
+When packets arrive from a new source address:
 
-1. Client starts sending packets from the new address with `FlagMigrate=1`.
-2. Server sees packets from a new source addr with a known `SessionID`.
-3. Server validates the packet (AEAD decrypt succeeds → proves ownership of session key).
-4. Server updates its routing table: `SessionID → newAddr`.
-5. Current implementation immediately updates the session return path after
-   authenticated decrypt succeeds. A future control packet with `FlagMigrate=1`
-   will make the confirmation explicit.
-6. Client drops the old path after it observes traffic on the new path.
+1. Core first authenticates the packet with AEAD.
+2. If the SessionID matches and the source address changed, the return path is
+   migrated to the new source.
+3. Packet numbers are still deduplicated, so old-path and new-path duplicates
+   do not reach the game socket twice.
 
-**Migration is zero-downtime**: during the migration window (≤100 ms), packets
-from both old and new paths are accepted (dedup buffer prevents doubles).
+Current migration is authenticated and zero-downtime, but explicit
+`FlagMigrate` confirmation packets are still planned.
 
 ---
 
 ## 6. Multipath
 
-When the client has both Wi-Fi and cellular available:
-
-1. Both `Transport` instances are registered with `MultipathTransport`.
-2. `MultipathTransport.WritePacket()` fans out to all paths simultaneously with `FlagMultipath=1`.
-3. The receiver tracks authenticated `PacketNumber` values in a sliding window.
-   Duplicates are silently dropped before delivery to the game socket.
-
-Current Core exposes the receive-side dedup window in `DatagramSession`.
-`MultipathTransport` fan-out is still an integration target.
+The current receive path already deduplicates authenticated packet numbers.
+True multi-transport fan-out still needs a `MultipathTransport` implementation
+that writes the same encoded packet over multiple local network interfaces.
 
 ---
 
 ## 7. Crypto
 
-| Aspect | Choice | Rationale |
-|---|---|---|
-| Key Exchange | X25519 ECDH | Fast, no patent issues, used by TLS 1.3 |
-| KDF | HKDF-SHA256 | RFC 5869, standard |
-| AEAD | ChaCha20-Poly1305 (IETF, RFC 8439) | Faster than AES-GCM without hardware acceleration (mobile) |
-| Nonce | Derived from PacketNumber + SessionID | Eliminates nonce reuse risk |
+| Aspect | Choice |
+| --- | --- |
+| Key exchange | X25519 |
+| KDF | HKDF-SHA256 |
+| AEAD | ChaCha20-Poly1305 |
+| Outer camouflage | DTLS-like application-data record |
 
 ---
 
-## 8. Obfuscation Details
+## 8. Current Limitations
 
-The goal is to make TGP traffic indistinguishable from real DTLS 1.0 traffic
-to passive DPI. Active probing resistance is a future goal.
-
-- `ContentType = 0x17`: All production TGP packets use application_data type.
-  DTLS handshake types (0x16) are never used to avoid confusing real DTLS stacks.
-- `Version = 0xFEFF`: DTLS 1.0 is the most common version seen in WebRTC ICE traffic.
-- `SequenceNumber`: Randomised per packet. Real DTLS sequences are monotonic,
-  but ISPs cannot distinguish random-looking sequences without deep state tracking.
-- `Epoch`: Incremented on migration (mirrors real DTLS re-key behaviour).
-
----
-
-## 9. Implementation Notes
-
-- The 16-byte Poly1305 authentication tag is appended after the inner payload.
-  Total per-packet overhead = 16 (outer) + 36 (inner) + 16 (Poly1305) = **68 bytes**.
-- For typical game packets of 64 bytes, this is a 106% overhead.
-  For 256-byte packets, overhead is 26%. FEC adds further overhead per config.
-- Implementations MUST reject packets where `Magic != [0x54,0x47,0x50,0x01]`
-  after decryption (prevents oracle attacks).
+- No explicit peer loss feedback yet; dynamic FEC currently uses receive-side
+  recovery ratio as a conservative local estimate.
+- No explicit migration-confirmation control packet yet.
+- Multipath fan-out is not yet implemented, although receive-side dedup is in
+  place.
+- TGP does not implement ARQ retransmission by design; it relies on pacing and
+  FEC to avoid adding physical RTT latency.

@@ -52,7 +52,9 @@ write_configs() {
     "fec": {
       "data_shards": 4,
       "parity_shards": 2,
-      "group_timeout": "20ms"
+      "group_timeout": "20ms",
+      "dynamic": true,
+      "adapt_window": 32
     },
     "pacing": {
       "initial_rate_pps": 128,

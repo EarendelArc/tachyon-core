@@ -203,6 +203,10 @@ type FECConfig struct {
 	// GroupTimeout is how long to wait for all shards before attempting
 	// partial reconstruction.
 	GroupTimeout time.Duration `yaml:"group_timeout" json:"group_timeout"`
+	// Dynamic lets Core adjust parity based on observed FEC recovery ratio.
+	Dynamic bool `yaml:"dynamic" json:"dynamic"`
+	// AdaptWindow is the number of delivered payloads in one adjustment window.
+	AdaptWindow int `yaml:"adapt_window" json:"adapt_window"`
 }
 
 // PacingConfig controls the Token Bucket send pacer.
@@ -330,6 +334,8 @@ func defaults() *Config {
 				DataShards:   4,
 				ParityShards: 2,
 				GroupTimeout: 20 * time.Millisecond,
+				Dynamic:      true,
+				AdaptWindow:  32,
 			},
 			Pacing: PacingConfig{
 				InitialRatePPS: 128,

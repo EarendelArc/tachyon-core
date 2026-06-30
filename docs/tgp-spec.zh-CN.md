@@ -8,7 +8,7 @@
 
 **目标读者:** Tachyon Core 与服务端实现者
 
-**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 数据包封包/解包、Reed-Solomon FEC 基础编解码、发送侧 parity 生成、低流量 FEC 超时 flush、接收侧实时 FEC 恢复、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、基于认证包来源地址变化的自动迁移，以及接收侧滑动窗口去重。显式迁移确认控制包、动态 FEC 比例调整，以及真正的多 transport fan-out 仍属于下一阶段。
+**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 数据包封包/解包、Reed-Solomon FEC 基础编解码、发送侧 parity 生成、低流量 FEC 超时 flush、保守动态 FEC 比例调整、接收侧实时 FEC 恢复、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、基于认证包来源地址变化的自动迁移，以及接收侧滑动窗口去重。显式迁移确认控制包、显式对端丢包反馈，以及真正的多 transport fan-out 仍属于下一阶段。
 
 ---
 
@@ -84,6 +84,6 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 ## 4. 下一阶段
 
 - 增加显式迁移确认控制包，区分“已接受新路径”和“已确认切换”。
-- 根据实时丢包率动态调整 FEC parity 比例。
+- 增加显式对端丢包反馈，让发送侧不只依赖接收侧恢复比例的对称性假设。
 - 实现真正的多 transport fan-out，并把 `FlagMultipath` 接入发送路径。
 - 为迁移、去重、FEC 恢复补充更细粒度的遥测事件。

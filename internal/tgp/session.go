@@ -37,6 +37,8 @@ type FECOptions struct {
 	ParityShards     int
 	MaxReceiveGroups int
 	GroupTimeout     time.Duration
+	Dynamic          bool
+	AdaptWindow      int
 }
 
 func (o FECOptions) enabled() bool {
@@ -61,6 +63,7 @@ type DatagramSession struct {
 	dedup    *packetDedupWindow
 	fecRx    *FECReceiveBuffer
 	fec      FECOptions
+	fecAdapt *FECAdaptiveController
 	fecMu    sync.Mutex
 	fecTx    map[StreamID]*fecSendGroup
 	fecGroup uint32
@@ -92,6 +95,7 @@ type sessionCounters struct {
 	bytesSent     atomic.Uint64
 	bytesReceived atomic.Uint64
 	fecRecovered  atomic.Uint64
+	packetLossPPM atomic.Uint64
 	migrations    atomic.Uint32
 }
 
@@ -122,6 +126,10 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	if fecRx == nil {
 		fecRx = NewFECReceiveBuffer(nil, opts.FEC.MaxReceiveGroups)
 	}
+	var fecAdapt *FECAdaptiveController
+	if opts.FEC.enabled() && opts.FEC.Dynamic {
+		fecAdapt = NewFECAdaptiveController(opts.FEC.DataShards, opts.FEC.DataShards, opts.FEC.AdaptWindow)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &DatagramSession{
@@ -139,6 +147,7 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		dedup:     newPacketDedupWindow(defaultDedupWindow),
 		fecRx:     fecRx,
 		fec:       opts.FEC,
+		fecAdapt:  fecAdapt,
 		fecTx:     make(map[StreamID]*fecSendGroup),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
@@ -164,10 +173,16 @@ func (s *DatagramSession) SendPacket(ctx context.Context, streamID StreamID, pay
 	if s.State() == SessionClosed {
 		return ErrSessionClosed
 	}
-	if s.fec.enabled() {
+	if s.fecEnabled() {
 		return s.sendPacketWithFEC(ctx, streamID, payload)
 	}
 	return s.sendWirePayload(ctx, streamID, payload, nil, uint64(len(payload)))
+}
+
+func (s *DatagramSession) fecEnabled() bool {
+	s.fecMu.Lock()
+	defer s.fecMu.Unlock()
+	return s.fec.enabled()
 }
 
 func (s *DatagramSession) sendPacketWithFEC(ctx context.Context, streamID StreamID, payload []byte) error {
@@ -411,6 +426,7 @@ func (s *DatagramSession) Close() error {
 
 func (s *DatagramSession) Stats() SessionStats {
 	return SessionStats{
+		PacketLoss:    float64(s.stats.packetLossPPM.Load()) / 1_000_000,
 		BytesSent:     s.stats.bytesSent.Load(),
 		BytesReceived: s.stats.bytesReceived.Load(),
 		FECRecovered:  s.stats.fecRecovered.Load(),
@@ -444,6 +460,7 @@ func (s *DatagramSession) readLoop(queueSize int) {
 		if result.RecoveredShards > 0 {
 			s.stats.fecRecovered.Add(uint64(result.RecoveredShards))
 		}
+		s.observeFECDelivery(len(result.Payloads), result.RecoveredShards)
 		for _, payload := range result.Payloads {
 			s.stats.bytesReceived.Add(uint64(len(payload)))
 			ch := s.streamWithSize(packet.Inner.StreamID, queueSize)
@@ -453,6 +470,19 @@ func (s *DatagramSession) readLoop(queueSize int) {
 				// Prefer dropping a stale game datagram over adding queue latency.
 			}
 		}
+	}
+}
+
+func (s *DatagramSession) observeFECDelivery(delivered, recovered int) {
+	s.fecMu.Lock()
+	defer s.fecMu.Unlock()
+	if s.fecAdapt == nil {
+		return
+	}
+	parity, lossRate, updated := s.fecAdapt.Observe(delivered, recovered)
+	s.stats.packetLossPPM.Store(uint64(lossRate * 1_000_000))
+	if updated && parity != s.fec.ParityShards {
+		s.fec.ParityShards = parity
 	}
 }
 

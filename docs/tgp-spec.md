@@ -14,9 +14,10 @@ primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
 source-address migration, send-side systematic FEC parity generation,
 low-traffic FEC timeout flush, conservative dynamic FEC ratio adjustment, and
-a sliding receive-side packet deduplication window in `internal/tgp`.
-Migration confirmation control packets, explicit peer loss feedback, and true
-multi-transport fan-out are planned next.
+a sliding receive-side packet deduplication window in `internal/tgp`. Core also
+includes a `MultipathTransport` adapter that fans out writes across multiple
+underlying transports and merges reads from any path. Migration confirmation
+control packets and explicit peer loss feedback are planned next.
 
 ---
 
@@ -33,7 +34,7 @@ changes.
 | 0-RTT loss recovery | Reed-Solomon FEC |
 | Connection migration | 128-bit Session ID |
 | DPI resistance | DTLS-like outer header plus ChaCha20-Poly1305 |
-| Multipath readiness | Receive-side packet-number deduplication |
+| Multipath readiness | Multi-transport fan-out plus receive-side packet-number deduplication |
 
 ---
 
@@ -198,9 +199,13 @@ Current migration is authenticated and zero-downtime, but explicit
 
 ## 6. Multipath
 
-The current receive path already deduplicates authenticated packet numbers.
-True multi-transport fan-out still needs a `MultipathTransport` implementation
-that writes the same encoded packet over multiple local network interfaces.
+The receive path deduplicates authenticated packet numbers, and
+`MultipathTransport` can now compose multiple `Transport` implementations. Each
+write is attempted on every path, while reads are merged from whichever path
+delivers first. The remaining integration work is system-interface discovery
+and policy selection, for example choosing Wi-Fi plus cellular paths on mobile.
+The current adapter relies on PacketNumber deduplication; explicit
+`FlagMultipath` marking remains reserved for a future control-plane integration.
 
 ---
 
@@ -220,7 +225,9 @@ that writes the same encoded packet over multiple local network interfaces.
 - No explicit peer loss feedback yet; dynamic FEC currently uses receive-side
   recovery ratio as a conservative local estimate.
 - No explicit migration-confirmation control packet yet.
-- Multipath fan-out is not yet implemented, although receive-side dedup is in
-  place.
+- Multipath interface discovery and policy selection are not wired yet; the
+  transport adapter and receive-side deduplication are implemented.
+- `FlagMultipath` is reserved; current fan-out does not rewrite encrypted inner
+  headers to set it.
 - TGP does not implement ARQ retransmission by design; it relies on pacing and
   FEC to avoid adding physical RTT latency.

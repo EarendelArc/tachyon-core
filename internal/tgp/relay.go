@@ -25,18 +25,20 @@ func (f RelayHandlerFunc) HandleRelayPacket(ctx context.Context, packet RelayPac
 }
 
 type RelayOptions struct {
-	ListenAddr string
-	Transport  Transport
-	PacerPPS   float64
-	FEC        FECOptions
-	Handler    RelayHandler
+	ListenAddr       string
+	Transport        Transport
+	PacerPPS         float64
+	FEC              FECOptions
+	DisableMigration bool
+	Handler          RelayHandler
 }
 
 type Relay struct {
-	listenAddr string
-	pacerPPS   float64
-	fec        FECOptions
-	handler    RelayHandler
+	listenAddr       string
+	pacerPPS         float64
+	fec              FECOptions
+	disableMigration bool
+	handler          RelayHandler
 
 	mu        sync.Mutex
 	transport Transport
@@ -52,11 +54,12 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 		handler = RelayHandlerFunc(func(context.Context, RelayPacket) error { return nil })
 	}
 	return &Relay{
-		listenAddr: opts.ListenAddr,
-		pacerPPS:   opts.PacerPPS,
-		fec:        opts.FEC,
-		handler:    handler,
-		transport:  opts.Transport,
+		listenAddr:       opts.ListenAddr,
+		pacerPPS:         opts.PacerPPS,
+		fec:              opts.FEC,
+		disableMigration: opts.DisableMigration,
+		handler:          handler,
+		transport:        opts.Transport,
 	}, nil
 }
 
@@ -72,8 +75,9 @@ func (r *Relay) ListenAndServe(ctx context.Context) error {
 	}
 
 	session, err := AcceptSessionWithOptions(ctx, transport, SessionRuntimeOptions{
-		PacerPPS: r.pacerPPS,
-		FEC:      r.fec,
+		PacerPPS:         r.pacerPPS,
+		FEC:              r.fec,
+		DisableMigration: r.disableMigration,
 	})
 	if err != nil {
 		if ctx.Err() != nil {

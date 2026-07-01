@@ -26,8 +26,9 @@ const (
 )
 
 type SessionRuntimeOptions struct {
-	PacerPPS float64
-	FEC      FECOptions
+	PacerPPS         float64
+	FEC              FECOptions
+	DisableMigration bool
 }
 
 func DialSession(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (*DatagramSession, error) {
@@ -42,7 +43,38 @@ func DialSessionWithOptions(ctx context.Context, localAddr string, remoteAddr ne
 	if err != nil {
 		return nil, err
 	}
+	return dialSessionWithTransport(ctx, transport, remoteAddr, opts)
+}
 
+func DialSessionMultipathWithOptions(ctx context.Context, localAddrs []string, remoteAddr net.Addr, opts SessionRuntimeOptions) (*DatagramSession, error) {
+	if remoteAddr == nil {
+		return nil, errors.New("remote address is required")
+	}
+	if len(localAddrs) == 0 {
+		return DialSessionWithOptions(ctx, "0.0.0.0:0", remoteAddr, opts)
+	}
+	transports := make([]Transport, 0, len(localAddrs))
+	for _, localAddr := range localAddrs {
+		transport, err := ListenUDP(localAddr)
+		if err != nil {
+			for _, item := range transports {
+				_ = item.Close()
+			}
+			return nil, err
+		}
+		transports = append(transports, transport)
+	}
+	transport, err := NewMultipathTransport(transports...)
+	if err != nil {
+		for _, item := range transports {
+			_ = item.Close()
+		}
+		return nil, err
+	}
+	return dialSessionWithTransport(ctx, transport, remoteAddr, opts)
+}
+
+func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAddr net.Addr, opts SessionRuntimeOptions) (*DatagramSession, error) {
 	keyPair, err := NewKeyPair()
 	if err != nil {
 		_ = transport.Close()
@@ -82,13 +114,14 @@ func DialSessionWithOptions(ctx context.Context, localAddr string, remoteAddr ne
 			return nil, err
 		}
 		return NewDatagramSession(SessionOptions{
-			ID:         sessionID,
-			Transport:  transport,
-			RemoteAddr: from,
-			SendKey:    keys.SendKey,
-			RecvKey:    keys.RecvKey,
-			Pacer:      NewTokenBucketPacer(opts.PacerPPS),
-			FEC:        opts.FEC,
+			ID:               sessionID,
+			Transport:        transport,
+			RemoteAddr:       from,
+			SendKey:          keys.SendKey,
+			RecvKey:          keys.RecvKey,
+			Pacer:            NewTokenBucketPacer(opts.PacerPPS),
+			FEC:              opts.FEC,
+			DisableMigration: opts.DisableMigration,
 		})
 	}
 }
@@ -131,13 +164,14 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 			return nil, err
 		}
 		return NewDatagramSession(SessionOptions{
-			ID:         sessionID,
-			Transport:  transport,
-			RemoteAddr: from,
-			SendKey:    keys.SendKey,
-			RecvKey:    keys.RecvKey,
-			Pacer:      NewTokenBucketPacer(opts.PacerPPS),
-			FEC:        opts.FEC,
+			ID:               sessionID,
+			Transport:        transport,
+			RemoteAddr:       from,
+			SendKey:          keys.SendKey,
+			RecvKey:          keys.RecvKey,
+			Pacer:            NewTokenBucketPacer(opts.PacerPPS),
+			FEC:              opts.FEC,
+			DisableMigration: opts.DisableMigration,
 		})
 	}
 }

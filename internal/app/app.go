@@ -122,8 +122,10 @@ func (a *App) runClient(ctx context.Context) error {
 
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
 		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
-		PacerPPS:         a.cfg.TGP.Pacing.InitialRatePPS,
+		LocalAddrs:       clientTGPLocalAddrs(a.cfg.Client.Proxy, a.cfg.TGP.Multipath),
+		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
 		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
+		DisableMigration: !a.cfg.TGP.ConnectionMigration,
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
 		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
 			packet, err := buildIPv4UDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
@@ -284,6 +286,19 @@ func clientTGPRemoteAddr(cfg config.ProxyConfig) string {
 	return strings.TrimSpace(cfg.ServerAddr)
 }
 
+func clientTGPLocalAddrs(cfg config.ProxyConfig, multipath bool) []string {
+	addrs := make([]string, 0, len(cfg.LocalAddrs))
+	for _, addr := range cfg.LocalAddrs {
+		if value := strings.TrimSpace(addr); value != "" {
+			addrs = append(addrs, value)
+		}
+	}
+	if !multipath && len(addrs) > 1 {
+		return addrs[:1]
+	}
+	return addrs
+}
+
 func tgpFECOptions(cfg config.FECConfig) tgp.FECOptions {
 	return tgp.FECOptions{
 		DataShards:   cfg.DataShards,
@@ -292,6 +307,14 @@ func tgpFECOptions(cfg config.FECConfig) tgp.FECOptions {
 		Dynamic:      cfg.Dynamic,
 		AdaptWindow:  cfg.AdaptWindow,
 	}
+}
+
+func tgpPacerPPS(cfg config.PacingConfig) float64 {
+	rate := cfg.InitialRatePPS
+	if cfg.MaxRatePPS > 0 && rate > cfg.MaxRatePPS {
+		return cfg.MaxRatePPS
+	}
+	return rate
 }
 
 func defaultRoutingStorePath() string {
@@ -349,9 +372,10 @@ func (a *App) runServer(ctx context.Context) error {
 	}()
 
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
-		ListenAddr: a.cfg.Server.Listen,
-		PacerPPS:   a.cfg.TGP.Pacing.InitialRatePPS,
-		FEC:        tgpFECOptions(a.cfg.TGP.FEC),
+		ListenAddr:       a.cfg.Server.Listen,
+		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
+		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
+		DisableMigration: !a.cfg.TGP.ConnectionMigration,
 		Handler: serverRelayHandler{
 			logger: a.logger,
 			relay:  udpRelay,

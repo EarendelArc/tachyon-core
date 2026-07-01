@@ -16,7 +16,8 @@ func TestLoadJSONConfig(t *testing.T) {
   "mode": "client",
   "client": {
     "proxy": {
-      "server_addr": "game.example.com:443"
+      "server_addr": "game.example.com:443",
+      "local_addrs": ["127.0.0.1:0", "127.0.0.2:0"]
     }
   },
   "tgp": {
@@ -45,6 +46,9 @@ func TestLoadJSONConfig(t *testing.T) {
 	}
 	if cfg.Client.Proxy.ServerAddr != "game.example.com:443" {
 		t.Fatalf("server addr = %q", cfg.Client.Proxy.ServerAddr)
+	}
+	if got := cfg.Client.Proxy.LocalAddrs; len(got) != 2 || got[0] != "127.0.0.1:0" || got[1] != "127.0.0.2:0" {
+		t.Fatalf("local addrs = %#v", got)
 	}
 	if cfg.TGP.HandshakeTimeout != 5*time.Second {
 		t.Fatalf("handshake timeout = %s", cfg.TGP.HandshakeTimeout)
@@ -336,6 +340,84 @@ func TestValidateClientWithProfilesAndServerAddr(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got error: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidClientLocalAddr(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{
+				ServerAddr: "game.example.com:443",
+				LocalAddrs: []string{
+					"not a udp addr",
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid local_addrs error")
+	}
+}
+
+func TestValidateRequiresTwoLocalAddrsForMultipath(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{
+				ServerAddr: "game.example.com:443",
+				LocalAddrs: []string{
+					"127.0.0.1:0",
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:                 FECConfig{DataShards: 4},
+			Pacing:              PacingConfig{InitialRatePPS: 128},
+			ConnectionMigration: true,
+			Multipath:           true,
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected multipath local_addrs error")
+	}
+
+	cfg.Client.Proxy.LocalAddrs = append(cfg.Client.Proxy.LocalAddrs, "127.0.0.2:0")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid multipath config, got error: %v", err)
+	}
+}
+
+func TestValidateRejectsMultipathWithoutConnectionMigration(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			Proxy: ProxyConfig{
+				ServerAddr: "game.example.com:443",
+				LocalAddrs: []string{
+					"127.0.0.1:0",
+					"127.0.0.2:0",
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:                 FECConfig{DataShards: 4},
+			Pacing:              PacingConfig{InitialRatePPS: 128},
+			ConnectionMigration: false,
+			Multipath:           true,
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected multipath connection_migration error")
+	}
+
+	cfg.TGP.ConnectionMigration = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid multipath config, got error: %v", err)
 	}
 }
 

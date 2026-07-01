@@ -38,6 +38,69 @@ func TestClientManagerDialsOnceAndSends(t *testing.T) {
 	}
 }
 
+func TestClientManagerUsesMultipathDialWhenMultipleLocalAddrsConfigured(t *testing.T) {
+	session := &fakeSession{state: SessionEstablished}
+	multipathDials := 0
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		LocalAddrs: []string{
+			"127.0.0.1:0",
+			"127.0.0.2:0",
+		},
+		Dial: func(context.Context, string, net.Addr, float64) (Session, error) {
+			t.Fatal("single-path dial should not be used")
+			return nil, nil
+		},
+		DialMultipath: func(_ context.Context, localAddrs []string, _ net.Addr, _ float64) (Session, error) {
+			multipathDials++
+			if len(localAddrs) != 2 {
+				t.Fatalf("local addrs = %v, want 2 entries", localAddrs)
+			}
+			return session, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	if err := manager.SendPacket(context.Background(), 1, []byte("one")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if multipathDials != 1 {
+		t.Fatalf("expected one multipath dial, got %d", multipathDials)
+	}
+}
+
+func TestClientManagerUsesSingleConfiguredLocalAddr(t *testing.T) {
+	session := &fakeSession{state: SessionEstablished}
+	var gotLocal string
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		LocalAddr:  "0.0.0.0:0",
+		LocalAddrs: []string{
+			"127.0.0.1:0",
+		},
+		Dial: func(_ context.Context, localAddr string, _ net.Addr, _ float64) (Session, error) {
+			gotLocal = localAddr
+			return session, nil
+		},
+		DialMultipath: func(context.Context, []string, net.Addr, float64) (Session, error) {
+			t.Fatal("multipath dial should not be used for a single configured address")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	if err := manager.SendPacket(context.Background(), 1, []byte("one")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if gotLocal != "127.0.0.1:0" {
+		t.Fatalf("local addr = %q, want configured addr", gotLocal)
+	}
+}
+
 func TestClientManagerLoopbackHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

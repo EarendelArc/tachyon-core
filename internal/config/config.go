@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +141,10 @@ type ProxyConfig struct {
 	// TGPServerAddr is the host:port for TGP game traffic.
 	// If empty, TGP traffic uses ServerAddr.
 	TGPServerAddr string `yaml:"tgp_server_addr,omitempty" json:"tgp_server_addr,omitempty"`
+
+	// LocalAddrs optionally pins client-side UDP bind addresses for multipath,
+	// e.g. ["192.168.1.10:0", "10.0.0.5:0"]. Empty uses "0.0.0.0:0".
+	LocalAddrs []string `yaml:"local_addrs,omitempty" json:"local_addrs,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +375,15 @@ func (c *Config) Validate() error {
 		if c.Client.Proxy.ServerAddr == "" {
 			return fmt.Errorf("client.proxy.server_addr is required in client mode")
 		}
+		if err := validateLocalAddrs(c.Client.Proxy.LocalAddrs); err != nil {
+			return err
+		}
+		if c.TGP.Multipath && countLocalAddrs(c.Client.Proxy.LocalAddrs) < 2 {
+			return fmt.Errorf("tgp.multipath requires at least two client.proxy.local_addrs entries")
+		}
+		if c.TGP.Multipath && !c.TGP.ConnectionMigration {
+			return fmt.Errorf("tgp.multipath requires tgp.connection_migration")
+		}
 		if err := validateGameProfiles(c.Client.Routing.GameProfiles); err != nil {
 			return err
 		}
@@ -387,6 +401,29 @@ func (c *Config) Validate() error {
 	}
 	if c.TGP.Pacing.MaxRatePPS < 0 {
 		return fmt.Errorf("tgp.pacing.max_rate_pps must be >= 0")
+	}
+	return nil
+}
+
+func countLocalAddrs(addrs []string) int {
+	count := 0
+	for _, addr := range addrs {
+		if strings.TrimSpace(addr) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func validateLocalAddrs(addrs []string) error {
+	for idx, addr := range addrs {
+		value := strings.TrimSpace(addr)
+		if value == "" {
+			return fmt.Errorf("client.proxy.local_addrs[%d] must not be empty", idx)
+		}
+		if _, err := net.ResolveUDPAddr("udp", value); err != nil {
+			return fmt.Errorf("client.proxy.local_addrs[%d] %q is not a valid UDP address: %w", idx, addr, err)
+		}
 	}
 	return nil
 }

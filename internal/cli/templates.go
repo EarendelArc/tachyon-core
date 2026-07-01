@@ -54,7 +54,8 @@ const ClientConfigTemplate = `{
     },
     "proxy": {
       "server_addr": "your-game-relay.example.com:443",
-      "tgp_server_addr": "your-game-relay.example.com:443"
+      "tgp_server_addr": "your-game-relay.example.com:443",
+      "local_addrs": []
     }
   },
   "tgp": {
@@ -110,7 +111,7 @@ const ServerConfigTemplate = `{
       "max_rate_pps": 1000
     },
     "connection_migration": true,
-    "multipath": true,
+    "multipath": false,
     "handshake_timeout": "5s",
     "session_idle_timeout": "300s"
   },

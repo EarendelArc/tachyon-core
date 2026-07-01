@@ -219,6 +219,13 @@ func TestServerConfigTemplateContainsRequiredFields(t *testing.T) {
 			t.Errorf("server template missing required key: %s", key)
 		}
 	}
+	tgpSection, ok := parsed["tgp"].(map[string]any)
+	if !ok {
+		t.Fatal("server template tgp section is not an object")
+	}
+	if tgpSection["multipath"] != false {
+		t.Fatalf("server template should disable client-side multipath, got %v", tgpSection["multipath"])
+	}
 }
 
 func TestUsageContainsCommandNames(t *testing.T) {

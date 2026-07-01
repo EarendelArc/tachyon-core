@@ -13,24 +13,30 @@ import (
 const defaultHandshakeTimeout = 5 * time.Second
 
 type DialFunc func(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (Session, error)
+type MultipathDialFunc func(ctx context.Context, localAddrs []string, remoteAddr net.Addr, pacerPPS float64) (Session, error)
 
 type ClientManagerOptions struct {
 	RemoteAddr       string
 	LocalAddr        string
+	LocalAddrs       []string
 	PacerPPS         float64
 	FEC              FECOptions
+	DisableMigration bool
 	HandshakeTimeout time.Duration
 	Dial             DialFunc
+	DialMultipath    MultipathDialFunc
 	OnDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 }
 
 type ClientManager struct {
 	remoteAddr       string
 	localAddr        string
+	localAddrs       []string
 	pacerPPS         float64
 	fec              FECOptions
 	handshakeTimeout time.Duration
 	dial             DialFunc
+	dialMultipath    MultipathDialFunc
 	onDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 
 	mu      sync.Mutex
@@ -48,6 +54,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	if local == "" {
 		local = "0.0.0.0:0"
 	}
+	localAddrs := normalizeLocalAddrs(opts.LocalAddrs, local)
 	timeout := opts.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
@@ -55,10 +62,24 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	dial := opts.Dial
 	if dial == nil {
 		fec := opts.FEC
+		disableMigration := opts.DisableMigration
 		dial = func(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (Session, error) {
 			return DialSessionWithOptions(ctx, localAddr, remoteAddr, SessionRuntimeOptions{
-				PacerPPS: pacerPPS,
-				FEC:      fec,
+				PacerPPS:         pacerPPS,
+				FEC:              fec,
+				DisableMigration: disableMigration,
+			})
+		}
+	}
+	dialMultipath := opts.DialMultipath
+	if dialMultipath == nil {
+		fec := opts.FEC
+		disableMigration := opts.DisableMigration
+		dialMultipath = func(ctx context.Context, localAddrs []string, remoteAddr net.Addr, pacerPPS float64) (Session, error) {
+			return DialSessionMultipathWithOptions(ctx, localAddrs, remoteAddr, SessionRuntimeOptions{
+				PacerPPS:         pacerPPS,
+				FEC:              fec,
+				DisableMigration: disableMigration,
 			})
 		}
 	}
@@ -66,10 +87,12 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	return &ClientManager{
 		remoteAddr:       remote,
 		localAddr:        local,
+		localAddrs:       localAddrs,
 		pacerPPS:         opts.PacerPPS,
 		fec:              opts.FEC,
 		handshakeTimeout: timeout,
 		dial:             dial,
+		dialMultipath:    dialMultipath,
 		onDatagram:       opts.OnDatagram,
 		ctx:              managerCtx,
 		cancel:           cancel,
@@ -121,7 +144,16 @@ func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
 	}
 	defer cancel()
 
-	session, err := m.dial(dialCtx, m.localAddr, remoteAddr, m.pacerPPS)
+	var session Session
+	if len(m.localAddrs) > 1 {
+		session, err = m.dialMultipath(dialCtx, m.localAddrs, remoteAddr, m.pacerPPS)
+	} else {
+		localAddr := m.localAddr
+		if len(m.localAddrs) == 1 {
+			localAddr = m.localAddrs[0]
+		}
+		session, err = m.dial(dialCtx, localAddr, remoteAddr, m.pacerPPS)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("dial tgp session %s: %w", remoteAddr, err)
 	}
@@ -130,6 +162,20 @@ func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
 		go m.readLoop(session)
 	}
 	return session, nil
+}
+
+func normalizeLocalAddrs(addrs []string, fallback string) []string {
+	normalized := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		value := strings.TrimSpace(addr)
+		if value != "" {
+			normalized = append(normalized, value)
+		}
+	}
+	if len(normalized) == 0 {
+		return []string{fallback}
+	}
+	return normalized
 }
 
 func (m *ClientManager) resetSession(session Session) {

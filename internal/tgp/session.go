@@ -18,6 +18,7 @@ const (
 var (
 	ErrSessionClosed     = errors.New("tgp session closed")
 	ErrSessionIDMismatch = errors.New("tgp session id mismatch")
+	ErrMigrationDisabled = errors.New("tgp connection migration disabled")
 )
 
 type SessionOptions struct {
@@ -30,6 +31,9 @@ type SessionOptions struct {
 	StreamQueue int
 	FECBuffer   *FECReceiveBuffer
 	FEC         FECOptions
+	// DisableMigration rejects authenticated packets that arrive from a source
+	// address different from the established remote address.
+	DisableMigration bool
 }
 
 type FECOptions struct {
@@ -56,17 +60,18 @@ type DatagramSession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu       sync.RWMutex
-	state    SessionState
-	remote   net.Addr
-	streams  map[StreamID]chan []byte
-	dedup    *packetDedupWindow
-	fecRx    *FECReceiveBuffer
-	fec      FECOptions
-	fecAdapt *FECAdaptiveController
-	fecMu    sync.Mutex
-	fecTx    map[StreamID]*fecSendGroup
-	fecGroup uint32
+	mu               sync.RWMutex
+	state            SessionState
+	remote           net.Addr
+	streams          map[StreamID]chan []byte
+	dedup            *packetDedupWindow
+	fecRx            *FECReceiveBuffer
+	fec              FECOptions
+	fecAdapt         *FECAdaptiveController
+	disableMigration bool
+	fecMu            sync.Mutex
+	fecTx            map[StreamID]*fecSendGroup
+	fecGroup         uint32
 
 	packetNo atomic.Uint64
 	stats    sessionCounters
@@ -133,22 +138,23 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &DatagramSession{
-		id:        opts.ID,
-		transport: opts.Transport,
-		sendCodec: sendCodec,
-		recvCodec: recvCodec,
-		pacer:     pacer,
-		ctx:       ctx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		state:     SessionEstablished,
-		remote:    opts.RemoteAddr,
-		streams:   make(map[StreamID]chan []byte),
-		dedup:     newPacketDedupWindow(defaultDedupWindow),
-		fecRx:     fecRx,
-		fec:       opts.FEC,
-		fecAdapt:  fecAdapt,
-		fecTx:     make(map[StreamID]*fecSendGroup),
+		id:               opts.ID,
+		transport:        opts.Transport,
+		sendCodec:        sendCodec,
+		recvCodec:        recvCodec,
+		pacer:            pacer,
+		ctx:              ctx,
+		cancel:           cancel,
+		done:             make(chan struct{}),
+		state:            SessionEstablished,
+		remote:           opts.RemoteAddr,
+		streams:          make(map[StreamID]chan []byte),
+		dedup:            newPacketDedupWindow(defaultDedupWindow),
+		fecRx:            fecRx,
+		fec:              opts.FEC,
+		fecAdapt:         fecAdapt,
+		disableMigration: opts.DisableMigration,
+		fecTx:            make(map[StreamID]*fecSendGroup),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
 
@@ -403,6 +409,9 @@ func (s *DatagramSession) Migrate(ctx context.Context, newAddr net.Addr) error {
 	if s.state == SessionClosed {
 		return ErrSessionClosed
 	}
+	if s.disableMigration {
+		return ErrMigrationDisabled
+	}
 	s.state = SessionMigrating
 	s.remote = newAddr
 	s.state = SessionEstablished
@@ -449,7 +458,9 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			continue
 		}
 		packet.SourceAddr = from
-		s.migrateIfNeeded(from)
+		if !s.acceptSource(from) {
+			continue
+		}
 		if !s.dedup.SeenFirst(packet.Inner.PacketNumber) {
 			continue
 		}
@@ -486,18 +497,25 @@ func (s *DatagramSession) observeFECDelivery(delivered, recovered int) {
 	}
 }
 
-func (s *DatagramSession) migrateIfNeeded(from net.Addr) {
+func (s *DatagramSession) acceptSource(from net.Addr) bool {
 	if from == nil {
-		return
+		return true
 	}
 	s.mu.RLock()
 	remote := s.remote
 	closed := s.state == SessionClosed
+	disableMigration := s.disableMigration
 	s.mu.RUnlock()
-	if closed || sameAddr(remote, from) {
-		return
+	if closed {
+		return false
 	}
-	_ = s.Migrate(s.ctx, from)
+	if sameAddr(remote, from) {
+		return true
+	}
+	if disableMigration {
+		return false
+	}
+	return s.Migrate(s.ctx, from) == nil
 }
 
 func sameAddr(left, right net.Addr) bool {

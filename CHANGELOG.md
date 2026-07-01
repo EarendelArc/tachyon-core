@@ -13,8 +13,24 @@ All notable changes to Tachyon Core will be documented in this file.
   Prism/Xray traffic unless explicitly configured.
 
 ### Added
+- Client-side TGP multipath configuration wiring: `client.proxy.local_addrs`
+  now feeds the TGP client manager, single-address binding is honored, and
+  multi-address configs use the multipath transport adapter.
+- `tgp.connection_migration` now gates authenticated source-address migration
+  in client and server TGP sessions; disabling it drops packets from unexpected
+  paths instead of silently rebinding the session.
+- Server config templates and install scripts now generate TGP relay configs
+  with `tgp.multipath` disabled because multipath is a client-side local-bind
+  feature.
+- `tgp.pacing.max_rate_pps` now acts as a hard ceiling for the initial TGP
+  pacer rate used by both client and server modes.
+- Config validation for malformed `client.proxy.local_addrs` entries and
+  multipath configs with fewer than two local bind addresses or disabled
+  connection migration.
 - Tests covering asynchronous server UDP relay responses, TGP relay echo, and
   TUN writeback through the persistent relay path.
+- Tests covering multipath handshakes, manager dial selection, and
+  `local_addrs` config loading.
 
 ## [v0.1.0-alpha.6] - 2026-06-28
 

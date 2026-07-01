@@ -96,7 +96,7 @@ write_configs() {
       "max_rate_pps": 1000
     },
     "connection_migration": true,
-    "multipath": true,
+    "multipath": false,
     "handshake_timeout": "5s",
     "session_idle_timeout": "300s"
   },

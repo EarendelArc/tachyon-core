@@ -3,6 +3,7 @@ package tgp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -127,6 +128,75 @@ func TestDatagramSessionMigratesOnAuthenticatedSourceChange(t *testing.T) {
 	}
 	if gotAddr := transport.nextWriteAddr(ctx); !sameAddr(gotAddr, migratedAddr) {
 		t.Fatalf("send used %v, want migrated addr %v", gotAddr, migratedAddr)
+	}
+}
+
+func TestDatagramSessionRejectsSourceChangeWhenMigrationDisabled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("migration-off!!!"))
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	for i := range sendKey {
+		sendKey[i] = byte(i + 3)
+		recvKey[i] = byte(203 - i)
+	}
+
+	initialAddr := mustUDPAddr(t, "127.0.0.1:30100")
+	migratedAddr := mustUDPAddr(t, "127.0.0.1:30101")
+	transport := newMigrationTestTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		ID:               sessionID,
+		Transport:        transport,
+		RemoteAddr:       initialAddr,
+		SendKey:          sendKey,
+		RecvKey:          recvKey,
+		Pacer:            NewTokenBucketPacer(100000),
+		DisableMigration: true,
+	})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer session.Close()
+
+	if err := session.Migrate(ctx, migratedAddr); !errors.Is(err, ErrMigrationDisabled) {
+		t.Fatalf("manual migration error = %v, want %v", err, ErrMigrationDisabled)
+	}
+
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatalf("codec: %v", err)
+	}
+	payload := []byte("packet from rejected path")
+	header, err := NewDataHeader(sessionID, 9, 1, len(payload))
+	if err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	wire, err := codec.Seal(1, header, payload)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	transport.inject(wire, migratedAddr)
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	if _, err := session.RecvPacket(shortCtx, 9); err == nil {
+		shortCancel()
+		t.Fatal("packet from migrated source was delivered while migration disabled")
+	}
+	shortCancel()
+	if stats := session.Stats(); stats.Migrations != 0 {
+		t.Fatalf("unexpected migration stats: %#v", stats)
+	}
+
+	transport.inject(wire, initialAddr)
+	got, err := session.RecvPacket(ctx, 9)
+	if err != nil {
+		t.Fatalf("recv original source: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %q, want %q", got, payload)
 	}
 }
 

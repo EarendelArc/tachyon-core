@@ -7,8 +7,10 @@ Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 al
 ## 当前预览版本
 
 当前预览版是
-[`v0.1.0-alpha.8`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.8)。
-该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重、接收侧 Reed-Solomon FEC 恢复、发送侧 parity 生成、低流量 FEC 超时 flush、保守自适应 FEC 调整，以及同步后的协议文档。
+[`v0.1.0-alpha.11`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.11)。
+该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重、接收侧 Reed-Solomon FEC 恢复、发送侧 parity 生成、低流量 FEC 超时 flush、保守自适应 FEC 调整、TGP-only 客户端安全默认值，以及多路径传输适配器。
+
+`main` 分支可能包含比该 tag 更新的未发布提交。只有在 `go test ./...` 和跨平台构建矩阵通过后，才应该创建新的 release tag。
 
 ## 触发方式
 
@@ -73,7 +75,7 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 `scripts/install-server.sh` 与 `scripts/install-server-docker.sh` 都从
 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的 Linux ZIP 资产。
 脚本的 `--version latest` 会读取 release 列表中的最新 tag，因此包含 alpha
-预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.8`
+预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.11`
 或更新后的固定 tag。
 
 裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把

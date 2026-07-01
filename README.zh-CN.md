@@ -85,7 +85,7 @@ sudo bash scripts/install-server-docker.sh --port 443
 两种安装脚本都会从 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的
 Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 alpha
 预览版；如需可复现部署，可传入明确 tag，例如
-`--version v0.1.0-alpha.8`。Docker 部署会把下载得到的静态
+`--version v0.1.0-alpha.11`。Docker 部署会把下载得到的静态
 `tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
 镜像。
 

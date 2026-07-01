@@ -8,11 +8,16 @@ useful for Prism-managed downloads and integration testing.
 ## Current Preview
 
 The current preview release is
-[`v0.1.0-alpha.8`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.8).
+[`v0.1.0-alpha.11`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.11).
 It includes authenticated TGP path migration, receive-side packet
 deduplication for multipath duplicates, receive-side Reed-Solomon FEC recovery,
 send-side parity generation, low-traffic FEC timeout flush, conservative
-adaptive FEC tuning, and updated protocol documentation.
+adaptive FEC tuning, TGP-only client safe defaults, and the multipath transport
+adapter.
+
+The `main` branch may contain newer unreleased changes after this tag. Create a
+new release tag only after `go test ./...` and the cross-platform build matrix
+pass.
 
 ## Trigger
 

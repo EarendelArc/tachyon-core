@@ -3,17 +3,25 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
 
 func TestServerRelayHandlerForwardsTunnelDatagram(t *testing.T) {
 	relay := &fakeGameUDPRelay{}
-	handler := serverRelayHandler{relay: relay}
+	handler := serverRelayHandler{
+		relay: relay,
+		acl: mustTargetACL(t, []config.RelayTargetRule{
+			{CIDR: "203.0.113.42/32", Ports: "27015"},
+		}),
+	}
 	payload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
 		LocalIP:    netip.MustParseAddr("198.18.0.2"),
 		LocalPort:  53000,
@@ -60,8 +68,13 @@ func TestUDPRelayPoolSendsAsyncResponsesToSession(t *testing.T) {
 	pool := newUDPRelayPool(nil, time.Second, time.Second)
 	defer pool.Close()
 	session := newFakeRelaySession()
-	handler := serverRelayHandler{relay: pool}
 	target := netip.MustParseAddrPort(echo.LocalAddr().String())
+	handler := serverRelayHandler{
+		relay: pool,
+		acl: mustTargetACL(t, []config.RelayTargetRule{
+			{CIDR: target.Addr().String() + "/32", Ports: fmt.Sprintf("%d", target.Port())},
+		}),
+	}
 	payload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
 		LocalIP:    netip.MustParseAddr("198.18.0.2"),
 		LocalPort:  53000,
@@ -97,6 +110,124 @@ func TestUDPRelayPoolSendsAsyncResponsesToSession(t *testing.T) {
 	}
 }
 
+func TestUDPRelayPoolRejectsTotalFlowLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	targets := listenUDPTargets(t, 2)
+	for _, target := range targets {
+		defer target.Close()
+	}
+	pool := newUDPRelayPoolWithOptions(nil, udpRelayPoolOptions{
+		DialTimeout:        time.Second,
+		IdleTimeout:        time.Second,
+		MaxFlows:           1,
+		MaxFlowsPerSession: 10,
+	})
+	defer pool.Close()
+	session := newFakeRelaySession()
+
+	first := tunnelPayloadForTarget(t, netip.MustParseAddrPort(targets[0].LocalAddr().String()))
+	if err := pool.ForwardUDP(ctx, tgp.RelayPacket{Session: session, SessionID: session.ID()}, first); err != nil {
+		t.Fatalf("first forward: %v", err)
+	}
+
+	second := tunnelPayloadForTarget(t, netip.MustParseAddrPort(targets[1].LocalAddr().String()))
+	if err := pool.ForwardUDP(ctx, tgp.RelayPacket{Session: session, SessionID: session.ID()}, second); !errors.Is(err, ErrUDPRelayFlowLimit) {
+		t.Fatalf("expected total flow limit error, got %v", err)
+	}
+}
+
+func TestUDPRelayPoolRejectsPerSessionFlowLimitWithoutBlockingOtherSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	targets := listenUDPTargets(t, 3)
+	for _, target := range targets {
+		defer target.Close()
+	}
+	pool := newUDPRelayPoolWithOptions(nil, udpRelayPoolOptions{
+		DialTimeout:        time.Second,
+		IdleTimeout:        time.Second,
+		MaxFlows:           3,
+		MaxFlowsPerSession: 1,
+	})
+	defer pool.Close()
+	firstSession := newFakeRelaySession()
+	secondSession := newFakeRelaySessionWithID("other-relay-sess")
+
+	first := tunnelPayloadForTarget(t, netip.MustParseAddrPort(targets[0].LocalAddr().String()))
+	if err := pool.ForwardUDP(ctx, tgp.RelayPacket{Session: firstSession, SessionID: firstSession.ID()}, first); err != nil {
+		t.Fatalf("first forward: %v", err)
+	}
+
+	sameSessionSecond := tunnelPayloadForTarget(t, netip.MustParseAddrPort(targets[1].LocalAddr().String()))
+	if err := pool.ForwardUDP(ctx, tgp.RelayPacket{Session: firstSession, SessionID: firstSession.ID()}, sameSessionSecond); !errors.Is(err, ErrUDPRelayFlowLimit) {
+		t.Fatalf("expected per-session flow limit error, got %v", err)
+	}
+
+	otherSessionFlow := tunnelPayloadForTarget(t, netip.MustParseAddrPort(targets[2].LocalAddr().String()))
+	if err := pool.ForwardUDP(ctx, tgp.RelayPacket{Session: secondSession, SessionID: secondSession.ID()}, otherSessionFlow); err != nil {
+		t.Fatalf("other session should not be blocked by first session limit: %v", err)
+	}
+}
+
+func TestServerRelayHandlerRejectsTargetsWithoutExplicitACL(t *testing.T) {
+	relay := &fakeGameUDPRelay{}
+	handler := serverRelayHandler{
+		relay: relay,
+		acl:   mustTargetACL(t, nil),
+	}
+	payload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("10.0.0.10"),
+		RemotePort: 27015,
+		Payload:    []byte("game"),
+	})
+	if err != nil {
+		t.Fatalf("marshal tunnel datagram: %v", err)
+	}
+	if err := handler.HandleRelayPacket(context.Background(), tgp.RelayPacket{Payload: payload}); !errors.Is(err, ErrRelayTargetDenied) {
+		t.Fatalf("expected ACL denial, got %v", err)
+	}
+	if relay.payload != nil {
+		t.Fatalf("relay should not receive denied payload: %q", relay.payload)
+	}
+}
+
+func TestServerRelayHandlerRejectsUnauthorizedPort(t *testing.T) {
+	relay := &fakeGameUDPRelay{}
+	handler := serverRelayHandler{
+		relay: relay,
+		acl: mustTargetACL(t, []config.RelayTargetRule{
+			{CIDR: "203.0.113.0/24", Ports: "27015-27016"},
+		}),
+	}
+	payload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("203.0.113.42"),
+		RemotePort: 9999,
+		Payload:    []byte("game"),
+	})
+	if err != nil {
+		t.Fatalf("marshal tunnel datagram: %v", err)
+	}
+	if err := handler.HandleRelayPacket(context.Background(), tgp.RelayPacket{Payload: payload}); !errors.Is(err, ErrRelayTargetDenied) {
+		t.Fatalf("expected ACL denial, got %v", err)
+	}
+}
+
+func mustTargetACL(t *testing.T, rules []config.RelayTargetRule) *targetACL {
+	t.Helper()
+	acl, err := newTargetACL(rules)
+	if err != nil {
+		t.Fatalf("target ACL: %v", err)
+	}
+	return acl
+}
+
 type fakeGameUDPRelay struct {
 	target  netip.AddrPort
 	payload []byte
@@ -114,11 +245,42 @@ type fakeRelaySession struct {
 }
 
 func newFakeRelaySession() *fakeRelaySession {
+	return newFakeRelaySessionWithID("fake-relay-sess!")
+}
+
+func newFakeRelaySessionWithID(raw string) *fakeRelaySession {
 	var id tgp.SessionID
-	copy(id[:], []byte("fake-relay-sess!"))
+	copy(id[:], []byte(raw))
 	return &fakeRelaySession{
 		id:   id,
 		sent: make(chan []byte, 8),
+	}
+}
+
+func listenUDPTargets(t *testing.T, count int) []net.PacketConn {
+	t.Helper()
+	targets := make([]net.PacketConn, 0, count)
+	for i := 0; i < count; i++ {
+		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			for _, target := range targets {
+				_ = target.Close()
+			}
+			t.Fatalf("listen target: %v", err)
+		}
+		targets = append(targets, conn)
+	}
+	return targets
+}
+
+func tunnelPayloadForTarget(t *testing.T, target netip.AddrPort) tgp.TunnelDatagram {
+	t.Helper()
+	return tgp.TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   target.Addr(),
+		RemotePort: target.Port(),
+		Payload:    []byte("game"),
 	}
 }
 

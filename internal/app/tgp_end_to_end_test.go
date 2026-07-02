@@ -3,11 +3,13 @@ package app
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
 
@@ -35,11 +37,15 @@ func TestTGPRelayEndToEndUDPEcho(t *testing.T) {
 	}
 	udpRelay := newUDPRelayPool(nil, time.Second, time.Second)
 	defer udpRelay.Close()
+	echoAddr := netip.MustParseAddrPort(echo.LocalAddr().String())
 	relay, err := tgp.NewRelay(tgp.RelayOptions{
 		Transport: relayTransport,
 		PacerPPS:  100000,
 		Handler: serverRelayHandler{
 			relay: udpRelay,
+			acl: mustTargetACL(t, []config.RelayTargetRule{
+				{CIDR: echoAddr.Addr().String() + "/32", Ports: fmt.Sprintf("%d", echoAddr.Port())},
+			}),
 		},
 	})
 	if err != nil {
@@ -67,7 +73,6 @@ func TestTGPRelayEndToEndUDPEcho(t *testing.T) {
 	}
 	defer manager.Close()
 
-	echoAddr := netip.MustParseAddrPort(echo.LocalAddr().String())
 	wire, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
 		LocalIP:    netip.MustParseAddr("198.18.0.2"),
 		LocalPort:  53000,

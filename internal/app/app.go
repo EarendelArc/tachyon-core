@@ -152,8 +152,9 @@ func (a *App) runClient(ctx context.Context) error {
 		Tracker: tracker,
 		Router:  packetRouter,
 		Handler: clientPacketHandler{
-			logger: a.logger,
-			tgp:    tgpManager,
+			logger:       a.logger,
+			tgp:          tgpManager,
+			rejectDirect: a.cfg.Client.TUN.TGPOnly,
 		},
 		Logger: a.logger,
 		OnDecision: func(d pipeline.Decision) {
@@ -372,22 +373,36 @@ func refreshRoutingEngine(ctx context.Context, service *routing.Service, router 
 func (a *App) runServer(ctx context.Context) error {
 	a.logger.Info("starting in server mode", "listen", a.cfg.Server.Listen)
 
-	udpRelay := newUDPRelayPool(a.logger, a.cfg.Server.Relay.DialTimeout, a.cfg.Server.Relay.IdleTimeout)
+	udpRelay := newUDPRelayPoolWithOptions(a.logger, udpRelayPoolOptions{
+		DialTimeout:        a.cfg.Server.Relay.DialTimeout,
+		IdleTimeout:        a.cfg.Server.Relay.IdleTimeout,
+		MaxFlows:           a.cfg.Server.Relay.MaxFlows,
+		MaxFlowsPerSession: a.cfg.Server.Relay.MaxFlowsPerSession,
+	})
 	defer func() {
 		if err := udpRelay.Close(); err != nil {
 			a.logger.Warn("close UDP relay pool", "error", err)
 		}
 	}()
+	targetACL, err := newTargetACL(a.cfg.Server.Relay.AllowedTargets)
+	if err != nil {
+		return fmt.Errorf("create relay target ACL: %w", err)
+	}
 
 	tgpRelay, err := tgp.NewRelay(tgp.RelayOptions{
-		ListenAddr:       a.cfg.Server.Listen,
-		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
-		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
-		DisableMigration: !a.cfg.TGP.ConnectionMigration,
-		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
+		ListenAddr:         a.cfg.Server.Listen,
+		PacerPPS:           tgpPacerPPS(a.cfg.TGP.Pacing),
+		FEC:                tgpFECOptions(a.cfg.TGP.FEC),
+		DisableMigration:   !a.cfg.TGP.ConnectionMigration,
+		AuthKey:            tgpAuthKey(a.cfg.TGP.Auth),
+		SessionIdleTimeout: a.cfg.TGP.SessionIdleTimeout,
+		MaxSessions:        a.cfg.Server.Relay.MaxSessions,
+		SessionQueueSize:   a.cfg.Server.Relay.SessionQueueSize,
+		HandlerConcurrency: a.cfg.Server.Relay.HandlerConcurrency,
 		Handler: serverRelayHandler{
 			logger: a.logger,
 			relay:  udpRelay,
+			acl:    targetACL,
 		},
 	})
 	if err != nil {

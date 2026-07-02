@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -59,6 +60,20 @@ func TestClientPacketHandlerIgnoresNonTGPDecision(t *testing.T) {
 	}
 	if len(sender.sent) != 0 {
 		t.Fatalf("unexpected TGP sends: %d", len(sender.sent))
+	}
+}
+
+func TestClientPacketHandlerRejectsCapturedDirectInTGPOnlyMode(t *testing.T) {
+	handler := clientPacketHandler{rejectDirect: true}
+	err := handler.HandlePacket(context.Background(), pipeline.Decision{
+		Action: pipeline.ActionDirect,
+		Flow: pidtrack.FlowKey{
+			RemoteIP:   "203.0.113.9",
+			RemotePort: 443,
+		},
+	}, []byte{1})
+	if !errors.Is(err, ErrDirectTrafficCaptured) {
+		t.Fatalf("expected direct capture error, got %v", err)
 	}
 }
 

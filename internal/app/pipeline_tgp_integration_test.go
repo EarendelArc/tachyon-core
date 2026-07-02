@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -33,11 +34,15 @@ func TestPipelineTGPRelayWritesResponseToTUN(t *testing.T) {
 	}
 	udpRelay := newUDPRelayPool(nil, time.Second, time.Second)
 	defer udpRelay.Close()
+	echoAddr := netip.MustParseAddrPort(echo.LocalAddr().String())
 	relay, err := tgp.NewRelay(tgp.RelayOptions{
 		Transport: relayTransport,
 		PacerPPS:  100000,
 		Handler: serverRelayHandler{
 			relay: udpRelay,
+			acl: mustTargetACL(t, []config.RelayTargetRule{
+				{CIDR: echoAddr.Addr().String() + "/32", Ports: fmt.Sprintf("%d", echoAddr.Port())},
+			}),
 		},
 	})
 	if err != nil {
@@ -49,7 +54,6 @@ func TestPipelineTGPRelayWritesResponseToTUN(t *testing.T) {
 		errCh <- relay.ListenAndServe(ctx)
 	}()
 
-	echoAddr := netip.MustParseAddrPort(echo.LocalAddr().String())
 	localAddr := netip.MustParseAddrPort("198.18.0.2:53000")
 	outbound, err := buildIPv4UDPPacket(localAddr, echoAddr, []byte("ping"))
 	if err != nil {

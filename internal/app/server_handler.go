@@ -7,11 +7,17 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
+
+var ErrRelayTargetDenied = errors.New("udp relay target denied by ACL")
+var ErrUDPRelayFlowLimit = errors.New("udp relay flow limit reached")
 
 type gameUDPRelay interface {
 	ForwardUDP(ctx context.Context, packet tgp.RelayPacket, datagram tgp.TunnelDatagram) error
@@ -20,6 +26,7 @@ type gameUDPRelay interface {
 type serverRelayHandler struct {
 	logger *slog.Logger
 	relay  gameUDPRelay
+	acl    *targetACL
 }
 
 func (h serverRelayHandler) HandleRelayPacket(ctx context.Context, packet tgp.RelayPacket) error {
@@ -33,6 +40,9 @@ func (h serverRelayHandler) HandleRelayPacket(ctx context.Context, packet tgp.Re
 		return err
 	}
 	target := datagram.RemoteAddrPort()
+	if h.acl == nil || !h.acl.Allows(target) {
+		return fmt.Errorf("%w: %s", ErrRelayTargetDenied, target)
+	}
 	if h.relay != nil {
 		if err := h.relay.ForwardUDP(ctx, packet, datagram); err != nil {
 			return err
@@ -46,15 +56,171 @@ func (h serverRelayHandler) HandleRelayPacket(ctx context.Context, packet tgp.Re
 	return nil
 }
 
-type udpRelayPool struct {
-	logger      *slog.Logger
-	dialTimeout time.Duration
-	idleTimeout time.Duration
-	sendTimeout time.Duration
+type targetACL struct {
+	rules []targetACLRule
+}
 
-	mu     sync.Mutex
-	flows  map[udpRelayKey]*udpRelayFlow
-	closed bool
+type targetACLRule struct {
+	prefixes []netip.Prefix
+	ports    []portRange
+}
+
+type portRange struct {
+	start uint16
+	end   uint16
+}
+
+func newTargetACL(rules []config.RelayTargetRule) (*targetACL, error) {
+	acl := &targetACL{}
+	for idx, rule := range rules {
+		compiled := targetACLRule{
+			ports: []portRange{{start: 1, end: 65535}},
+		}
+		if value := strings.TrimSpace(rule.CIDR); value != "" {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("server.relay.allowed_targets[%d].cidr: %w", idx, err)
+			}
+			if prefix.Bits() == 0 {
+				return nil, fmt.Errorf("server.relay.allowed_targets[%d].cidr must not allow the whole internet", idx)
+			}
+			compiled.prefixes = append(compiled.prefixes, prefix.Masked())
+		}
+		if value := strings.TrimSpace(rule.Domain); value != "" {
+			prefixes, err := resolveACLDomain(value)
+			if err != nil {
+				return nil, fmt.Errorf("server.relay.allowed_targets[%d].domain: %w", idx, err)
+			}
+			compiled.prefixes = append(compiled.prefixes, prefixes...)
+		}
+		if strings.TrimSpace(rule.Ports) == "" {
+			return nil, fmt.Errorf("server.relay.allowed_targets[%d].ports is required", idx)
+		}
+		ports, err := parseACLPortRanges(rule.Ports)
+		if err != nil {
+			return nil, fmt.Errorf("server.relay.allowed_targets[%d].ports: %w", idx, err)
+		}
+		compiled.ports = ports
+		if len(compiled.prefixes) == 0 {
+			return nil, fmt.Errorf("server.relay.allowed_targets[%d] requires cidr or resolvable domain", idx)
+		}
+		acl.rules = append(acl.rules, compiled)
+	}
+	return acl, nil
+}
+
+func (a *targetACL) Allows(target netip.AddrPort) bool {
+	if a == nil || !target.IsValid() || len(a.rules) == 0 {
+		return false
+	}
+	for _, rule := range a.rules {
+		if !rule.portAllowed(target.Port()) {
+			continue
+		}
+		for _, prefix := range rule.prefixes {
+			if prefix.Contains(target.Addr()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r targetACLRule) portAllowed(port uint16) bool {
+	for _, item := range r.ports {
+		if port >= item.start && port <= item.end {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveACLDomain(domain string) ([]netip.Prefix, error) {
+	if addr, err := netip.ParseAddr(domain); err == nil {
+		return []netip.Prefix{addrPrefix(addr)}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", domain)
+	if err != nil {
+		return nil, err
+	}
+	prefixes := make([]netip.Prefix, 0, len(addrs))
+	for _, addr := range addrs {
+		prefixes = append(prefixes, addrPrefix(addr))
+	}
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("no A/AAAA records for %q", domain)
+	}
+	return prefixes, nil
+}
+
+func addrPrefix(addr netip.Addr) netip.Prefix {
+	if addr.Is4() {
+		return netip.PrefixFrom(addr, 32)
+	}
+	return netip.PrefixFrom(addr, 128)
+}
+
+func parseACLPortRanges(raw string) ([]portRange, error) {
+	var ranges []portRange
+	for _, part := range strings.Split(raw, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			return nil, fmt.Errorf("empty port range")
+		}
+		bounds := strings.Split(item, "-")
+		if len(bounds) > 2 {
+			return nil, fmt.Errorf("invalid range %q", item)
+		}
+		start, err := parseACLPort(bounds[0])
+		if err != nil {
+			return nil, err
+		}
+		end := start
+		if len(bounds) == 2 {
+			end, err = parseACLPort(bounds[1])
+			if err != nil {
+				return nil, err
+			}
+		}
+		if start > end {
+			return nil, fmt.Errorf("range %q has start greater than end", item)
+		}
+		ranges = append(ranges, portRange{start: start, end: end})
+	}
+	return ranges, nil
+}
+
+func parseACLPort(raw string) (uint16, error) {
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid UDP port %q", raw)
+	}
+	return uint16(port), nil
+}
+
+type udpRelayPool struct {
+	logger             *slog.Logger
+	dialTimeout        time.Duration
+	idleTimeout        time.Duration
+	sendTimeout        time.Duration
+	maxFlows           int
+	maxFlowsPerSession int
+
+	mu                sync.Mutex
+	flows             map[udpRelayKey]*udpRelayFlow
+	flowCounts        map[tgp.SessionID]int
+	pendingFlows      int
+	pendingFlowCounts map[tgp.SessionID]int
+	closed            bool
+}
+
+type udpRelayPoolOptions struct {
+	DialTimeout        time.Duration
+	IdleTimeout        time.Duration
+	MaxFlows           int
+	MaxFlowsPerSession int
 }
 
 type udpRelayKey struct {
@@ -74,18 +240,39 @@ type udpRelayFlow struct {
 }
 
 func newUDPRelayPool(logger *slog.Logger, dialTimeout time.Duration, idleTimeout time.Duration) *udpRelayPool {
+	return newUDPRelayPoolWithOptions(logger, udpRelayPoolOptions{
+		DialTimeout: dialTimeout,
+		IdleTimeout: idleTimeout,
+	})
+}
+
+func newUDPRelayPoolWithOptions(logger *slog.Logger, opts udpRelayPoolOptions) *udpRelayPool {
+	dialTimeout := opts.DialTimeout
 	if dialTimeout <= 0 {
 		dialTimeout = 5 * time.Second
 	}
+	idleTimeout := opts.IdleTimeout
 	if idleTimeout <= 0 {
 		idleTimeout = 60 * time.Second
 	}
+	maxFlows := opts.MaxFlows
+	if maxFlows <= 0 {
+		maxFlows = 4096
+	}
+	maxFlowsPerSession := opts.MaxFlowsPerSession
+	if maxFlowsPerSession <= 0 {
+		maxFlowsPerSession = 256
+	}
 	return &udpRelayPool{
-		logger:      logger,
-		dialTimeout: dialTimeout,
-		idleTimeout: idleTimeout,
-		sendTimeout: dialTimeout,
-		flows:       make(map[udpRelayKey]*udpRelayFlow),
+		logger:             logger,
+		dialTimeout:        dialTimeout,
+		idleTimeout:        idleTimeout,
+		sendTimeout:        dialTimeout,
+		maxFlows:           maxFlows,
+		maxFlowsPerSession: maxFlowsPerSession,
+		flows:              make(map[udpRelayKey]*udpRelayFlow),
+		flowCounts:         make(map[tgp.SessionID]int),
+		pendingFlowCounts:  make(map[tgp.SessionID]int),
 	}
 }
 
@@ -115,7 +302,17 @@ func (p *udpRelayPool) flow(ctx context.Context, key udpRelayKey, session tgp.Se
 		p.mu.Unlock()
 		return flow, nil
 	}
+	if !p.reserveFlowLocked(key.sessionID) {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: session=%x remote=%s", ErrUDPRelayFlowLimit, key.sessionID, key.remote)
+	}
 	p.mu.Unlock()
+	reserved := true
+	defer func() {
+		if reserved {
+			p.releaseReservedFlow(key.sessionID)
+		}
+	}()
 
 	dialCtx := ctx
 	cancel := func() {}
@@ -138,6 +335,8 @@ func (p *udpRelayPool) flow(ctx context.Context, key udpRelayKey, session tgp.Se
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.releaseReservedFlowLocked(key.sessionID)
+	reserved = false
 	if p.closed {
 		_ = created.close()
 		return nil, errors.New("udp relay pool is closed")
@@ -146,9 +345,60 @@ func (p *udpRelayPool) flow(ctx context.Context, key udpRelayKey, session tgp.Se
 		_ = created.close()
 		return existing, nil
 	}
+	if !p.flowLimitAllowsLocked(key.sessionID) {
+		_ = created.close()
+		return nil, fmt.Errorf("%w: session=%x remote=%s", ErrUDPRelayFlowLimit, key.sessionID, key.remote)
+	}
 	p.flows[key] = created
+	p.flowCounts[key.sessionID]++
 	go created.readLoop()
 	return created, nil
+}
+
+func (p *udpRelayPool) reserveFlowLocked(sessionID tgp.SessionID) bool {
+	if !p.flowLimitAllowsWithPendingLocked(sessionID) {
+		return false
+	}
+	p.pendingFlows++
+	p.pendingFlowCounts[sessionID]++
+	return true
+}
+
+func (p *udpRelayPool) releaseReservedFlow(sessionID tgp.SessionID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.releaseReservedFlowLocked(sessionID)
+}
+
+func (p *udpRelayPool) releaseReservedFlowLocked(sessionID tgp.SessionID) {
+	if p.pendingFlows > 0 {
+		p.pendingFlows--
+	}
+	if count := p.pendingFlowCounts[sessionID]; count <= 1 {
+		delete(p.pendingFlowCounts, sessionID)
+	} else {
+		p.pendingFlowCounts[sessionID] = count - 1
+	}
+}
+
+func (p *udpRelayPool) flowLimitAllowsWithPendingLocked(sessionID tgp.SessionID) bool {
+	if p.maxFlows > 0 && len(p.flows)+p.pendingFlows >= p.maxFlows {
+		return false
+	}
+	if p.maxFlowsPerSession > 0 && p.flowCounts[sessionID]+p.pendingFlowCounts[sessionID] >= p.maxFlowsPerSession {
+		return false
+	}
+	return true
+}
+
+func (p *udpRelayPool) flowLimitAllowsLocked(sessionID tgp.SessionID) bool {
+	if p.maxFlows > 0 && len(p.flows) >= p.maxFlows {
+		return false
+	}
+	if p.maxFlowsPerSession > 0 && p.flowCounts[sessionID] >= p.maxFlowsPerSession {
+		return false
+	}
+	return true
 }
 
 func (p *udpRelayPool) remove(key udpRelayKey, flow *udpRelayFlow) {
@@ -156,6 +406,11 @@ func (p *udpRelayPool) remove(key udpRelayKey, flow *udpRelayFlow) {
 	defer p.mu.Unlock()
 	if p.flows[key] == flow {
 		delete(p.flows, key)
+		if count := p.flowCounts[key.sessionID]; count <= 1 {
+			delete(p.flowCounts, key.sessionID)
+		} else {
+			p.flowCounts[key.sessionID] = count - 1
+		}
 	}
 }
 
@@ -166,6 +421,9 @@ func (p *udpRelayPool) Close() error {
 		flows = append(flows, flow)
 	}
 	p.flows = make(map[udpRelayKey]*udpRelayFlow)
+	p.flowCounts = make(map[tgp.SessionID]int)
+	p.pendingFlows = 0
+	p.pendingFlowCounts = make(map[tgp.SessionID]int)
 	p.closed = true
 	p.mu.Unlock()
 

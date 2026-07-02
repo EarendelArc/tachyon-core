@@ -19,6 +19,7 @@ var (
 	handshakeMagic       = [4]byte{0x54, 0x47, 0x48, 0x01} // "TGH\x01"
 	ErrInvalidHandshake  = errors.New("invalid tgp handshake")
 	ErrUnexpectedMessage = errors.New("unexpected tgp handshake message")
+	ErrHandshakeTimeout  = errors.New("tgp handshake timeout")
 )
 
 type handshakeType uint8
@@ -111,6 +112,9 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		wire, from, err := transport.ReadPacket(ctx)
 		if err != nil {
 			_ = transport.Close()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, err)
+			}
 			return nil, err
 		}
 		msg, err := parseHandshake(wire)

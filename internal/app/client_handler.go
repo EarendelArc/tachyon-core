@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 
@@ -13,13 +14,16 @@ import (
 
 const capturedPacketStream tgp.StreamID = 0
 
+var ErrDirectTrafficCaptured = errors.New("direct traffic captured by TGP-only TUN pipeline")
+
 type tgpPacketSender interface {
 	SendPacket(ctx context.Context, streamID tgp.StreamID, payload []byte) error
 }
 
 type clientPacketHandler struct {
-	logger *slog.Logger
-	tgp    tgpPacketSender
+	logger       *slog.Logger
+	tgp          tgpPacketSender
+	rejectDirect bool
 }
 
 func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline.Decision, packet []byte) error {
@@ -74,6 +78,9 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 			"remote_port", decision.Flow.RemotePort,
 		)
 	case pipeline.ActionDirect:
+		if h.rejectDirect {
+			return fmt.Errorf("%w: %s:%d", ErrDirectTrafficCaptured, decision.Flow.RemoteIP, decision.Flow.RemotePort)
+		}
 		logger.Debug("packet route decision bypassed by core",
 			"action", decision.Action,
 			"reason", decision.Reason,

@@ -9,7 +9,8 @@ const ClientConfigTemplate = `{
       "address": "198.18.0.1/16",
       "mtu": 9000,
       "auto_route": false,
-      "dns_hijack": false
+      "dns_hijack": false,
+      "tgp_only": true
     },
     "routing": {
       "default_action": "direct",
@@ -98,7 +99,13 @@ const ServerConfigTemplate = `{
     "listen": ":443",
     "relay": {
       "dial_timeout": "5s",
-      "idle_timeout": "60s"
+      "idle_timeout": "60s",
+      "max_sessions": 1024,
+      "session_queue_size": 256,
+      "handler_concurrency": 1024,
+      "max_flows": 4096,
+      "max_flows_per_session": 256,
+      "allowed_targets": []
     }
   },
   "tgp": {

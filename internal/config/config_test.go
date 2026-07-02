@@ -68,6 +68,9 @@ func TestLoadJSONConfig(t *testing.T) {
 	if cfg.Client.TUN.DNSHijack {
 		t.Fatal("client.tun.dns_hijack should default to false in TGP-only mode")
 	}
+	if !cfg.Client.TUN.TGPOnly {
+		t.Fatal("client.tun.tgp_only should default to true")
+	}
 }
 
 func TestLoadJSONRejectsYAML(t *testing.T) {
@@ -473,6 +476,83 @@ func TestValidateServerWithListen(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid server config, got error: %v", err)
+	}
+}
+
+func TestValidateServerRelayAllowedTargets(t *testing.T) {
+	cfg := Config{
+		Mode: ModeServer,
+		Server: ServerConfig{
+			Listen: ":443",
+			Relay: RelayConfig{
+				AllowedTargets: []RelayTargetRule{
+					{CIDR: "203.0.113.0/24", Ports: "27015-27016,27020"},
+					{Domain: "example.com", Ports: "443"},
+				},
+			},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+			Auth:   TGPAuthConfig{PSK: "0123456789abcdef"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid relay targets, got: %v", err)
+	}
+
+	cfg.Server.Relay.AllowedTargets = []RelayTargetRule{{CIDR: "not-cidr"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid CIDR error")
+	}
+
+	cfg.Server.Relay.AllowedTargets = []RelayTargetRule{{CIDR: "0.0.0.0/0", Ports: "27015"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected wildcard IPv4 CIDR error")
+	}
+
+	cfg.Server.Relay.AllowedTargets = []RelayTargetRule{{CIDR: "::/0", Ports: "27015"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected wildcard IPv6 CIDR error")
+	}
+
+	cfg.Server.Relay.AllowedTargets = []RelayTargetRule{{CIDR: "203.0.113.0/24"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected missing ports error")
+	}
+
+	cfg.Server.Relay.AllowedTargets = []RelayTargetRule{{CIDR: "203.0.113.0/24", Ports: "27016-27015"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid port range error")
+	}
+}
+
+func TestValidateServerRelayLimits(t *testing.T) {
+	cfg := Config{
+		Mode: ModeServer,
+		Server: ServerConfig{
+			Listen: ":443",
+			Relay: RelayConfig{
+				MaxSessions:        1,
+				SessionQueueSize:   1,
+				HandlerConcurrency: 1,
+				MaxFlows:           1,
+				MaxFlowsPerSession: 1,
+			},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+			Auth:   TGPAuthConfig{PSK: "0123456789abcdef"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid relay limits, got: %v", err)
+	}
+
+	cfg.Server.Relay.MaxSessions = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected negative max_sessions error")
 	}
 }
 

@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,6 +98,10 @@ type TUNConfig struct {
 	// DNSHijack intercepts DNS UDP/53 traffic. It should only be enabled in
 	// deployments that intentionally route DNS through the Core TUN pipeline.
 	DNSHijack bool `yaml:"dns_hijack" json:"dns_hijack"`
+
+	// TGPOnly rejects captured direct traffic instead of silently consuming it.
+	// Leave enabled unless Core is explicitly paired with an OS bypass route.
+	TGPOnly bool `yaml:"tgp_only" json:"tgp_only"`
 }
 
 // RoutingConfig defines how traffic is classified into routing decisions.
@@ -176,6 +182,33 @@ type RelayConfig struct {
 
 	// IdleTimeout closes relay sessions that have been silent for this long.
 	IdleTimeout time.Duration `yaml:"idle_timeout" json:"idle_timeout"`
+
+	// MaxSessions caps concurrently established TGP sessions.
+	MaxSessions int `yaml:"max_sessions" json:"max_sessions"`
+
+	// SessionQueueSize caps queued packets per TGP session while the relay
+	// demux path fans encrypted packets out to sessions.
+	SessionQueueSize int `yaml:"session_queue_size" json:"session_queue_size"`
+
+	// HandlerConcurrency caps concurrent relay handler goroutines.
+	HandlerConcurrency int `yaml:"handler_concurrency" json:"handler_concurrency"`
+
+	// MaxFlows caps total UDP relay flows across all sessions.
+	MaxFlows int `yaml:"max_flows" json:"max_flows"`
+
+	// MaxFlowsPerSession caps UDP relay flows owned by a single TGP session.
+	MaxFlowsPerSession int `yaml:"max_flows_per_session" json:"max_flows_per_session"`
+
+	// AllowedTargets is an explicit allow-list for UDP relay targets. Empty
+	// means deny all targets; loopback/private/reserved ranges also require an
+	// explicit rule.
+	AllowedTargets []RelayTargetRule `yaml:"allowed_targets,omitempty" json:"allowed_targets,omitempty"`
+}
+
+type RelayTargetRule struct {
+	CIDR   string `yaml:"cidr,omitempty" json:"cidr,omitempty"`
+	Domain string `yaml:"domain,omitempty" json:"domain,omitempty"`
+	Ports  string `yaml:"ports,omitempty" json:"ports,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +368,7 @@ func defaults() *Config {
 				MTU:       9000,
 				AutoRoute: false,
 				DNSHijack: false,
+				TGPOnly:   true,
 			},
 			Routing: RoutingConfig{
 				DefaultAction: "direct",
@@ -343,8 +377,13 @@ func defaults() *Config {
 		Server: ServerConfig{
 			Listen: ":443",
 			Relay: RelayConfig{
-				DialTimeout: 5 * time.Second,
-				IdleTimeout: 60 * time.Second,
+				DialTimeout:        5 * time.Second,
+				IdleTimeout:        60 * time.Second,
+				MaxSessions:        1024,
+				SessionQueueSize:   256,
+				HandlerConcurrency: 1024,
+				MaxFlows:           4096,
+				MaxFlowsPerSession: 256,
 			},
 		},
 		TGP: TGPConfig{
@@ -403,6 +442,12 @@ func (c *Config) Validate() error {
 		if c.Server.Listen == "" {
 			return fmt.Errorf("server.listen is required in server mode")
 		}
+		if err := validateRelayTargets(c.Server.Relay.AllowedTargets); err != nil {
+			return err
+		}
+		if err := validateRelayLimits(c.Server.Relay); err != nil {
+			return err
+		}
 	}
 	if c.TGP.FEC.DataShards < 1 {
 		return fmt.Errorf("tgp.fec.data_shards must be >= 1")
@@ -424,6 +469,93 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("server mode requires tgp.auth.psk unless tgp.auth.allow_unauthenticated is true")
 	}
 	return nil
+}
+
+func validateRelayTargets(rules []RelayTargetRule) error {
+	for idx, rule := range rules {
+		if strings.TrimSpace(rule.CIDR) == "" && strings.TrimSpace(rule.Domain) == "" {
+			return fmt.Errorf("server.relay.allowed_targets[%d] requires cidr or domain", idx)
+		}
+		if value := strings.TrimSpace(rule.CIDR); value != "" {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return fmt.Errorf("server.relay.allowed_targets[%d].cidr %q is invalid: %w", idx, rule.CIDR, err)
+			}
+			if prefix.Bits() == 0 {
+				return fmt.Errorf("server.relay.allowed_targets[%d].cidr must not allow the whole internet", idx)
+			}
+		}
+		if value := strings.TrimSpace(rule.Domain); value != "" && strings.Contains(value, ":") {
+			return fmt.Errorf("server.relay.allowed_targets[%d].domain must not include a port", idx)
+		}
+		if strings.TrimSpace(rule.Ports) == "" {
+			return fmt.Errorf("server.relay.allowed_targets[%d].ports is required", idx)
+		}
+		if err := validatePortRanges(rule.Ports); err != nil {
+			return fmt.Errorf("server.relay.allowed_targets[%d].ports: %w", idx, err)
+		}
+	}
+	return nil
+}
+
+func validateRelayLimits(cfg RelayConfig) error {
+	if cfg.MaxSessions < 0 {
+		return fmt.Errorf("server.relay.max_sessions must be >= 0")
+	}
+	if cfg.SessionQueueSize < 0 {
+		return fmt.Errorf("server.relay.session_queue_size must be >= 0")
+	}
+	if cfg.HandlerConcurrency < 0 {
+		return fmt.Errorf("server.relay.handler_concurrency must be >= 0")
+	}
+	if cfg.MaxFlows < 0 {
+		return fmt.Errorf("server.relay.max_flows must be >= 0")
+	}
+	if cfg.MaxFlowsPerSession < 0 {
+		return fmt.Errorf("server.relay.max_flows_per_session must be >= 0")
+	}
+	return nil
+}
+
+func validatePortRanges(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	for _, part := range strings.Split(value, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			return fmt.Errorf("empty port range")
+		}
+		bounds := strings.Split(item, "-")
+		if len(bounds) > 2 {
+			return fmt.Errorf("invalid range %q", item)
+		}
+		start, err := parsePortNumber(bounds[0])
+		if err != nil {
+			return err
+		}
+		end := start
+		if len(bounds) == 2 {
+			end, err = parsePortNumber(bounds[1])
+			if err != nil {
+				return err
+			}
+		}
+		if start > end {
+			return fmt.Errorf("range %q has start greater than end", item)
+		}
+	}
+	return nil
+}
+
+func parsePortNumber(raw string) (int, error) {
+	value := strings.TrimSpace(raw)
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid UDP port %q", raw)
+	}
+	return port, nil
 }
 
 func countLocalAddrs(addrs []string) int {

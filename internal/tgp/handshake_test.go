@@ -140,8 +140,8 @@ func TestHandshakeRejectsMismatchedPSK(t *testing.T) {
 		_ = client.Close()
 		t.Fatal("expected mismatched PSK handshake to fail")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context timeout for rejected handshake, got %v", err)
+	if !errors.Is(err, ErrHandshakeTimeout) || (!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("expected handshake timeout for rejected handshake, got %v", err)
 	}
 
 	select {
@@ -178,8 +178,8 @@ func TestHandshakeRejectsClientPSKWhenServerHasNoPSK(t *testing.T) {
 		_ = client.Close()
 		t.Fatal("expected authenticated client to fail against unauthenticated server")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context timeout for rejected handshake, got %v", err)
+	if !errors.Is(err, ErrHandshakeTimeout) || (!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("expected handshake timeout for rejected handshake, got %v", err)
 	}
 
 	select {
@@ -216,8 +216,8 @@ func TestHandshakeRejectsUnauthenticatedClientWhenServerRequiresPSK(t *testing.T
 		_ = client.Close()
 		t.Fatal("expected unauthenticated client to fail against authenticated server")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context timeout for rejected handshake, got %v", err)
+	if !errors.Is(err, ErrHandshakeTimeout) || (!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("expected handshake timeout for rejected handshake, got %v", err)
 	}
 
 	select {
@@ -227,6 +227,26 @@ func TestHandshakeRejectsUnauthenticatedClientWhenServerRequiresPSK(t *testing.T
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server accept did not return after context timeout")
+	}
+}
+
+func TestHandshakeTimesOutWhenAckIsDropped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	blackhole, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen blackhole: %v", err)
+	}
+	defer blackhole.Close()
+
+	client, err := DialSessionWithOptions(ctx, "127.0.0.1:0", blackhole.LocalAddr(), SessionRuntimeOptions{PacerPPS: 100000})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("expected dropped ack handshake to fail")
+	}
+	if !errors.Is(err, ErrHandshakeTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected handshake timeout with context deadline, got %v", err)
 	}
 }
 

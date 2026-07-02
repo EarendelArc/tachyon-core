@@ -184,8 +184,9 @@ type RelayConfig struct {
 
 // TGPConfig holds TGP parameters used by both client and server.
 type TGPConfig struct {
-	FEC    FECConfig    `yaml:"fec" json:"fec"`
-	Pacing PacingConfig `yaml:"pacing" json:"pacing"`
+	FEC    FECConfig     `yaml:"fec" json:"fec"`
+	Pacing PacingConfig  `yaml:"pacing" json:"pacing"`
+	Auth   TGPAuthConfig `yaml:"auth,omitempty" json:"auth,omitempty"`
 
 	// ConnectionMigration enables transparent session migration on IP change.
 	ConnectionMigration bool `yaml:"connection_migration" json:"connection_migration"`
@@ -198,6 +199,16 @@ type TGPConfig struct {
 
 	// SessionIdleTimeout closes sessions that have been idle for this long.
 	SessionIdleTimeout time.Duration `yaml:"session_idle_timeout" json:"session_idle_timeout"`
+}
+
+const placeholderTGPPSK = "replace-with-shared-tgp-psk"
+
+// TGPAuthConfig controls pre-shared-key authentication for TGP handshakes.
+// Server mode requires PSK unless AllowUnauthenticated is explicitly enabled
+// for local development or alpha compatibility testing.
+type TGPAuthConfig struct {
+	PSK                  string `yaml:"psk,omitempty" json:"psk,omitempty"`
+	AllowUnauthenticated bool   `yaml:"allow_unauthenticated,omitempty" json:"allow_unauthenticated,omitempty"`
 }
 
 // FECConfig controls Reed-Solomon forward error correction.
@@ -401,6 +412,16 @@ func (c *Config) Validate() error {
 	}
 	if c.TGP.Pacing.MaxRatePPS < 0 {
 		return fmt.Errorf("tgp.pacing.max_rate_pps must be >= 0")
+	}
+	psk := strings.TrimSpace(c.TGP.Auth.PSK)
+	if strings.EqualFold(psk, placeholderTGPPSK) {
+		return fmt.Errorf("tgp.auth.psk must be replaced with a unique secret")
+	}
+	if psk != "" && len(psk) < 16 {
+		return fmt.Errorf("tgp.auth.psk must be at least 16 characters when set")
+	}
+	if c.Mode == ModeServer && psk == "" && !c.TGP.Auth.AllowUnauthenticated {
+		return fmt.Errorf("server mode requires tgp.auth.psk unless tgp.auth.allow_unauthenticated is true")
 	}
 	return nil
 }

@@ -197,6 +197,11 @@ func TestLoadKeepsAbsolutePaths(t *testing.T) {
       "cert": ` + quoteJSON(certPath) + `,
       "key": ` + quoteJSON(keyPath) + `
     }
+  },
+  "tgp": {
+    "auth": {
+      "psk": "0123456789abcdef"
+    }
   }
 }`)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -318,6 +323,41 @@ func TestValidateRejectsNegativeMaxRatePPS(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsShortTGPAuthPSK(t *testing.T) {
+	cfg := Config{
+		Mode:   ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+			Auth:   TGPAuthConfig{PSK: "too-short"},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for short tgp.auth.psk")
+	}
+
+	cfg.TGP.Auth.PSK = "0123456789abcdef"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid psk, got error: %v", err)
+	}
+}
+
+func TestValidateRejectsPlaceholderTGPAuthPSK(t *testing.T) {
+	cfg := Config{
+		Mode:   ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+			Auth:   TGPAuthConfig{PSK: placeholderTGPPSK},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for placeholder tgp.auth.psk")
+	}
+}
+
 func TestValidateClientWithProfilesAndServerAddr(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
@@ -428,10 +468,30 @@ func TestValidateServerWithListen(t *testing.T) {
 		TGP: TGPConfig{
 			FEC:    FECConfig{DataShards: 4},
 			Pacing: PacingConfig{InitialRatePPS: 128},
+			Auth:   TGPAuthConfig{PSK: "0123456789abcdef"},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid server config, got error: %v", err)
+	}
+}
+
+func TestValidateServerRequiresAuthByDefault(t *testing.T) {
+	cfg := Config{
+		Mode:   ModeServer,
+		Server: ServerConfig{Listen: ":443"},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected server mode to require tgp.auth.psk")
+	}
+
+	cfg.TGP.Auth.AllowUnauthenticated = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected explicit unauthenticated server config to validate, got: %v", err)
 	}
 }
 

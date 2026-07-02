@@ -126,6 +126,7 @@ func (a *App) runClient(ctx context.Context) error {
 		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
 		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
 		DisableMigration: !a.cfg.TGP.ConnectionMigration,
+		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
 		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
 			packet, err := buildIPv4UDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
@@ -317,6 +318,13 @@ func tgpPacerPPS(cfg config.PacingConfig) float64 {
 	return rate
 }
 
+func tgpAuthKey(cfg config.TGPAuthConfig) []byte {
+	if value := strings.TrimSpace(cfg.PSK); value != "" {
+		return []byte(value)
+	}
+	return nil
+}
+
 func defaultRoutingStorePath() string {
 	if value := strings.TrimSpace(os.Getenv("TACHYON_ROUTING_STORE")); value != "" {
 		return value
@@ -376,6 +384,7 @@ func (a *App) runServer(ctx context.Context) error {
 		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
 		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
 		DisableMigration: !a.cfg.TGP.ConnectionMigration,
+		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
 		Handler: serverRelayHandler{
 			logger: a.logger,
 			relay:  udpRelay,

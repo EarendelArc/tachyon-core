@@ -95,7 +95,31 @@ func TestValidateConfigValidClient(t *testing.T) {
 func TestValidateConfigValidServer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "server.json")
+	writeFile(t, path, `{"mode":"server","server":{"listen":":443"},"tgp":{"auth":{"psk":"0123456789abcdef"},"fec":{"data_shards":4,"parity_shards":2},"connection_migration":true},"observability":{"log_level":"info"}}`)
+
+	mode, err := ValidateConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != config.ModeServer {
+		t.Fatalf("expected server mode, got %q", mode)
+	}
+}
+
+func TestValidateConfigServerRequiresAuthByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.json")
 	writeFile(t, path, `{"mode":"server","server":{"listen":":443"},"tgp":{"fec":{"data_shards":4,"parity_shards":2},"connection_migration":true},"observability":{"log_level":"info"}}`)
+
+	if _, err := ValidateConfig(path); err == nil {
+		t.Fatal("expected server config without tgp.auth.psk to fail")
+	}
+}
+
+func TestValidateConfigServerAllowsExplicitUnauthenticated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.json")
+	writeFile(t, path, `{"mode":"server","server":{"listen":":443"},"tgp":{"auth":{"allow_unauthenticated":true},"fec":{"data_shards":4,"parity_shards":2},"connection_migration":true},"observability":{"log_level":"info"}}`)
 
 	mode, err := ValidateConfig(path)
 	if err != nil {
@@ -225,6 +249,16 @@ func TestServerConfigTemplateContainsRequiredFields(t *testing.T) {
 	}
 	if tgpSection["multipath"] != false {
 		t.Fatalf("server template should disable client-side multipath, got %v", tgpSection["multipath"])
+	}
+	authSection, ok := tgpSection["auth"].(map[string]any)
+	if !ok {
+		t.Fatal("server template tgp.auth section is not an object")
+	}
+	if authSection["psk"] != "" {
+		t.Fatalf("server template must not include a reusable default PSK, got %v", authSection["psk"])
+	}
+	if authSection["allow_unauthenticated"] != false {
+		t.Fatalf("server template must not enable unauthenticated mode, got %v", authSection["allow_unauthenticated"])
 	}
 }
 

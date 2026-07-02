@@ -9,7 +9,7 @@
 **Target audience:** Tachyon Core implementers
 
 **Implementation status:** Core currently implements X25519/HKDF traffic-key
-derivation, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
+derivation with optional PSK authentication, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
 source-address migration, send-side systematic FEC parity generation,
@@ -42,7 +42,45 @@ changes.
 
 All integer fields are encoded in big-endian order.
 
-### 2.1 Outer Header
+### 2.1 Handshake
+
+TGP session setup is a two-message UDP handshake:
+
+```text
+Client -> Server: Hello(session_id, client_x25519_public, optional_auth_tag)
+Server -> Client: HelloAck(session_id, server_x25519_public, optional_auth_tag)
+```
+
+Both messages are wrapped in the DTLS-like outer header with sequence number
+`0`. The body is:
+
+```text
++----------------+----------------+-------------------------------+
+| Magic "TGH\1"  | Type           | SessionID (16 bytes)          |
++----------------+----------------+-------------------------------+
+| X25519 public key (32 bytes)                                    |
++---------------------------------------------------------------+
+| Optional HMAC-SHA256 auth tag (32 bytes)                       |
++---------------------------------------------------------------+
+```
+
+When `tgp.auth.psk` is configured, the auth tag is mandatory:
+
+```text
+HMAC-SHA256(psk, magic || type || session_id || sender_public || peer_public)
+```
+
+`peer_public` is all zeroes in `Hello` and the client public key in
+`HelloAck`. A server without a PSK rejects handshakes that include an auth tag,
+and a server with a PSK rejects handshakes without a valid tag.
+
+In server mode, Core requires `tgp.auth.psk` by default. Operators must set
+`tgp.auth.allow_unauthenticated=true` explicitly to run an unauthenticated relay
+for local development or compatibility testing. Generated templates do not
+include a reusable default PSK; installers generate a fresh random PSK and store
+it in `server.json` with restrictive file permissions.
+
+### 2.2 Outer Header
 
 The plaintext outer header mimics a DTLS 1.0 application-data record:
 
@@ -69,13 +107,18 @@ The plaintext outer header mimics a DTLS 1.0 application-data record:
 The outer header is used as AEAD additional authenticated data. Tampering with
 it causes packet open to fail.
 
-### 2.2 Inner Header
+### 2.3 Inner Header
 
 The inner header and payload are encrypted with ChaCha20-Poly1305. Traffic
 keys are derived with:
 
 ```text
-HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
+HKDF-SHA256(
+  shared_secret,
+  salt=session_id when no PSK is configured,
+  salt=SHA256(session_id || psk) when tgp.auth.psk is configured,
+  info="tachyon-tgp-v1 traffic keys"
+)
 ```
 
 ```text
@@ -109,7 +152,7 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 | Reserved | 1 byte | Zero for now |
 | PayloadLength | 2 bytes | Encrypted payload length |
 
-### 2.3 Flags
+### 2.4 Flags
 
 | Bit | Name | Meaning |
 | --- | --- | --- |

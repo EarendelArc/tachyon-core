@@ -59,6 +59,9 @@ const ClientConfigTemplate = `{
     }
   },
   "tgp": {
+    "auth": {
+      "psk": ""
+    },
     "fec": {
       "data_shards": 4,
       "parity_shards": 2,
@@ -99,6 +102,10 @@ const ServerConfigTemplate = `{
     }
   },
   "tgp": {
+    "auth": {
+      "psk": "",
+      "allow_unauthenticated": false
+    },
     "fec": {
       "data_shards": 4,
       "parity_shards": 2,

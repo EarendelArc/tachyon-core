@@ -11,8 +11,13 @@ All notable changes to Tachyon Core will be documented in this file.
 - Changed client TUN defaults to TGP-only safe mode: `auto_route` and
   `dns_hijack` now default to `false` so Core does not capture unrelated
   Prism/Xray traffic unless explicitly configured.
+- Server mode now requires `tgp.auth.psk` by default; unauthenticated relay mode
+  must be enabled explicitly with `tgp.auth.allow_unauthenticated` for local
+  development.
 
 ### Added
+- Optional TGP PSK authentication. When configured, PSK-backed HMAC tags are
+  required during handshake and the PSK is mixed into traffic-key derivation.
 - Client-side TGP multipath configuration wiring: `client.proxy.local_addrs`
   now feeds the TGP client manager, single-address binding is honored, and
   multi-address configs use the multipath transport adapter.
@@ -35,6 +40,9 @@ All notable changes to Tachyon Core will be documented in this file.
 ### Fixed
 - Server bare-metal and Docker installers now download `SHA256SUMS.txt` and
   verify the selected release archive before extracting `tachyon-core`.
+- Server installers now generate a random TGP PSK, write it into `server.json`,
+  and create the config file with restrictive permissions before writing so
+  local users cannot casually read the shared secret.
 
 ## [v0.1.0-alpha.6] - 2026-06-28
 

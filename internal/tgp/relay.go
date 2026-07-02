@@ -30,6 +30,7 @@ type RelayOptions struct {
 	PacerPPS         float64
 	FEC              FECOptions
 	DisableMigration bool
+	AuthKey          []byte
 	Handler          RelayHandler
 }
 
@@ -38,6 +39,7 @@ type Relay struct {
 	pacerPPS         float64
 	fec              FECOptions
 	disableMigration bool
+	authKey          []byte
 	handler          RelayHandler
 
 	mu        sync.Mutex
@@ -58,6 +60,7 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 		pacerPPS:         opts.PacerPPS,
 		fec:              opts.FEC,
 		disableMigration: opts.DisableMigration,
+		authKey:          append([]byte(nil), opts.AuthKey...),
 		handler:          handler,
 		transport:        opts.Transport,
 	}, nil
@@ -78,6 +81,7 @@ func (r *Relay) ListenAndServe(ctx context.Context) error {
 		PacerPPS:         r.pacerPPS,
 		FEC:              r.fec,
 		DisableMigration: r.disableMigration,
+		AuthKey:          r.authKey,
 	})
 	if err != nil {
 		if ctx.Err() != nil {

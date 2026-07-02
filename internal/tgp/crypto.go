@@ -63,6 +63,10 @@ func (k *KeyPair) PublicKey() PublicKey {
 }
 
 func (k *KeyPair) DeriveTrafficKeys(peer PublicKey, sessionID SessionID, role Role) (TrafficKeys, error) {
+	return k.DeriveTrafficKeysWithAuth(peer, sessionID, role, nil)
+}
+
+func (k *KeyPair) DeriveTrafficKeysWithAuth(peer PublicKey, sessionID SessionID, role Role, authKey []byte) (TrafficKeys, error) {
 	if k == nil || k.private == nil {
 		return TrafficKeys{}, errors.New("nil tgp keypair")
 	}
@@ -75,7 +79,7 @@ func (k *KeyPair) DeriveTrafficKeys(peer PublicKey, sessionID SessionID, role Ro
 		return TrafficKeys{}, fmt.Errorf("x25519 ecdh: %w", err)
 	}
 
-	okm, err := hkdf.Key(sha256.New, shared, sessionID[:], "tachyon-tgp-v1 traffic keys", trafficKeySize*2)
+	okm, err := hkdf.Key(sha256.New, shared, trafficKeySalt(sessionID, authKey), "tachyon-tgp-v1 traffic keys", trafficKeySize*2)
 	if err != nil {
 		return TrafficKeys{}, fmt.Errorf("derive traffic keys: %w", err)
 	}
@@ -93,4 +97,14 @@ func (k *KeyPair) DeriveTrafficKeys(peer PublicKey, sessionID SessionID, role Ro
 	default:
 		return TrafficKeys{}, ErrInvalidRole
 	}
+}
+
+func trafficKeySalt(sessionID SessionID, authKey []byte) []byte {
+	if len(authKey) == 0 {
+		return sessionID[:]
+	}
+	hash := sha256.New()
+	_, _ = hash.Write(sessionID[:])
+	_, _ = hash.Write(authKey)
+	return hash.Sum(nil)
 }

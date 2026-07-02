@@ -22,6 +22,7 @@ type ClientManagerOptions struct {
 	PacerPPS         float64
 	FEC              FECOptions
 	DisableMigration bool
+	AuthKey          []byte
 	HandshakeTimeout time.Duration
 	Dial             DialFunc
 	DialMultipath    MultipathDialFunc
@@ -63,11 +64,13 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	if dial == nil {
 		fec := opts.FEC
 		disableMigration := opts.DisableMigration
+		authKey := append([]byte(nil), opts.AuthKey...)
 		dial = func(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (Session, error) {
 			return DialSessionWithOptions(ctx, localAddr, remoteAddr, SessionRuntimeOptions{
 				PacerPPS:         pacerPPS,
 				FEC:              fec,
 				DisableMigration: disableMigration,
+				AuthKey:          authKey,
 			})
 		}
 	}
@@ -75,11 +78,13 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	if dialMultipath == nil {
 		fec := opts.FEC
 		disableMigration := opts.DisableMigration
+		authKey := append([]byte(nil), opts.AuthKey...)
 		dialMultipath = func(ctx context.Context, localAddrs []string, remoteAddr net.Addr, pacerPPS float64) (Session, error) {
 			return DialSessionMultipathWithOptions(ctx, localAddrs, remoteAddr, SessionRuntimeOptions{
 				PacerPPS:         pacerPPS,
 				FEC:              fec,
 				DisableMigration: disableMigration,
+				AuthKey:          authKey,
 			})
 		}
 	}

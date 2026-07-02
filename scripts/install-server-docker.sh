@@ -14,6 +14,7 @@ die()     { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 PORT=443
 TACHYON_VERSION="latest"
 UNINSTALL=false
+TACHYON_PSK="${TACHYON_PSK:-}"
 COMPOSE_DIR="/opt/tachyon-docker"
 GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
 GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
@@ -64,6 +65,14 @@ verify_archive_checksum() {
     || die "Checksum verification failed for $asset_name"
 }
 
+ensure_tgp_psk() {
+  if [[ -z "$TACHYON_PSK" ]]; then
+    TACHYON_PSK=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+  fi
+  [[ ${#TACHYON_PSK} -ge 16 ]] || die "TACHYON_PSK must be at least 16 characters"
+  [[ "$TACHYON_PSK" =~ ^[A-Za-z0-9._~:-]+$ ]] || die "TACHYON_PSK contains characters unsafe for this installer"
+}
+
 install_tachyon_binary() {
   [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
   info "Installing tachyon-core $TACHYON_VERSION for Docker..."
@@ -87,7 +96,11 @@ install_tachyon_binary() {
 }
 
 write_configs() {
+  ensure_tgp_psk
   mkdir -p "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
+  chmod 0750 "$COMPOSE_DIR/config"
+  chmod 0755 "$COMPOSE_DIR/logs"
+  install -m 0600 /dev/null "$COMPOSE_DIR/config/server.json"
   cat > "$COMPOSE_DIR/config/server.json" <<JSON
 {
   "mode": "server",
@@ -99,6 +112,9 @@ write_configs() {
     }
   },
   "tgp": {
+    "auth": {
+      "psk": "$TACHYON_PSK"
+    },
     "fec": {
       "data_shards": 4,
       "parity_shards": 2,
@@ -122,7 +138,9 @@ write_configs() {
   }
 }
 JSON
+  chmod 0600 "$COMPOSE_DIR/config/server.json"
   success "Config written."
+  info "TGP PSK saved in $COMPOSE_DIR/config/server.json; copy it into the Prism Tachyon server profile."
 }
 
 write_compose() {

@@ -18,6 +18,7 @@ die()     { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 PORT=443
 TACHYON_VERSION="latest"
 UNINSTALL=false
+TACHYON_PSK="${TACHYON_PSK:-}"
 
 INSTALL_DIR="/opt/tachyon"
 CONFIG_DIR="/etc/tachyon"
@@ -59,6 +60,14 @@ verify_archive_checksum() {
     || die "Checksum verification failed for $asset_name"
 }
 
+ensure_tgp_psk() {
+  if [[ -z "$TACHYON_PSK" ]]; then
+    TACHYON_PSK=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+  fi
+  [[ ${#TACHYON_PSK} -ge 16 ]] || die "TACHYON_PSK must be at least 16 characters"
+  [[ "$TACHYON_PSK" =~ ^[A-Za-z0-9._~:-]+$ ]] || die "TACHYON_PSK contains characters unsafe for this installer"
+}
+
 install_deps() {
   info "Installing dependencies..."
   apt-get update -qq
@@ -69,12 +78,15 @@ install_deps() {
 create_user() {
   id "$TACHYON_USER" &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin "$TACHYON_USER"
   mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR"
+  chmod 0755 "$INSTALL_DIR" "$LOG_DIR"
+  chmod 0750 "$CONFIG_DIR"
   chown -R "$TACHYON_USER:$TACHYON_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR"
   success "System user '$TACHYON_USER' ready."
 }
 
 install_tachyon() {
   [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
+  ensure_tgp_psk
   info "Installing tachyon-core $TACHYON_VERSION..."
 
   arch=$(dpkg --print-architecture)
@@ -92,6 +104,7 @@ install_tachyon() {
   unzip -q "$tmp/$asset_name" -d "$tmp"
   install -m 755 "$tmp/tachyon-core" "$INSTALL_DIR/tachyon-core"
 
+  install -m 0640 -o "$TACHYON_USER" -g "$TACHYON_USER" /dev/null "$CONFIG_DIR/server.json"
   cat > "$CONFIG_DIR/server.json" <<JSON
 {
   "mode": "server",
@@ -103,6 +116,9 @@ install_tachyon() {
     }
   },
   "tgp": {
+    "auth": {
+      "psk": "$TACHYON_PSK"
+    },
     "fec": {
       "data_shards": 4,
       "parity_shards": 2,
@@ -127,6 +143,7 @@ install_tachyon() {
 }
 JSON
   chown -R "$TACHYON_USER:$TACHYON_USER" "$CONFIG_DIR"
+  chmod 0640 "$CONFIG_DIR/server.json"
 
   cat > /etc/systemd/system/tachyon-core.service <<UNIT
 [Unit]
@@ -152,6 +169,7 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now tachyon-core
   success "tachyon-core $TACHYON_VERSION installed."
+  info "TGP PSK saved in $CONFIG_DIR/server.json; copy it into the Prism Tachyon server profile."
 }
 
 configure_firewall() {

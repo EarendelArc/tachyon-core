@@ -54,19 +54,34 @@ get_asset_url() {
     | head -1
 }
 
+verify_archive_checksum() {
+  local work_dir="$1"
+  local asset_name="$2"
+
+  grep -F "  $asset_name" "$work_dir/SHA256SUMS.txt" > "$work_dir/SHA256SUMS.asset" \
+    || die "SHA256SUMS.txt does not contain $asset_name"
+  (cd "$work_dir" && sha256sum -c SHA256SUMS.asset) \
+    || die "Checksum verification failed for $asset_name"
+}
+
 install_tachyon_binary() {
   [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
   info "Installing tachyon-core $TACHYON_VERSION for Docker..."
 
   arch=$(dpkg --print-architecture)
-  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "tachyon-core_${TACHYON_VERSION}_linux_${arch}.zip")
+  asset_name="tachyon-core_${TACHYON_VERSION}_linux_${arch}.zip"
+  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "$asset_name")
+  checksums_url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "SHA256SUMS.txt")
   [[ -n "$url" ]] || die "No tachyon-core asset for linux_${arch}"
+  [[ -n "$checksums_url" ]] || die "No SHA256SUMS.txt asset for $TACHYON_VERSION"
 
   mkdir -p "$COMPOSE_DIR/bin"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
-  curl -fL --progress-bar -o "$tmp/tachyon-core.zip" "$url"
-  unzip -q "$tmp/tachyon-core.zip" -d "$tmp"
+  curl -fL --progress-bar -o "$tmp/$asset_name" "$url"
+  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$checksums_url"
+  verify_archive_checksum "$tmp" "$asset_name"
+  unzip -q "$tmp/$asset_name" -d "$tmp"
   install -m 755 "$tmp/tachyon-core" "$COMPOSE_DIR/bin/tachyon-core"
   success "tachyon-core binary installed."
 }

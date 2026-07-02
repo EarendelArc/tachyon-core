@@ -32,6 +32,10 @@ All notable changes to Tachyon Core will be documented in this file.
 - Tests covering multipath handshakes, manager dial selection, and
   `local_addrs` config loading.
 
+### Fixed
+- Server bare-metal and Docker installers now download `SHA256SUMS.txt` and
+  verify the selected release archive before extracting `tachyon-core`.
+
 ## [v0.1.0-alpha.6] - 2026-06-28
 
 ### Fixed

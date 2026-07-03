@@ -112,6 +112,20 @@ as `0.0.0.0/0` and `::/0` are rejected, and each allow rule must include an
 explicit `ports` list or range. Relay path migration/rebind is currently
 fail-closed; future protocol work will add an authenticated rebind control path.
 
+After deployment, collect read-only diagnostics with:
+
+```bash
+sudo bash scripts/verify-server.sh
+sudo bash scripts/verify-server.sh --mode docker
+bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
+```
+
+Send us the full output when asking for help with VPS relay validation. The
+verify script redacts PSK values and does not change firewall rules, but still
+review the output before posting it publicly. Never paste or publish
+`tgp.auth.psk`; share only whether it is present/non-placeholder and the
+`allowed_targets` summary.
+
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.
 See [docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.

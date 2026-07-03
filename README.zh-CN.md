@@ -100,4 +100,17 @@ Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 al
 迁移/重绑定当前是 fail-closed；后续协议版本会补充 authenticated rebind
 控制路径。
 
+部署完成后，可以用只读验收脚本收集诊断信息：
+
+```bash
+sudo bash scripts/verify-server.sh
+sudo bash scripts/verify-server.sh --mode docker
+bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
+```
+
+如果需要我们协助排查 VPS Relay，请把完整输出发给我们。验收脚本会隐藏 PSK，
+也不会修改防火墙规则，但公开发布前仍应先检查输出。不要公开或粘贴
+`tgp.auth.psk`；只需要说明它是否存在、是否不是占位值，并提供
+`allowed_targets` 摘要即可。
+
 Prism/Core IPC 设计请见 [docs/ipc-api.md](docs/ipc-api.md) 和 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)。TGP 线缆格式请见 [docs/tgp-spec.md](docs/tgp-spec.md)。Prism 使用的 GitHub Release 资产说明请见 [docs/release.md](docs/release.md)。

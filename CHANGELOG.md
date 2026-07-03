@@ -14,6 +14,11 @@ All notable changes to Tachyon Core will be documented in this file.
 - Server mode now requires `tgp.auth.psk` by default; unauthenticated relay mode
   must be enabled explicitly with `tgp.auth.allow_unauthenticated` for local
   development.
+- Server installers now keep relay forwarding in safe deny-all mode unless
+  explicit `server.relay.allowed_targets` are supplied, and reject wildcard
+  targets or entries without explicit ports.
+- Relay path migration/rebind is documented as fail-closed until a future
+  authenticated rebind control path is added.
 
 ### Added
 - Optional TGP PSK authentication. When configured, PSK-backed HMAC tags are
@@ -27,6 +32,9 @@ All notable changes to Tachyon Core will be documented in this file.
 - Server config templates and install scripts now generate TGP relay configs
   with `tgp.multipath` disabled because multipath is a client-side local-bind
   feature.
+- Server config templates and installers now include relay ACL examples and
+  resource-limit defaults for sessions, queues, handler concurrency, and UDP
+  flows.
 - `tgp.pacing.max_rate_pps` now acts as a hard ceiling for the initial TGP
   pacer rate used by both client and server modes.
 - Config validation for malformed `client.proxy.local_addrs` entries and

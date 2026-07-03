@@ -12,12 +12,12 @@
 derivation with optional PSK authentication, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
 pacing, UDP session handshake, client/relay session plumbing, authenticated
-source-address migration, send-side systematic FEC parity generation,
-low-traffic FEC timeout flush, conservative dynamic FEC ratio adjustment, and
-a sliding receive-side packet deduplication window in `internal/tgp`. Core also
-includes a `MultipathTransport` adapter that fans out writes across multiple
-underlying transports and merges reads from any path. Migration confirmation
-control packets and explicit peer loss feedback are planned next.
+handshake source-address demux for relay sessions, send-side systematic FEC
+parity generation, low-traffic FEC timeout flush, conservative dynamic FEC
+ratio adjustment, and a sliding receive-side packet deduplication window in
+`internal/tgp`. Core also includes a `MultipathTransport` adapter that fans out
+writes across multiple underlying transports and merges reads from any path.
+Relay path rebind/migration and explicit peer loss feedback are planned next.
 
 ---
 
@@ -227,16 +227,17 @@ future control-plane upgrade.
 
 ## 5. Connection Migration
 
-When packets arrive from a new source address:
+The relay currently binds an accepted session to the UDP source address that
+completed the authenticated handshake. Encrypted data packets from unknown
+source addresses are dropped before they reach any session queue; they are not
+broadcast to active sessions for trial decryption.
 
-1. Core first authenticates the packet with AEAD.
-2. If the SessionID matches and the source address changed, the return path is
-   migrated to the new source.
-3. Packet numbers are still deduplicated, so old-path and new-path duplicates
-   do not reach the game socket twice.
+Within a session transport, packet numbers are still deduplicated, so duplicate
+packets from the established path do not reach the game socket twice.
 
-Current migration is authenticated and zero-downtime, but explicit
-`FlagMigrate` confirmation packets are still planned.
+Current relay path migration/rebind is fail-closed. A future protocol version
+should add a handshake-like authenticated rebind control path before the relay
+updates its source-address mapping.
 
 ---
 
@@ -267,7 +268,8 @@ The current adapter relies on PacketNumber deduplication; explicit
 
 - No explicit peer loss feedback yet; dynamic FEC currently uses receive-side
   recovery ratio as a conservative local estimate.
-- No explicit migration-confirmation control packet yet.
+- Relay path migration/rebind is fail-closed until an authenticated rebind
+  control path is added.
 - Multipath interface discovery and policy selection are not wired yet; the
   transport adapter and receive-side deduplication are implemented.
 - `FlagMultipath` is reserved; current fan-out does not rewrite encrypted inner

@@ -8,7 +8,7 @@
 
 **目标读者:** Tachyon Core 实现者
 
-**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 封包/解包、Reed-Solomon FEC 基础编解码、发送侧系统 FEC parity 生成、低流量 FEC 超时 flush、接收侧实时 FEC 恢复、保守动态 FEC 比例调整、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、基于认证包来源地址变化的自动迁移、接收侧滑动窗口去重，以及 `MultipathTransport` 多底层 transport 写入 fan-out/读取合并适配器。显式迁移确认控制包和显式对端丢包反馈仍属于下一阶段。
+**当前实现状态:** Core 已在 `internal/tgp` 中实现 X25519/HKDF 流量密钥派生、ChaCha20-Poly1305 封包/解包、Reed-Solomon FEC 基础编解码、发送侧系统 FEC parity 生成、低流量 FEC 超时 flush、接收侧实时 FEC 恢复、保守动态 FEC 比例调整、Token Bucket pacing、UDP session 握手、客户端/Relay 会话管道、Relay 基于已认证握手来源地址的 demux、接收侧滑动窗口去重，以及 `MultipathTransport` 多底层 transport 写入 fan-out/读取合并适配器。Relay 路径迁移/重绑定和显式对端丢包反馈仍属于下一阶段。
 
 ---
 
@@ -130,13 +130,11 @@ Core 根据接收侧 FEC 恢复比例调整 parity。当前实现把该估计保
 
 ## 5. 连接迁移
 
-当认证数据包从新来源地址到达时：
+Relay 当前会把已接受的 session 绑定到完成认证握手的 UDP 来源地址。来自未知来源地址的加密数据包会在进入任何 session 队列前被丢弃；Relay 不会把未知来源数据广播给所有活跃 session 尝试解密。
 
-1. Core 先用 AEAD 认证数据包。
-2. 如果 SessionID 匹配且来源地址变化，则将返回路径迁移到新来源。
-3. PacketNumber 仍会去重，所以旧路径和新路径的重复包不会二次进入游戏 socket。
+在单个 session transport 内，PacketNumber 仍会去重，所以来自既有路径的重复包不会二次进入游戏 socket。
 
-当前迁移已经具备认证和零停机特性，但显式 `FlagMigrate` 确认包仍是下一阶段工作。
+当前 Relay 路径迁移/重绑定是 fail-closed。后续协议版本需要增加 handshake-like 的 authenticated rebind 控制路径，Relay 才能安全更新来源地址映射。
 
 ---
 
@@ -162,7 +160,7 @@ Core 根据接收侧 FEC 恢复比例调整 parity。当前实现把该估计保
 ## 8. 当前限制
 
 - 尚无显式对端丢包反馈；动态 FEC 目前使用接收侧恢复比例作为本地保守估计。
-- 尚无显式迁移确认控制包。
+- Relay 路径迁移/重绑定在 authenticated rebind 控制路径实现前保持 fail-closed。
 - 多路径接口发现和策略选择尚未接入；底层 transport adapter 与接收侧去重已实现。
 - `FlagMultipath` 仍是预留标记；当前 fan-out 不会重写已加密内层头来设置它。
 - TGP 设计上不实现 ARQ 重传，依靠 pacing 和 FEC 避免引入物理 RTT 延迟。

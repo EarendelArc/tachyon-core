@@ -5,7 +5,12 @@
 # configure Xray. Prism/Xray is the desktop TCP proxy control plane.
 #
 # Usage:
-#   sudo bash scripts/install-server.sh --port 443 --version latest
+#   sudo bash scripts/install-server.sh --port 443 --version latest \
+#     --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
+#
+# Or:
+#   sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
+#     bash scripts/install-server.sh --port 443
 
 set -euo pipefail
 
@@ -19,6 +24,10 @@ PORT=443
 TACHYON_VERSION="latest"
 UNINSTALL=false
 TACHYON_PSK="${TACHYON_PSK:-}"
+TACHYON_ALLOWED_TARGETS="${TACHYON_ALLOWED_TARGETS:-}"
+ALLOWED_TARGET_INPUTS=()
+ALLOWED_TARGET_OBJECTS=()
+ALLOWED_TARGETS_JSON="[]"
 
 INSTALL_DIR="/opt/tachyon"
 CONFIG_DIR="/etc/tachyon"
@@ -31,6 +40,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)      PORT="$2";            shift 2 ;;
     --version)   TACHYON_VERSION="$2"; shift 2 ;;
+    --allow-target)
+      ALLOWED_TARGET_INPUTS+=("$2")
+      shift 2
+      ;;
     --uninstall) UNINSTALL=true;       shift ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -68,6 +81,105 @@ ensure_tgp_psk() {
   [[ "$TACHYON_PSK" =~ ^[A-Za-z0-9._~:-]+$ ]] || die "TACHYON_PSK contains characters unsafe for this installer"
 }
 
+validate_ports() {
+  local raw="$1"
+  [[ -n "$raw" ]] || die "allowed target ports are required; empty ports would create an unsafe all-port relay"
+  [[ "$raw" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
+    || die "allowed target ports must be a comma-separated list like 27015 or 27015-27050"
+
+  local part start end
+  IFS=',' read -ra parts <<< "$raw"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%%-*}"
+      end="${part##*-}"
+    else
+      start="$part"
+      end="$part"
+    fi
+    (( start >= 1 && start <= 65535 && end >= 1 && end <= 65535 && start <= end )) \
+      || die "allowed target port range out of bounds: $part"
+  done
+}
+
+add_allowed_target() {
+  local raw="$1"
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" == *,ports=* ]] \
+    || die "allowed target must include explicit ports: cidr=198.51.100.0/24,ports=27015-27050"
+
+  local target="${raw%%,ports=*}"
+  local ports="${raw#*,ports=}"
+  validate_ports "$ports"
+
+  if [[ "$target" == cidr=* ]]; then
+    local cidr="${target#cidr=}"
+    [[ "$cidr" != "0.0.0.0/0" && "$cidr" != "::/0" ]] \
+      || die "refusing wildcard relay target $cidr"
+    [[ "$cidr" =~ ^[A-Za-z0-9:.\/]+$ && "$cidr" == */* ]] \
+      || die "allowed target CIDR is invalid or unsafe: $cidr"
+    ALLOWED_TARGET_OBJECTS+=("{\"cidr\":\"$cidr\",\"ports\":\"$ports\"}")
+    return 0
+  fi
+
+  if [[ "$target" == domain=* ]]; then
+    local domain="${target#domain=}"
+    [[ "$domain" =~ ^[A-Za-z0-9._-]+$ && "$domain" != *":"* ]] \
+      || die "allowed target domain is invalid or unsafe: $domain"
+    ALLOWED_TARGET_OBJECTS+=("{\"domain\":\"$domain\",\"ports\":\"$ports\"}")
+    return 0
+  fi
+
+  die "allowed target must start with cidr= or domain=: $raw"
+}
+
+render_allowed_targets_json() {
+  if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 ]]; then
+    echo "[]"
+    return 0
+  fi
+
+  echo "["
+  local i
+  for i in "${!ALLOWED_TARGET_OBJECTS[@]}"; do
+    local comma=","
+    [[ "$i" -eq $((${#ALLOWED_TARGET_OBJECTS[@]} - 1)) ]] && comma=""
+    echo "        ${ALLOWED_TARGET_OBJECTS[$i]}$comma"
+  done
+  echo "      ]"
+}
+
+collect_allowed_targets() {
+  local item
+  if [[ -n "$TACHYON_ALLOWED_TARGETS" ]]; then
+    IFS=';' read -ra env_targets <<< "$TACHYON_ALLOWED_TARGETS"
+    for item in "${env_targets[@]}"; do
+      add_allowed_target "$item"
+    done
+  fi
+  for item in "${ALLOWED_TARGET_INPUTS[@]}"; do
+    add_allowed_target "$item"
+  done
+
+  if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 && -t 0 ]]; then
+    warn "No relay allowed targets configured yet."
+    warn "Enter targets one per line, e.g. cidr=198.51.100.0/24,ports=27015-27050"
+    warn "Leave blank to keep the safe deny-all relay policy."
+    while true; do
+      read -r -p "Allowed target: " item || true
+      [[ -n "$item" ]] || break
+      add_allowed_target "$item"
+    done
+  fi
+
+  ALLOWED_TARGETS_JSON=$(render_allowed_targets_json)
+  if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 ]]; then
+    warn "安全 deny-all，TGP relay 不会转发游戏 UDP，需配置后再测 / Safe deny-all: TGP relay will not forward game UDP until allowed_targets is configured."
+  else
+    success "Configured ${#ALLOWED_TARGET_OBJECTS[@]} relay allowed target(s)."
+  fi
+}
+
 install_deps() {
   info "Installing dependencies..."
   apt-get update -qq
@@ -87,6 +199,7 @@ create_user() {
 install_tachyon() {
   [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
   ensure_tgp_psk
+  collect_allowed_targets
   info "Installing tachyon-core $TACHYON_VERSION..."
 
   arch=$(dpkg --print-architecture)
@@ -112,7 +225,13 @@ install_tachyon() {
     "listen": ":$PORT",
     "relay": {
       "dial_timeout": "5s",
-      "idle_timeout": "60s"
+      "idle_timeout": "60s",
+      "max_sessions": 1024,
+      "session_queue_size": 256,
+      "handler_concurrency": 1024,
+      "max_flows": 4096,
+      "max_flows_per_session": 256,
+      "allowed_targets": $ALLOWED_TARGETS_JSON
     }
   },
   "tgp": {
@@ -170,6 +289,9 @@ UNIT
   systemctl enable --now tachyon-core
   success "tachyon-core $TACHYON_VERSION installed."
   info "TGP PSK saved in $CONFIG_DIR/server.json; copy it into the Prism Tachyon server profile."
+  if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 ]]; then
+    warn "Relay ACL is deny-all. Edit $CONFIG_DIR/server.json server.relay.allowed_targets before testing game UDP forwarding."
+  fi
 }
 
 configure_firewall() {

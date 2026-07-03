@@ -89,9 +89,11 @@ mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.js
 ## Server Deployment
 
 ```bash
-sudo bash scripts/install-server.sh --port 443
+sudo bash scripts/install-server.sh --port 443 \
+  --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
 
-sudo bash scripts/install-server-docker.sh --port 443
+sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
+  bash scripts/install-server-docker.sh --port 443
 ```
 
 Both installers download the matching Linux ZIP asset from
@@ -100,6 +102,15 @@ newest release entry, including alpha prereleases; pass an explicit tag such as
 `--version v0.1.0-alpha.11` for reproducible deployment. The Docker path mounts
 the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
 container and does not depend on a GHCR image.
+
+Server relay security is fail-closed. The installer generates a fresh
+`tgp.auth.psk` and writes it to `server.json`; copy that PSK into the Prism
+Tachyon server profile. `server.relay.allowed_targets` is an explicit UDP
+allow-list. If no targets are supplied, the server starts in safe deny-all mode
+and will not forward game UDP until you edit the config. Wildcard targets such
+as `0.0.0.0/0` and `::/0` are rejected, and each allow rule must include an
+explicit `ports` list or range. Relay path migration/rebind is currently
+fail-closed; future protocol work will add an authenticated rebind control path.
 
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.

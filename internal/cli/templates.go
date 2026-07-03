@@ -105,7 +105,16 @@ const ServerConfigTemplate = `{
       "handler_concurrency": 1024,
       "max_flows": 4096,
       "max_flows_per_session": 256,
-      "allowed_targets": []
+      "allowed_targets": [
+        {
+          "cidr": "203.0.113.0/24",
+          "ports": "27015-27050"
+        },
+        {
+          "domain": "game.example.com",
+          "ports": "27015"
+        }
+      ]
     }
   },
   "tgp": {

@@ -81,3 +81,13 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把
 下载的静态二进制放入 `/opt/tachyon-docker/bin`，再挂载到
 `debian:bookworm-slim` 容器中运行，避免依赖尚未发布的 GHCR 镜像。
+
+两个脚本都会在未提供 `TACHYON_PSK` 时生成新的 `tgp.auth.psk`。服务端 Relay
+默认不会成为开放 UDP relay：安装脚本会从 `--allow-target` 参数或分号分隔的
+`TACHYON_ALLOWED_TARGETS` 环境变量写入 `server.relay.allowed_targets`。条目格式示例：
+`cidr=198.51.100.0/24,ports=27015-27050` 或
+`domain=game.example.com,ports=27015`。如果未提供目标，生成配置会保持
+`allowed_targets` 为空，Core 以安全 deny-all 模式运行。脚本会拒绝
+`0.0.0.0/0`、`::/0` 和未显式填写端口的条目。生成配置也会写入 Relay 资源上限默认值：
+`max_sessions`、`session_queue_size`、`handler_concurrency`、`max_flows` 和
+`max_flows_per_session`。

@@ -94,3 +94,15 @@ The bare-metal and Docker server installers consume the same release ZIP assets:
 Both scripts resolve `--version latest` from the releases list instead of the
 GitHub `latest` endpoint so alpha prereleases remain deployable during the
 current development phase.
+
+Both scripts generate a fresh `tgp.auth.psk` unless `TACHYON_PSK` is supplied.
+The server relay does not become an open UDP relay by default: installers write
+`server.relay.allowed_targets` from `--allow-target` entries or the
+semicolon-separated `TACHYON_ALLOWED_TARGETS` environment variable. Accepted
+entries look like `cidr=198.51.100.0/24,ports=27015-27050` or
+`domain=game.example.com,ports=27015`. If no target is supplied, the generated
+config keeps `allowed_targets` empty and Core runs in safe deny-all mode. The
+installers reject `0.0.0.0/0`, `::/0`, and entries without explicit ports.
+Generated configs also include the relay resource-limit defaults
+(`max_sessions`, `session_queue_size`, `handler_concurrency`, `max_flows`, and
+`max_flows_per_session`).

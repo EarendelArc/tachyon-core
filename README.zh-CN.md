@@ -77,9 +77,11 @@ mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.js
 ## 服务端部署
 
 ```bash
-sudo bash scripts/install-server.sh --port 443
+sudo bash scripts/install-server.sh --port 443 \
+  --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
 
-sudo bash scripts/install-server-docker.sh --port 443
+sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
+  bash scripts/install-server-docker.sh --port 443
 ```
 
 两种安装脚本都会从 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的
@@ -88,5 +90,14 @@ Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 al
 `--version v0.1.0-alpha.11`。Docker 部署会把下载得到的静态
 `tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
 镜像。
+
+服务端 Relay 默认采用 fail-closed 安全策略。安装脚本会生成新的
+`tgp.auth.psk` 并写入 `server.json`，需要把该 PSK 复制到 Prism 的 Tachyon
+服务器配置中。`server.relay.allowed_targets` 是显式 UDP 目标 allow-list；
+如果安装时没有提供目标，服务端会以安全 deny-all 模式启动，不会转发游戏 UDP，
+需要配置后再测试。脚本和 Core 配置校验都会拒绝 `0.0.0.0/0`、`::/0`
+这类全网目标，并要求每条 allow 规则显式填写 `ports` 列表或范围。Relay 路径
+迁移/重绑定当前是 fail-closed；后续协议版本会补充 authenticated rebind
+控制路径。
 
 Prism/Core IPC 设计请见 [docs/ipc-api.md](docs/ipc-api.md) 和 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)。TGP 线缆格式请见 [docs/tgp-spec.md](docs/tgp-spec.md)。Prism 使用的 GitHub Release 资产说明请见 [docs/release.md](docs/release.md)。

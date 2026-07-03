@@ -55,24 +55,34 @@ firewalld, Docker, or systemd state.
 USAGE
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --mode)            MODE="${2:-}"; shift 2 ;;
-    --config)          CONFIG_PATH="${2:-}"; shift 2 ;;
-    --binary)          BINARY_PATH="${2:-}"; shift 2 ;;
-    --service)         SERVICE_NAME="${2:-}"; shift 2 ;;
-    --docker-config)   DOCKER_CONFIG_PATH="${2:-}"; shift 2 ;;
-    --docker-binary)   DOCKER_BINARY_PATH="${2:-}"; shift 2 ;;
-    --docker-service)  DOCKER_SERVICE_NAME="${2:-}"; shift 2 ;;
-    --container)       DOCKER_CONTAINER_NAME="${2:-}"; shift 2 ;;
-    --compose-dir)     COMPOSE_DIR="${2:-}"; shift 2 ;;
-    --journal-lines)   JOURNAL_LINES="${2:-}"; shift 2 ;;
-    --log-lines)       LOG_LINES="${2:-}"; shift 2 ;;
-    --self-test)       MODE="self-test"; shift ;;
-    -h|--help)         usage; exit 0 ;;
-    *)                 echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
-  esac
-done
+require_option_value() {
+  local option="$1"
+  if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+    echo "missing value for $option" >&2
+    return 2
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)            require_option_value "$@" || return 2; MODE="$2"; shift 2 ;;
+      --config)          require_option_value "$@" || return 2; CONFIG_PATH="$2"; shift 2 ;;
+      --binary)          require_option_value "$@" || return 2; BINARY_PATH="$2"; shift 2 ;;
+      --service)         require_option_value "$@" || return 2; SERVICE_NAME="$2"; shift 2 ;;
+      --docker-config)   require_option_value "$@" || return 2; DOCKER_CONFIG_PATH="$2"; shift 2 ;;
+      --docker-binary)   require_option_value "$@" || return 2; DOCKER_BINARY_PATH="$2"; shift 2 ;;
+      --docker-service)  require_option_value "$@" || return 2; DOCKER_SERVICE_NAME="$2"; shift 2 ;;
+      --container)       require_option_value "$@" || return 2; DOCKER_CONTAINER_NAME="$2"; shift 2 ;;
+      --compose-dir)     require_option_value "$@" || return 2; COMPOSE_DIR="$2"; shift 2 ;;
+      --journal-lines)   require_option_value "$@" || return 2; JOURNAL_LINES="$2"; shift 2 ;;
+      --log-lines)       require_option_value "$@" || return 2; LOG_LINES="$2"; shift 2 ;;
+      --self-test)       MODE="self-test"; shift ;;
+      -h|--help)         usage; exit 0 ;;
+      *)                 echo "unknown option: $1" >&2; usage >&2; return 2 ;;
+    esac
+  done
+}
 
 is_integer() {
   [[ "$1" =~ ^[0-9]+$ ]]
@@ -88,8 +98,10 @@ sanitize_count() {
   fi
 }
 
-JOURNAL_LINES=$(sanitize_count "$JOURNAL_LINES" 80)
-LOG_LINES=$(sanitize_count "$LOG_LINES" 80)
+normalize_counts() {
+  JOURNAL_LINES=$(sanitize_count "$JOURNAL_LINES" 80)
+  LOG_LINES=$(sanitize_count "$LOG_LINES" 80)
+}
 
 have() {
   command -v "$1" >/dev/null 2>&1
@@ -134,7 +146,11 @@ print_cmd() {
 }
 
 redact_psk_stream() {
-  sed -E 's/("psk"[[:space:]]*:[[:space:]]*")[^"]*(")/\1<redacted>\2/g; s/(psk=)[^[:space:]]+/\1<redacted>/Ig'
+  sed -E \
+    -e 's/(["'\'']psk["'\''][[:space:]]*:[[:space:]]*["'\''])[^"'\'']*(["'\''])/\1<redacted>\2/Ig' \
+    -e 's/((^|[^[:alnum:]_.-])psk=)[^[:space:],;]+/\1<redacted>/Ig' \
+    -e 's/((^|[^[:alnum:]_.-])psk:[[:space:]]*)[^[:space:],;]+/\1<redacted>/Ig' \
+    -e 's/((^|[^[:alnum:]_.-])tgp\.auth\.psk:[[:space:]]*)[^[:space:],;]+/\1<redacted>/Ig'
 }
 
 check_binary_and_validate() {
@@ -418,6 +434,17 @@ auto_detect_mode() {
   echo "systemd"
 }
 
+make_temp_dir() {
+  if have mktemp; then
+    mktemp -d
+    return
+  fi
+
+  local base="${TMPDIR:-/tmp}"
+  local dir="$base/tachyon-verify-self-test.$$"
+  mkdir -p "$dir" && echo "$dir"
+}
+
 self_test() {
   section "self-test"
   if ! have jq; then
@@ -426,7 +453,7 @@ self_test() {
   fi
 
   local tmp
-  tmp=$(mktemp -d) || { fail "mktemp failed"; return 1; }
+  tmp=$(make_temp_dir) || { fail "temporary directory creation failed"; return 1; }
   cat > "$tmp/server.json" <<'JSON'
 {
   "mode": "server",
@@ -451,8 +478,65 @@ JSON
   psk_len=$(json_get "$tmp/server.json" '(.tgp.auth.psk // "") | length')
   local ok=0
   [[ "$port" == "2443" ]] || { fail "listen port helper returned $port"; ok=1; }
+  [[ "$(listen_port_from_value "127.0.0.1:2444")" == "2444" ]] || { fail "host:port listen helper failed"; ok=1; }
+  [[ "$(listen_port_from_value "[::1]:2445")" == "2445" ]] || { fail "IPv6 listen helper failed"; ok=1; }
+  [[ "$(listen_port_from_value "2446")" == "2446" ]] || { fail "bare listen port helper failed"; ok=1; }
   [[ "$count" == "2" ]] || { fail "allowed target helper returned $count"; ok=1; }
   [[ "$psk_len" == "32" ]] || { fail "psk length helper returned $psk_len"; ok=1; }
+
+  local original_mode="$MODE"
+  local original_config="$CONFIG_PATH"
+  local original_binary="$BINARY_PATH"
+  MODE="auto"
+  CONFIG_PATH="$tmp/server.json"
+  BINARY_PATH="$tmp/tachyon-core"
+  : > "$BINARY_PATH"
+  chmod +x "$BINARY_PATH"
+  [[ "$(auto_detect_mode)" == "systemd" ]] || { fail "auto_detect_mode did not prefer systemd"; ok=1; }
+  parse_args --mode config --config "$tmp/server.json" --binary "$tmp/tachyon-core" || { fail "parse_args failed for config mode"; ok=1; }
+  [[ "$MODE" == "config" ]] || { fail "parse_args did not set config mode"; ok=1; }
+  MODE="$original_mode"
+  CONFIG_PATH="$original_config"
+  BINARY_PATH="$original_binary"
+
+  local missing_output status
+  for opt in --mode --config --binary; do
+    if have timeout; then
+      missing_output=$(timeout 5 bash "$0" "$opt" 2>&1 >/dev/null)
+      status=$?
+    else
+      missing_output=$(bash "$0" "$opt" 2>&1 >/dev/null)
+      status=$?
+    fi
+    if [[ "$status" -eq 0 ]]; then
+      fail "$opt without value exited 0"
+      ok=1
+    elif [[ "$status" -eq 124 ]]; then
+      fail "$opt without value timed out"
+      ok=1
+    elif [[ "$missing_output" != *"missing value for $opt"* ]]; then
+      fail "$opt without value produced unclear error: ${missing_output:-<empty>}"
+      ok=1
+    fi
+  done
+
+  local secret="super-secret-shared-psk"
+  local redacted
+  redacted=$(printf '%s\n' \
+    "\"psk\": \"$secret\"" \
+    "'psk': '$secret'" \
+    "psk=$secret" \
+    "PSK: $secret" \
+    "tgp.auth.psk: $secret" \
+    | redact_psk_stream)
+  if [[ "$redacted" == *"$secret"* ]]; then
+    fail "redact_psk_stream leaked a PSK value"
+    ok=1
+  fi
+  local redacted_count
+  redacted_count=$(printf '%s' "$redacted" | grep -o "<redacted>" | wc -l | tr -d ' ')
+  [[ "$redacted_count" == "5" ]] || { fail "redact_psk_stream redacted $redacted_count/5 samples"; ok=1; }
+
   rm -rf "$tmp"
   if (( ok == 0 )); then
     success "helper self-test passed"
@@ -461,6 +545,9 @@ JSON
 }
 
 main() {
+  parse_args "$@" || exit 2
+  normalize_counts
+
   case "$MODE" in
     self-test)
       self_test

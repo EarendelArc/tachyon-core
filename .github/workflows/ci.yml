@@ -20,6 +20,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Verify server diagnostics script
+        shell: bash
+        run: |
+          bash -n scripts/verify-server.sh
+          bash scripts/verify-server.sh --self-test
+
       - name: Test
         run: go test ./...
 

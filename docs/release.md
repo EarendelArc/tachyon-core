@@ -8,12 +8,19 @@ useful for Prism-managed downloads and integration testing.
 ## Current Preview
 
 The current preview release is
-[`v0.1.0-alpha.11`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.11).
-It includes authenticated TGP path migration, receive-side packet
-deduplication for multipath duplicates, receive-side Reed-Solomon FEC recovery,
-send-side parity generation, low-traffic FEC timeout flush, conservative
-adaptive FEC tuning, TGP-only client safe defaults, and the multipath transport
-adapter.
+`v0.1.0-alpha.12` (preview tag preparation). It includes PSK-authenticated TGP
+handshakes with server-side PSK required by default, safe deny-all server relay
+ACLs, wildcard/empty-port ACL rejection, multi-session relay handling,
+source-address relay demux, fail-closed handling for unknown non-handshake UDP,
+relay resource limits, persistent UDP relay pools with asynchronous upstream
+responses, TGP-only client safe defaults, and bare-metal/Docker installer
+guidance for `allowed_targets`.
+
+Known limitations for this preview: relay path rebind/migration is fail-closed
+until an authenticated rebind control path exists, Windows TUN still needs
+elevated validation on real Windows hosts, real VPS/game-link relay validation
+is still pending, and domain ACLs are resolved at Core startup rather than
+dynamically tracked.
 
 The `main` branch may contain newer unreleased changes after this tag. Create a
 new release tag only after `go test ./...` and the cross-platform build matrix

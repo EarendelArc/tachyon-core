@@ -5,6 +5,14 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+
+### Added
+
+### Fixed
+
+## [v0.1.0-alpha.12] - 2026-07-03
+
+### Changed
 - Replaced the server's one-shot UDP forwarder with a persistent per-session,
   per-flow UDP relay pool. Upstream game sockets are now reused and background
   read loops can forward asynchronous game responses back over the TGP session.
@@ -19,6 +27,8 @@ All notable changes to Tachyon Core will be documented in this file.
   targets or entries without explicit ports.
 - Relay path migration/rebind is documented as fail-closed until a future
   authenticated rebind control path is added.
+- Client TUN direct decisions now fail explicitly in TGP-only mode instead of
+  being silently consumed by Core.
 
 ### Added
 - Optional TGP PSK authentication. When configured, PSK-backed HMAC tags are
@@ -35,6 +45,17 @@ All notable changes to Tachyon Core will be documented in this file.
 - Server config templates and installers now include relay ACL examples and
   resource-limit defaults for sessions, queues, handler concurrency, and UDP
   flows.
+- Server relay ACL validation defaults to deny-all and requires explicit
+  `server.relay.allowed_targets` entries with `ports`; wildcard CIDRs such as
+  `0.0.0.0/0` and `::/0` are rejected.
+- TGP relay now accepts multiple concurrent client sessions and demuxes data
+  packets by authenticated UDP source address. Unknown non-handshake UDP
+  packets fail closed instead of being broadcast to all sessions.
+- Relay resource limits for max sessions, per-session packet queues, handler
+  concurrency, total UDP flows, and per-session UDP flows.
+- Bare-metal and Docker server installers now accept safe relay target inputs
+  via `--allow-target` or `TACHYON_ALLOWED_TARGETS`, keep deny-all when omitted,
+  and validate listener ports as numeric `1..65535`.
 - `tgp.pacing.max_rate_pps` now acts as a hard ceiling for the initial TGP
   pacer rate used by both client and server modes.
 - Config validation for malformed `client.proxy.local_addrs` entries and
@@ -51,6 +72,16 @@ All notable changes to Tachyon Core will be documented in this file.
 - Server installers now generate a random TGP PSK, write it into `server.json`,
   and create the config file with restrictive permissions before writing so
   local users cannot casually read the shared secret.
+- Handshake failures now surface a dedicated `ErrHandshakeTimeout` wrapper
+  while preserving the underlying context deadline/cancellation cause.
+
+### Known Limitations
+- Relay path rebind/migration is fail-closed until a future authenticated
+  rebind control path is implemented.
+- Windows TUN still needs elevated validation on real Windows hosts.
+- Real VPS and real game-server relay paths still need alpha field validation.
+- Domain-based relay ACL entries are resolved at Core startup and do not track
+  DNS changes dynamically.
 
 ## [v0.1.0-alpha.6] - 2026-06-28
 

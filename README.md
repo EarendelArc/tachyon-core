@@ -99,7 +99,7 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 Both installers download the matching Linux ZIP asset from
 `EarendelArc/tachyon-core` GitHub Releases. `--version latest` selects the
 newest release entry, including alpha prereleases; pass an explicit tag such as
-`--version v0.1.0-alpha.11` for reproducible deployment. The Docker path mounts
+`--version v0.1.0-alpha.13` for reproducible deployment. The Docker path mounts
 the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
 container and does not depend on a GHCR image.
 

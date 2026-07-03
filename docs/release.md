@@ -8,19 +8,19 @@ useful for Prism-managed downloads and integration testing.
 ## Current Preview
 
 The current preview release is
-`v0.1.0-alpha.12` (preview tag preparation). It includes PSK-authenticated TGP
-handshakes with server-side PSK required by default, safe deny-all server relay
-ACLs, wildcard/empty-port ACL rejection, multi-session relay handling,
-source-address relay demux, fail-closed handling for unknown non-handshake UDP,
-relay resource limits, persistent UDP relay pools with asynchronous upstream
-responses, TGP-only client safe defaults, and bare-metal/Docker installer
-guidance for `allowed_targets`.
+`v0.1.0-alpha.13` (preview tag preparation). It keeps the alpha.12
+PSK-authenticated, deny-all-by-default relay posture and adds a non-destructive
+server acceptance helper, `scripts/verify-server.sh`. The helper inspects
+bare-metal systemd installs, Docker Compose installs, and local config/binary
+pairs; reports service state, config validation, listen settings, and a
+redacted `allowed_targets` summary; and avoids printing raw `tgp.auth.psk`
+values. CI also runs bash self-checks for the script.
 
-Known limitations for this preview: relay path rebind/migration is fail-closed
-until an authenticated rebind control path exists, Windows TUN still needs
-elevated validation on real Windows hosts, real VPS/game-link relay validation
-is still pending, and domain ACLs are resolved at Core startup rather than
-dynamically tracked.
+Known limitations for this preview: `scripts/verify-server.sh` is an acceptance
+aid, not a replacement for real VPS, Docker host, or target-game UDP validation;
+relay path rebind/migration is fail-closed until an authenticated rebind control
+path exists; Windows TUN still needs elevated validation on real Windows hosts;
+and domain ACLs are resolved at Core startup rather than dynamically tracked.
 
 The `main` branch may contain newer unreleased changes after this tag. Create a
 new release tag only after `go test ./...` and the cross-platform build matrix

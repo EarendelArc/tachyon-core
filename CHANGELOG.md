@@ -10,6 +10,43 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ### Fixed
 
+## [v0.1.0-alpha.13] - 2026-07-04
+
+### Added
+- Added and documented `scripts/verify-server.sh` as a non-destructive server
+  acceptance helper for alpha deployments. It can inspect bare-metal systemd
+  installs, Docker Compose installs, and local config/binary pairs without
+  starting new relay traffic.
+- The verification helper reports systemd unit/service state, Docker Compose
+  service state, config validation results, relay listen settings, and a
+  redacted `allowed_targets` summary so operators can confirm whether the
+  server is still in deny-all mode.
+- Added CI bash self-check coverage for the server verification script so
+  syntax and fixture-based diagnostics stay exercised before release.
+
+### Changed
+- Server diagnostics now keep `tgp.auth.psk` redacted and do not print raw PSK
+  values in config summaries or command output.
+- The release notes call out that the script is an alpha acceptance aid, not a
+  substitute for real VPS, Docker, or target-game UDP validation.
+
+### Known Limitations
+- Real VPS and Docker host validation is still required for this preview.
+- The verification helper only summarizes configured `allowed_targets`; it does
+  not prove remote game reachability or relay policy correctness in the target
+  network.
+
+### 中文说明
+- 新增并强化 `scripts/verify-server.sh`，用于 alpha 服务端部署后的非破坏性验收。
+  脚本可检查裸机 systemd、Docker Compose 以及本地 config/binary 组合，不会主动
+  发起新的 relay 流量。
+- 诊断输出包含 systemd/docker 状态、配置校验结果、监听配置和脱敏后的
+  `allowed_targets` 摘要，便于确认服务端是否仍处于安全 deny-all 模式。
+- 诊断不会输出 `tgp.auth.psk` 原文，避免在日志或终端记录中泄露 PSK。
+- CI 增加 bash 自检，覆盖验收脚本的语法和基于 fixture 的诊断路径。
+- 仍需在真实 VPS 和 Docker 主机上做 alpha 验证；脚本摘要不能替代真实游戏 UDP
+  可达性和目标网络中的 relay 策略验证。
+
 ## [v0.1.0-alpha.12] - 2026-07-03
 
 ### Changed

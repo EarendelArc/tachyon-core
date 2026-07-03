@@ -7,8 +7,17 @@ Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 al
 ## 当前预览版本
 
 当前预览版是
-[`v0.1.0-alpha.11`](https://github.com/EarendelArc/tachyon-core/releases/tag/v0.1.0-alpha.11)。
-该版本包含 TGP 已认证路径迁移、接收侧多路径重复包去重、接收侧 Reed-Solomon FEC 恢复、发送侧 parity 生成、低流量 FEC 超时 flush、保守自适应 FEC 调整、TGP-only 客户端安全默认值，以及多路径传输适配器。
+`v0.1.0-alpha.13`（预发布 tag 准备）。该版本延续 alpha.12 中
+PSK 认证、服务端 relay 默认 deny-all 的安全口径，并新增非破坏性服务端验收脚本
+`scripts/verify-server.sh`。脚本可检查裸机 systemd 部署、Docker Compose 部署以及
+本地 config/binary 组合，输出服务状态、配置校验、监听配置和脱敏后的
+`allowed_targets` 摘要，并避免打印 `tgp.auth.psk` 原文。CI 也会对该脚本运行
+bash 自检。
+
+该预览版的已知限制：`scripts/verify-server.sh` 只是 alpha 验收辅助，不能替代
+真实 VPS、Docker 主机和目标游戏 UDP 链路验证；relay 路径迁移/重绑定在加入
+authenticated rebind 控制路径前仍为 fail-closed；Windows TUN 仍需真实 Windows
+管理员环境验证；domain ACL 在 Core 启动时解析，暂不动态追踪。
 
 `main` 分支可能包含比该 tag 更新的未发布提交。只有在 `go test ./...` 和跨平台构建矩阵通过后，才应该创建新的 release tag。
 
@@ -75,7 +84,7 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 `scripts/install-server.sh` 与 `scripts/install-server-docker.sh` 都从
 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的 Linux ZIP 资产。
 脚本的 `--version latest` 会读取 release 列表中的最新 tag，因此包含 alpha
-预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.11`
+预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.13`
 或更新后的固定 tag。
 
 裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把

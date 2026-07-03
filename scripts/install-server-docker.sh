@@ -12,7 +12,7 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()     { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 
-PORT=443
+PORT="${TACHYON_PORT:-443}"
 TACHYON_VERSION="latest"
 UNINSTALL=false
 TACHYON_PSK="${TACHYON_PSK:-}"
@@ -26,7 +26,11 @@ GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)      PORT="$2";            shift 2 ;;
+    --port)
+      [[ $# -ge 2 ]] || die "--port requires a value"
+      PORT="$2"
+      shift 2
+      ;;
     --version)   TACHYON_VERSION="$2"; shift 2 ;;
     --allow-target)
       ALLOWED_TARGET_INPUTS+=("$2")
@@ -39,6 +43,15 @@ done
 
 check_root() {
   [[ $EUID -eq 0 ]] || die "Run as root."
+}
+
+validate_listen_port() {
+  local raw="$1"
+  [[ "$raw" =~ ^[0-9]+$ && ${#raw} -le 5 ]] \
+    || die "listen port must be a number from 1 to 65535"
+  local port=$((10#$raw))
+  (( port >= 1 && port <= 65535 )) \
+    || die "listen port must be in range 1..65535: $raw"
 }
 
 install_docker() {
@@ -316,6 +329,7 @@ uninstall() {
 }
 
 main() {
+  validate_listen_port "$PORT"
   check_root
   if [[ "$UNINSTALL" == "true" ]]; then
     uninstall

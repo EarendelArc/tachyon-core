@@ -86,6 +86,16 @@ mise exec -- go build ./...
 mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.json
 ```
 
+Before deploying a VPS, run the local TGP relay smoke test:
+
+```bash
+bash scripts/smoke-tgp-relay.sh
+```
+
+It uses only temporary `127.0.0.1` UDP ports and checks PSK handshake behavior,
+UDP echo-like relay, and `allowed_targets` fail-closed behavior without starting
+TUN or changing routes, firewall, systemd, Docker, or proxy state.
+
 ## Server Deployment
 
 ```bash
@@ -125,6 +135,9 @@ verify script redacts PSK values and does not change firewall rules, but still
 review the output before posting it publicly. Never paste or publish
 `tgp.auth.psk`; share only whether it is present/non-placeholder and the
 `allowed_targets` summary.
+
+See [docs/tgp-server-verification.md](docs/tgp-server-verification.md) for the
+full local smoke and VPS verification checklist.
 
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.

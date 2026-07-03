@@ -74,6 +74,16 @@ mise exec -- go build ./...
 mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.json
 ```
 
+部署 VPS 前，可以先运行本地 TGP relay smoke：
+
+```bash
+bash scripts/smoke-tgp-relay.sh
+```
+
+它只使用临时 `127.0.0.1` UDP 端口，验证 PSK 握手、UDP echo-like relay 和
+`allowed_targets` fail-closed 行为；不会启动 TUN，也不会修改路由、防火墙、
+systemd、Docker 或系统代理状态。
+
 ## 服务端部署
 
 ```bash
@@ -112,5 +122,8 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 也不会修改防火墙规则，但公开发布前仍应先检查输出。不要公开或粘贴
 `tgp.auth.psk`；只需要说明它是否存在、是否不是占位值，并提供
 `allowed_targets` 摘要即可。
+
+完整的本地 smoke 和 VPS 验收清单请见
+[docs/tgp-server-verification.zh-CN.md](docs/tgp-server-verification.zh-CN.md)。
 
 Prism/Core IPC 设计请见 [docs/ipc-api.md](docs/ipc-api.md) 和 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)。TGP 线缆格式请见 [docs/tgp-spec.md](docs/tgp-spec.md)。Prism 使用的 GitHub Release 资产说明请见 [docs/release.md](docs/release.md)。

@@ -21,6 +21,8 @@ LOG_LINES=120
 OUTPUT_DIR="."
 FORMAT="tar.gz"
 SELF_TEST=false
+DRY_RUN=false
+DRY_RUN_FIXTURE_DIR=""
 
 usage() {
   cat <<'USAGE'
@@ -44,12 +46,14 @@ OPTIONS:
   --log-lines N                docker/file log lines to collect (default: 120, max: 1000)
   --output-dir PATH            Directory for the timestamped output (default: current dir)
   --format tar.gz|txt          Output format (default: tar.gz)
+  --dry-run                    Generate a fixture bundle without inspecting the host
   --self-test                  Run helper tests; does not inspect the host
   -h, --help                   Show this help
 
 The collector is read-only. It redacts common secret forms including PSK,
-token, uuid, private_key, password, and subscription/proxy URLs, but you must
-manually inspect the generated file before sending it back or posting publicly.
+token, password, private keys, auth/cookie headers, and credential URLs, but
+you must manually inspect the generated file before sending it back or posting
+publicly.
 USAGE
 }
 
@@ -77,6 +81,7 @@ parse_args() {
       --log-lines)       require_option_value "$@" || return 2; LOG_LINES="$2"; shift 2 ;;
       --output-dir)      require_option_value "$@" || return 2; OUTPUT_DIR="$2"; shift 2 ;;
       --format)          require_option_value "$@" || return 2; FORMAT="$2"; shift 2 ;;
+      --dry-run)         DRY_RUN=true; shift ;;
       --self-test)       SELF_TEST=true; shift ;;
       -h|--help)         usage; exit 0 ;;
       *)                 echo "unknown option: $1" >&2; usage >&2; return 2 ;;
@@ -86,6 +91,15 @@ parse_args() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+have_collector_command() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    case "$1" in
+      systemctl|journalctl|docker|ss|netstat) return 1 ;;
+    esac
+  fi
+  have "$1"
 }
 
 is_integer() {
@@ -155,13 +169,68 @@ listen_port_from_value() {
 }
 
 redact_secret_stream() {
-  sed -E \
-    -e 's/(["'\'']?(psk|token|access_token|refresh_token|api_key|secret|uuid|private_key|private-key|password|passwd|subscription_url|subscription-url|subscription)["'\'']?[[:space:]]*[:=][[:space:]]*["'\'']?)[^"'\''[:space:],;}]+/\1<redacted>/Ig' \
-    -e 's/((^|[^[:alnum:]_.-])tgp\.auth\.psk[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1<redacted>/Ig' \
-    -e 's#https?://[^[:space:]<>"'\'']*(token|subscription|subscribe|sub|password|passwd|private_key|psk|secret|key)[^[:space:]<>"'\'']*#<redacted-url>#Ig' \
+  if have perl && [[ "${TACHYON_DIAGNOSTICS_FORCE_FALLBACK_REDACTOR:-}" != "1" ]]; then
+    perl -0pe '
+      my $name = qr/[A-Za-z0-9_.-]*(?:psk|token|access[_.-]?token|refresh[_.-]?token|api[_.-]?key|apikey|secret|uuid|private[_.-]?key|privateKey|pre[_.-]?shared[_.-]?key|presharedkey|shortId|short[_.-]?id|password|passwd|pass|subscription[_.-]?url|subscription)[A-Za-z0-9_.-]*/i;
+      my $header = qr/(?:authorization|proxy-authorization|cookie|set-cookie)/i;
+      s/-----BEGIN [A-Z0-9 ]*(?:PRIVATE|SECRET|RSA|DSA|EC|OPENSSH|ENCRYPTED)[A-Z0-9 ]*KEY-----.*?-----END [A-Z0-9 ]*(?:PRIVATE|SECRET|RSA|DSA|EC|OPENSSH|ENCRYPTED)[A-Z0-9 ]*KEY-----/<redacted-pem>/gis;
+      s/^([ \t]*["\x27]?$name["\x27]?[ \t]*:[ \t]*[|>][-+]?[^\r\n]*(?:\r?\n))(?:(?:[ \t]+.*(?:\r?\n|$))*)/$1<redacted-block>\n/gim;
+      s/((?:^|[{\s,;])["\x27]?$name["\x27]?\s*[:=]\s*")((?:\\.|[^"\\])*)(")/$1<redacted>$3/gims;
+      s/((?:^|[{\s,;])["\x27]?$name["\x27]?\s*[:=]\s*\x27)((?:\\.|[^\x27\\])*)(\x27)/$1<redacted>$3/gims;
+      s/((?:^|[{\s,;])["\x27]?$name["\x27]?\s*[:=]\s*)[^\r\n,;}#]+/$1<redacted>/gim;
+      s/^([ \t]*$header[ \t]*:[ \t]*)(?:Bearer|Basic)[ \t]+[^\r\n]+/$1<redacted-auth>/gim;
+      s/^([ \t]*$header[ \t]*:[ \t]*)[^\r\n]+/$1<redacted-header>/gim;
+      s/((?:^|\s)--?$name(?:=|\s+))(?!-)[^\r\n]*(?=(?:\s--?[A-Za-z][A-Za-z0-9_-]*(?:=|\s|$))|\r?\n|$)/$1<redacted>/gim;
+      s#([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@<>"\x27]+(?::[^\s/@<>"\x27]*)?@#$1<redacted>@#gi;
+      s#https?://[^\s<>"\x27]*(?:token|subscription|subscribe|sub|password|passwd|private_key|privateKey|pre-shared-key|psk|secret|key)[^\s<>"\x27]*#<redacted-url>#gi;
+      s#(?:vmess|vless|trojan|ss|ssr|hysteria2|hy2|tuic)://[^\s<>"\x27]+#<redacted-url>#gi;
+      s#(?:subscription|sub)://[^\s<>"\x27]+#<redacted-url>#gi;
+      s/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}/<redacted-uuid>/g;
+    '
+    return
+  fi
+
+  awk '
+    BEGIN { in_pem = 0 }
+    /-----BEGIN [A-Z0-9 ]*(PRIVATE|SECRET|RSA|DSA|EC|OPENSSH|ENCRYPTED)[A-Z0-9 ]*KEY-----/ {
+      print "<redacted-pem>"
+      if ($0 ~ /-----END [A-Z0-9 ]*(PRIVATE|SECRET|RSA|DSA|EC|OPENSSH|ENCRYPTED)[A-Z0-9 ]*KEY-----/) {
+        in_pem = 0
+      } else {
+        in_pem = 1
+      }
+      next
+    }
+    in_pem {
+      if ($0 ~ /-----END [A-Z0-9 ]*(PRIVATE|SECRET|RSA|DSA|EC|OPENSSH|ENCRYPTED)[A-Z0-9 ]*KEY-----/) {
+        in_pem = 0
+      }
+      next
+    }
+    { print }
+  ' | sed -E \
+    -e 's/(["'\'']?[[:alnum:]_.-]*(psk|token|access[_.-]?token|refresh[_.-]?token|api[_.-]?key|apikey|secret|uuid|private[_.-]?key|privateKey|pre[_.-]?shared[_.-]?key|presharedkey|shortId|short[_.-]?id|password|passwd|pass|subscription[_.-]?url|subscription)[[:alnum:]_.-]*["'\'']?[[:space:]]*[:=][[:space:]]*["'\'']?)[^,;}#]+/\1<redacted>/Ig' \
+    -e 's/((^|[^[:alnum:]_.-])tgp\.auth\.psk[[:space:]]*[:=][[:space:]]*)[^,;}#]+/\1<redacted>/Ig' \
+    -e 's/^([[:space:]]*(authorization|proxy-authorization|cookie|set-cookie)[[:space:]]*:[[:space:]]*)(Bearer|Basic)[[:space:]]+[^[:cntrl:]]+/\1<redacted-auth>/Ig' \
+    -e 's/^([[:space:]]*(authorization|proxy-authorization|cookie|set-cookie)[[:space:]]*:[[:space:]]*)[^[:cntrl:]]+/\1<redacted-header>/Ig' \
+    -e 's/((^|[[:space:]])--?[[:alnum:]_.-]*(psk|token|access[_.-]?token|refresh[_.-]?token|api[_.-]?key|apikey|secret|uuid|private[_.-]?key|privateKey|pre[_.-]?shared[_.-]?key|presharedkey|shortId|short[_.-]?id|password|passwd|pass|subscription[_.-]?url|subscription)[[:alnum:]_.-]*(=|[[:space:]]+))[^[:space:]]+([[:space:]][^-][^[:space:]]+)*/\1<redacted>/Ig' \
+    -e 's#([[:alpha:]][[:alnum:]+.-]*://)[^[:space:]/@<>"'\'']+(:[^[:space:]/@<>"'\'']*)?@#\1<redacted>@#Ig' \
+    -e 's#https?://[^[:space:]<>"'\'']*(token|subscription|subscribe|sub|password|passwd|private_key|privateKey|pre-shared-key|psk|secret|key)[^[:space:]<>"'\'']*#<redacted-url>#Ig' \
     -e 's#(vmess|vless|trojan|ss|ssr|hysteria2|hy2|tuic)://[^[:space:]<>"'\'']+#<redacted-url>#Ig' \
     -e 's#(subscription|sub)://[^[:space:]<>"'\'']+#<redacted-url>#Ig' \
     -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}/<redacted-uuid>/g'
+}
+
+redact_inline() {
+  printf '%s\n' "$*" | redact_secret_stream | tr '\r\n' ' ' | sed -E 's/[[:space:]]+$//'
+}
+
+strip_ansi_stream() {
+  if have perl; then
+    perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g'
+    return
+  fi
+  sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g'
 }
 
 write_header() {
@@ -177,7 +246,7 @@ append_cmd() {
   shift
   write_header "$title"
   {
-    echo "+ $*"
+    echo "+ $(redact_inline "$*")"
     "$@" 2>&1 | redact_secret_stream || true
   } >> "$REPORT_FILE"
 }
@@ -316,7 +385,7 @@ append_allowed_targets_summary() {
 
 append_systemd_status() {
   local service="$1"
-  if ! have systemctl; then
+  if ! have_collector_command systemctl; then
     append_text "systemd service status" "systemctl is unavailable"
     return 0
   fi
@@ -327,7 +396,7 @@ append_systemd_status() {
 
 append_docker_status() {
   local container="$1"
-  if ! have docker; then
+  if ! have_collector_command docker; then
     append_text "Docker container status" "docker is unavailable"
     return 0
   fi
@@ -341,9 +410,9 @@ append_udp_listener() {
     append_text "UDP listening port" "No UDP port was parsed from config."
     return 0
   fi
-  if have ss; then
+  if have_collector_command ss; then
     append_cmd "UDP listening port" ss -lunp "sport = :$port"
-  elif have netstat; then
+  elif have_collector_command netstat; then
     append_cmd "UDP listeners" netstat -lunp
   else
     append_text "UDP listening port" "Neither ss nor netstat is available."
@@ -353,14 +422,18 @@ append_udp_listener() {
 append_log_tails() {
   local mode="$1"
   if [[ "$mode" == "docker" ]]; then
-    if have journalctl; then
+    if have_collector_command journalctl; then
       append_cmd "Docker systemd journal tail" journalctl -u "$DOCKER_SERVICE_NAME" -n "$JOURNAL_LINES" --no-pager
+    else
+      append_text "Docker systemd journal tail" "journalctl is unavailable; Docker service journal tail was not collected."
     fi
-    if have docker; then
+    if have_collector_command docker; then
       append_cmd "Docker logs tail" docker logs --tail "$LOG_LINES" "$DOCKER_CONTAINER_NAME"
+    else
+      append_text "Docker logs tail" "docker is unavailable; Docker container log tail was not collected."
     fi
   else
-    if have journalctl; then
+    if have_collector_command journalctl; then
       append_cmd "systemd journal tail" journalctl -u "$SERVICE_NAME" -n "$JOURNAL_LINES" --no-pager
     else
       append_text "systemd journal tail" "journalctl is unavailable"
@@ -390,24 +463,33 @@ append_verify_server_output() {
     return 0
   fi
 
-  {
-    bash "$verify_script" \
-      --mode "$mode" \
-      --config "$CONFIG_PATH" \
-      --binary "$BINARY_PATH" \
-      --service "$SERVICE_NAME" \
-      --docker-config "$DOCKER_CONFIG_PATH" \
-      --docker-binary "$DOCKER_BINARY_PATH" \
-      --docker-service "$DOCKER_SERVICE_NAME" \
-      --container "$DOCKER_CONTAINER_NAME" \
-      --compose-dir "$COMPOSE_DIR" \
-      --journal-lines "$JOURNAL_LINES" \
-      --log-lines "$LOG_LINES" 2>&1 || true
-  } | redact_secret_stream > "$output_file"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    {
+      printf '\033[1;33m[WARN]\033[0m dry-run verify fixture warning token=verify secret value\n'
+      printf '\033[0;31m[FAIL]\033[0m dry-run verify fixture failure password=verify secret value\n'
+      echo "Warnings: 1"
+      echo "Failures: 1"
+    } | redact_secret_stream > "$output_file"
+  else
+    {
+      bash "$verify_script" \
+        --mode "$mode" \
+        --config "$CONFIG_PATH" \
+        --binary "$BINARY_PATH" \
+        --service "$SERVICE_NAME" \
+        --docker-config "$DOCKER_CONFIG_PATH" \
+        --docker-binary "$DOCKER_BINARY_PATH" \
+        --docker-service "$DOCKER_SERVICE_NAME" \
+        --container "$DOCKER_CONTAINER_NAME" \
+        --compose-dir "$COMPOSE_DIR" \
+        --journal-lines "$JOURNAL_LINES" \
+        --log-lines "$LOG_LINES" 2>&1 || true
+    } | redact_secret_stream > "$output_file"
+  fi
 
   {
     echo "verify_server_output_file=verify-server-output.txt"
-    grep -E '^\[FAIL\]|^\[WARN\]|^Failures:|^Warnings:' "$output_file" 2>/dev/null || true
+    strip_ansi_stream < "$output_file" | grep -E '^\[FAIL\]|^\[WARN\]|^Failures:|^Warnings:' 2>/dev/null || true
   } > "$summary_file"
 
   write_header "verify-server output summary"
@@ -451,27 +533,140 @@ tar -czf
 COMMANDS
 }
 
+prepare_dry_run_fixture() {
+  DRY_RUN_FIXTURE_DIR=$(make_temp_dir) || return 1
+  mkdir -p "$DRY_RUN_FIXTURE_DIR/config" "$DRY_RUN_FIXTURE_DIR/bin" "$DRY_RUN_FIXTURE_DIR/compose" || return 1
+
+  local fixture_log="$DRY_RUN_FIXTURE_DIR/tachyon.log"
+  cat > "$fixture_log" <<'LOG'
+2026-01-01T00:00:00Z dry-run log password=abc def token=secret token
+TGP_AUTH_PSK=env psk secret words
+TACHYON_TOKEN=env token secret words
+MY_PASSWORD=env password secret words
+SECRET_KEY=env secret key words
+SERVICE_API_KEY=env api key words
+AUTHORIZATION: Bearer bearer-token-value
+Proxy-Authorization: Basic proxy-basic-value
+Cookie: sessionid=cookie-secret-value; csrftoken=cookie-csrf-value
+Set-Cookie: sessionid=set-cookie-secret-value; Path=/; HttpOnly
+DATABASE_URL=postgres://user:pass@example/db
+private_key: |
+  -----BEGIN PRIVATE KEY-----
+  dry-run pem body should not appear
+  -----END PRIVATE KEY-----
+LOG
+
+  CONFIG_PATH="$DRY_RUN_FIXTURE_DIR/config/server.json"
+  cat > "$CONFIG_PATH" <<JSON
+{
+  "mode": "server",
+  "server": {
+    "listen": ":2443",
+    "relay": {
+      "allowed_targets": [
+        {"cidr": "198.51.100.0/24", "ports": "27015-27050"},
+        {"domain": "game.example.com", "ports": "27015"}
+      ]
+    }
+  },
+  "tgp": {
+    "auth": {
+      "psk": "dry-run psk with spaces",
+      "allow_unauthenticated": false
+    }
+  },
+  "observability": {
+    "log_file": "$fixture_log"
+  }
+}
+JSON
+
+  BINARY_PATH="$DRY_RUN_FIXTURE_DIR/bin/tachyon-core"
+  cat > "$BINARY_PATH" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  version)
+    echo "tachyon-core dry-run version token=multi word token"
+    ;;
+  validate)
+    echo "validate ok password=abc def"
+    echo '"private_key": "-----BEGIN PRIVATE KEY----- dry-run inline pem -----END PRIVATE KEY-----"'
+    ;;
+  *)
+    echo "dry-run tachyon-core $*"
+    ;;
+esac
+SH
+  chmod +x "$BINARY_PATH"
+
+  DOCKER_CONFIG_PATH="$DRY_RUN_FIXTURE_DIR/config/docker-server.json"
+  cp "$CONFIG_PATH" "$DOCKER_CONFIG_PATH"
+  DOCKER_BINARY_PATH="$DRY_RUN_FIXTURE_DIR/bin/docker-tachyon-core"
+  cp "$BINARY_PATH" "$DOCKER_BINARY_PATH"
+  chmod +x "$DOCKER_BINARY_PATH"
+  COMPOSE_DIR="$DRY_RUN_FIXTURE_DIR/compose"
+  cat > "$COMPOSE_DIR/docker-compose.yaml" <<'YAML'
+services:
+  tachyon-core:
+    image: tachyon/core:dry-run
+YAML
+}
+
 self_test() {
   local ok=0
-  local secret="super-secret-value"
+  local secret="super secret value with spaces"
   local uuid="123e4567-e89b-12d3-a456-426614174000"
-  local redacted
+  local redaction_samples leaked_redaction_needles redacted label force
+  redaction_samples=$(cat <<EOF
+"psk": "$secret"
+'private_key': '-----BEGIN PRIVATE KEY----- $secret -----END PRIVATE KEY-----'
+password=abc def
+token=$secret
+secret: $secret
+shortId: $secret
+pre-shared-key: $secret
+--token $secret --mode docker
+uuid=$uuid
+subscription_url=https://example.com/subscription?token=$secret
+vmess://abcdef0123456789
+plain uuid $uuid
+TGP_AUTH_PSK=env psk secret words
+TACHYON_TOKEN=env token secret words
+MY_PASSWORD=env password secret words
+SECRET_KEY=env secret key words
+SERVICE_API_KEY=env api key words
+AUTHORIZATION: Bearer bearer-token-value
+Proxy-Authorization: Basic proxy-basic-value
+Cookie: sessionid=cookie-secret-value; csrftoken=cookie-csrf-value
+Set-Cookie: sessionid=set-cookie-secret-value; Path=/; HttpOnly
+DATABASE_URL=postgres://user:pass@example/db
+EOF
+)
+  leaked_redaction_needles=$'super secret value with spaces\nabc def\nPRIVATE KEY\n123e4567-e89b-12d3-a456-426614174000\nvmess://abcdef0123456789\nenv psk secret words\nenv token secret words\nenv password secret words\nenv secret key words\nenv api key words\nbearer-token-value\nproxy-basic-value\ncookie-secret-value\ncookie-csrf-value\nset-cookie-secret-value\nuser:pass'
 
-  redacted=$(printf '%s\n' \
-    "\"psk\": \"$secret\"" \
-    "token=$secret" \
-    "uuid=$uuid" \
-    "private_key: $secret" \
-    "password=$secret" \
-    "subscription_url=https://example.com/subscription?token=$secret" \
-    "vmess://abcdef0123456789" \
-    "plain uuid $uuid" \
-    | redact_secret_stream)
+  for label in perl fallback; do
+    force=0
+    if [[ "$label" == "fallback" ]]; then
+      force=1
+    elif ! have perl; then
+      echo "[WARN] perl is unavailable; perl redaction path self-test uses fallback path" >&2
+      force=1
+    fi
 
-  if [[ "$redacted" == *"$secret"* || "$redacted" == *"$uuid"* || "$redacted" == *"vmess://abcdef0123456789"* ]]; then
-    echo "[FAIL] redaction self-test leaked a sample secret" >&2
-    ok=1
-  fi
+    redacted=$(printf '%s\n' "$redaction_samples" | TACHYON_DIAGNOSTICS_FORCE_FALLBACK_REDACTOR="$force" redact_secret_stream)
+    while IFS= read -r needle; do
+      [[ -z "$needle" ]] && continue
+      if [[ "$redacted" == *"$needle"* ]]; then
+        echo "[FAIL] $label redaction self-test leaked: $needle" >&2
+        ok=1
+      fi
+    done <<< "$leaked_redaction_needles"
+
+    if ! printf '%s\n' "$redacted" | grep -Fq "DATABASE_URL=postgres://<redacted>@example/db"; then
+      echo "[FAIL] $label redaction self-test did not preserve credential URL structure" >&2
+      ok=1
+    fi
+  done
 
   [[ "$(listen_port_from_value ":2443")" == "2443" ]] || { echo "[FAIL] :port parsing failed" >&2; ok=1; }
   [[ "$(listen_port_from_value "127.0.0.1:2444")" == "2444" ]] || { echo "[FAIL] host:port parsing failed" >&2; ok=1; }
@@ -484,8 +679,105 @@ self_test() {
     ok=1
   fi
 
-  parse_args --format txt --mode config --output-dir /tmp >/dev/null || { echo "[FAIL] parse_args failed" >&2; ok=1; }
+  parse_args --format txt --mode config --output-dir /tmp --dry-run >/dev/null || { echo "[FAIL] parse_args failed" >&2; ok=1; }
   normalize_options || { echo "[FAIL] normalize_options failed" >&2; ok=1; }
+  [[ "$DRY_RUN" == "true" ]] || { echo "[FAIL] parse_args did not set dry-run" >&2; ok=1; }
+
+  local tmp txt_output tar_output extract_dir leaked_needles required_needles needle bundle_run_output
+  tmp=$(make_temp_dir) || { echo "[FAIL] temporary directory creation failed" >&2; return 1; }
+
+  if ! bundle_run_output=$(bash "$0" --dry-run --mode docker --format txt --output-dir "$tmp" 2>&1); then
+    echo "[FAIL] dry-run txt collection failed" >&2
+    printf '%s\n' "$bundle_run_output" >&2
+    ok=1
+  fi
+  txt_output=""
+  for candidate in "$tmp"/tachyon-server-diagnostics-*.txt; do
+    if [[ -f "$candidate" ]]; then
+      txt_output="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$txt_output" ]]; then
+    echo "[FAIL] dry-run txt collection did not create a txt bundle" >&2
+    ok=1
+  else
+    required_needles=$'Tachyon Core server diagnostics support bundle\nTachyon Core server diagnostics report\ncollector_mode=docker\n== Docker systemd journal tail ==\njournalctl is unavailable\n== Docker logs tail ==\ndocker is unavailable\n== Configured log file tail ==\nverify_server_output_file=verify-server-output.txt\n[WARN] dry-run verify fixture warning\n[FAIL] dry-run verify fixture failure\n== Full verify-server output =='
+    while IFS= read -r needle; do
+      [[ -z "$needle" ]] && continue
+      if ! grep -Fq "$needle" "$txt_output"; then
+        echo "[FAIL] dry-run txt bundle missing: $needle" >&2
+        ok=1
+      fi
+    done <<< "$required_needles"
+    leaked_needles=$'dry-run psk with spaces\nabc def\nsecret token\nverify secret value\nBEGIN PRIVATE KEY\ndry-run pem body\ninline pem\n123e4567-e89b-12d3-a456-426614174000\nenv psk secret words\nenv token secret words\nenv password secret words\nenv secret key words\nenv api key words\nbearer-token-value\nproxy-basic-value\ncookie-secret-value\ncookie-csrf-value\nset-cookie-secret-value\nuser:pass'
+    while IFS= read -r needle; do
+      [[ -z "$needle" ]] && continue
+      if grep -Fq "$needle" "$txt_output"; then
+        echo "[FAIL] dry-run txt bundle leaked: $needle" >&2
+        ok=1
+      fi
+    done <<< "$leaked_needles"
+  fi
+
+  if have tar; then
+    if ! bundle_run_output=$(bash "$0" --dry-run --mode docker --format tar.gz --output-dir "$tmp" 2>&1); then
+      echo "[FAIL] dry-run tar.gz collection failed" >&2
+      printf '%s\n' "$bundle_run_output" >&2
+      ok=1
+    fi
+    tar_output=""
+    for candidate in "$tmp"/tachyon-server-diagnostics-*.tar.gz; do
+      if [[ -f "$candidate" ]]; then
+        tar_output="$candidate"
+        break
+      fi
+    done
+    if [[ -z "$tar_output" ]]; then
+      echo "[FAIL] dry-run tar.gz collection did not create an archive" >&2
+      ok=1
+    else
+      local tar_listing expected_file
+      tar_listing=$(tar -tzf "$tar_output")
+      for expected_file in README-FIRST.txt report.txt verify-server-output.txt; do
+        if ! printf '%s\n' "$tar_listing" | grep -Eq "(^|/)$expected_file$"; then
+          echo "[FAIL] dry-run tar.gz archive is missing expected file: $expected_file" >&2
+          ok=1
+        fi
+      done
+      extract_dir="$tmp/extracted"
+      mkdir -p "$extract_dir"
+      if tar -xzf "$tar_output" -C "$extract_dir"; then
+        if ! grep -Fq "verify_server_output_file=verify-server-output.txt" "$extract_dir/report.txt"; then
+          echo "[FAIL] dry-run tar.gz report missing verify summary" >&2
+          ok=1
+        fi
+        if grep -R -Fq "dry-run psk with spaces" "$extract_dir"; then
+          echo "[FAIL] dry-run tar.gz archive leaked fixture PSK" >&2
+          ok=1
+        fi
+        if grep -R -Fq "BEGIN PRIVATE KEY" "$extract_dir"; then
+          echo "[FAIL] dry-run tar.gz archive leaked fixture PEM" >&2
+          ok=1
+        fi
+        if grep -R -Fq "bearer-token-value" "$extract_dir"; then
+          echo "[FAIL] dry-run tar.gz archive leaked fixture Authorization header" >&2
+          ok=1
+        fi
+        if grep -R -Fq "user:pass" "$extract_dir"; then
+          echo "[FAIL] dry-run tar.gz archive leaked fixture URL credentials" >&2
+          ok=1
+        fi
+      else
+        echo "[FAIL] dry-run tar.gz archive could not be extracted" >&2
+        ok=1
+      fi
+    fi
+  else
+    echo "[WARN] tar is unavailable; skipping tar.gz dry-run self-test" >&2
+  fi
+
+  rm -rf "$tmp"
 
   if (( ok == 0 )); then
     echo "[OK] diagnostics collector self-test passed"
@@ -503,6 +795,9 @@ collect() {
   REPORT_FILE="$WORK_DIR/report.txt"
   SCRIPT_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
   LISTEN_PORT=""
+  if [[ "$DRY_RUN" == "true" ]]; then
+    prepare_dry_run_fixture || { echo "failed to prepare dry-run fixture" >&2; return 1; }
+  fi
 
   local timestamp
   timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
@@ -555,6 +850,9 @@ collect() {
   fi
 
   rm -rf "$WORK_DIR"
+  if [[ -n "${DRY_RUN_FIXTURE_DIR:-}" ]]; then
+    rm -rf "$DRY_RUN_FIXTURE_DIR"
+  fi
   echo "Created read-only Tachyon diagnostics: $output_path"
   echo "Manual review required before sending. Do not include PSK, full subscription URLs, tokens, private keys, or passwords."
 }

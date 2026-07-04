@@ -51,10 +51,10 @@ Server mode
 
 ## Implementation Status
 
-Tachyon Core is not a production-complete release yet. The protocol and
-pipeline are ready for alpha integration. Windows TUN now has an alpha dynamic
-`wintun.dll` backend, but it still requires runtime validation with elevated
-adapter creation on real Windows hosts.
+Tachyon Core is not a stable or production-complete release yet. The protocol
+and pipeline are ready for alpha integration. Client TUN auto-route and DNS
+hijack stay disabled by default, and Windows TUN still requires runtime
+validation with elevated adapter creation on real Windows hosts.
 
 | Area | Status |
 | --- | --- |
@@ -93,8 +93,11 @@ bash scripts/smoke-tgp-relay.sh
 ```
 
 It uses only temporary `127.0.0.1` UDP ports and checks PSK handshake behavior,
-UDP echo-like relay, and `allowed_targets` fail-closed behavior without starting
-TUN or changing routes, firewall, systemd, Docker, or proxy state.
+missing/wrong PSK rejection, ACL allow/deny behavior, deny-all defaults,
+wildcard target rejection, and an echo-like UDP relay round trip without
+starting TUN or changing routes, firewall, systemd, Docker, or proxy state. This
+local smoke test does not replace real VPS, real client, or real game UDP
+validation.
 
 ## Server Deployment
 
@@ -109,7 +112,7 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 Both installers download the matching Linux ZIP asset from
 `EarendelArc/tachyon-core` GitHub Releases. `--version latest` selects the
 newest release entry, including alpha prereleases; pass an explicit tag such as
-`--version v0.1.0-alpha.13` for reproducible deployment. The Docker path mounts
+`--version v0.1.0-alpha.14` for reproducible deployment. The Docker path mounts
 the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
 container and does not depend on a GHCR image.
 

@@ -10,6 +10,49 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ### Fixed
 
+## [v0.1.0-alpha.14] - 2026-07-04
+
+### Added
+- Added `scripts/smoke-tgp-relay.sh` as a local TGP relay smoke verification
+  entry point. It runs the focused relay smoke test without touching TUN,
+  system proxy, routes, firewall, systemd, Docker, or a real VPS.
+- The smoke coverage exercises PSK-authenticated handshakes, missing/wrong PSK
+  rejection, ACL allow/deny behavior, deny-all defaults, wildcard target
+  rejection, and an echo-like UDP relay round trip on temporary `127.0.0.1`
+  ports.
+- Added TGP server verification documentation that separates local smoke checks
+  from post-deployment VPS acceptance checks.
+
+### Changed
+- Release and README guidance now makes the alpha boundary explicit: Core is
+  not stable or complete, client TUN routing remains disabled by default, local
+  smoke does not replace real VPS/client/game UDP validation, and deployed
+  servers should still be checked with `scripts/verify-server.sh`.
+- Server deployment notes continue to require a private `tgp.auth.psk`, explicit
+  `server.relay.allowed_targets`, and no public sharing of PSK values.
+
+### Known Limitations
+- Client TUN auto-route and DNS hijack remain disabled by default for alpha.
+- Local relay smoke verification is not a real network test; real VPS security
+  groups, client paths, carrier UDP reachability, and target game UDP behavior
+  still need field validation.
+- Relay path rebind/migration remains fail-closed until an authenticated rebind
+  control path exists.
+- Windows TUN still needs elevated validation on real Windows hosts.
+
+### 中文说明
+- 新增 `scripts/smoke-tgp-relay.sh`，作为本地 TGP relay smoke 验证入口。
+  该脚本只运行聚焦的 relay smoke，不会启用 TUN、系统代理，也不会修改路由、
+  防火墙、systemd、Docker 或真实 VPS。
+- smoke 覆盖带 PSK 的握手、缺失/错误 PSK 拒绝、ACL allow/deny、默认
+  deny-all、通配全网目标拒绝，以及临时 `127.0.0.1` UDP 端口上的 echo-like
+  relay 往返。
+- README 和 release 说明明确 alpha 边界：Core 还不是 stable/完整版本，客户端
+  TUN 路由默认关闭，本地 smoke 不能替代真实 VPS、客户端和游戏 UDP 验证；
+  部署后仍应运行 `scripts/verify-server.sh`。
+- 服务端部署仍要求使用私有 `tgp.auth.psk` 和显式 `server.relay.allowed_targets`；
+  不要公开或粘贴 PSK 原文。
+
 ## [v0.1.0-alpha.13] - 2026-07-04
 
 ### Added

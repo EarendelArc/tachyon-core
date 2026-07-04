@@ -1,26 +1,30 @@
 # Release Process
 
 Tachyon Core releases are published by GitHub Actions from this repository.
-Releases are currently alpha-quality: Windows TUN has a dynamic `wintun.dll`
-backend, but it still needs real elevated-host validation. The artifacts are
-useful for Prism-managed downloads and integration testing.
+Releases are currently alpha-quality: client TUN auto-route and DNS hijack are
+disabled by default, Windows TUN still needs real elevated-host validation, and
+the artifacts are intended for Prism-managed downloads and integration testing.
 
 ## Current Preview
 
 The current preview release is
-`v0.1.0-alpha.13` (preview tag preparation). It keeps the alpha.12
-PSK-authenticated, deny-all-by-default relay posture and adds a non-destructive
-server acceptance helper, `scripts/verify-server.sh`. The helper inspects
-bare-metal systemd installs, Docker Compose installs, and local config/binary
-pairs; reports service state, config validation, listen settings, and a
-redacted `allowed_targets` summary; and avoids printing raw `tgp.auth.psk`
-values. CI also runs bash self-checks for the script.
+`v0.1.0-alpha.14` (preview tag preparation). It keeps the alpha.13
+PSK-authenticated, deny-all-by-default relay posture and adds
+`scripts/smoke-tgp-relay.sh` as a local TGP relay smoke verification entry
+point. The smoke test binds only temporary `127.0.0.1` UDP ports and covers
+PSK-authenticated handshakes, missing/wrong PSK rejection, ACL allow/deny
+behavior, deny-all defaults, wildcard target rejection, and an echo-like UDP
+relay round trip. It does not start TUN, enable system proxy, or change routes,
+firewall rules, systemd, Docker, or real VPS state.
 
-Known limitations for this preview: `scripts/verify-server.sh` is an acceptance
-aid, not a replacement for real VPS, Docker host, or target-game UDP validation;
-relay path rebind/migration is fail-closed until an authenticated rebind control
-path exists; Windows TUN still needs elevated validation on real Windows hosts;
-and domain ACLs are resolved at Core startup rather than dynamically tracked.
+Known limitations for this preview: local smoke is not a replacement for real
+VPS, real client, carrier/network, or target-game UDP validation; deployed
+servers should still be checked with `scripts/verify-server.sh`; relay path
+rebind/migration is fail-closed until an authenticated rebind control path
+exists; Windows TUN still needs elevated validation on real Windows hosts; and
+domain ACLs are resolved at Core startup rather than dynamically tracked. Do
+not publish or paste `tgp.auth.psk`; share only redacted diagnostics and the
+shape of `allowed_targets`.
 
 The `main` branch may contain newer unreleased changes after this tag. Create a
 new release tag only after `go test ./...` and the cross-platform build matrix
@@ -113,3 +117,6 @@ installers reject `0.0.0.0/0`, `::/0`, and entries without explicit ports.
 Generated configs also include the relay resource-limit defaults
 (`max_sessions`, `session_queue_size`, `handler_concurrency`, `max_flows`, and
 `max_flows_per_session`).
+
+After deployment, run `scripts/verify-server.sh` in the matching mode to collect
+read-only diagnostics before testing with real clients and game UDP traffic.

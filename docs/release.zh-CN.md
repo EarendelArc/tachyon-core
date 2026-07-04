@@ -1,23 +1,25 @@
 # 发布流程
 
 Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 alpha
-质量：Windows TUN 已经具备动态 `wintun.dll` 后端，但仍需要真实管理员环境验证。
-这些产物已经可以用于 Prism 托管下载和集成测试。
+质量：客户端 TUN 自动路由和 DNS hijack 默认关闭；Windows TUN 仍需要真实管理员
+环境验证。这些产物主要用于 Prism 托管下载和集成测试。
 
 ## 当前预览版本
 
 当前预览版是
-`v0.1.0-alpha.13`（预发布 tag 准备）。该版本延续 alpha.12 中
-PSK 认证、服务端 relay 默认 deny-all 的安全口径，并新增非破坏性服务端验收脚本
-`scripts/verify-server.sh`。脚本可检查裸机 systemd 部署、Docker Compose 部署以及
-本地 config/binary 组合，输出服务状态、配置校验、监听配置和脱敏后的
-`allowed_targets` 摘要，并避免打印 `tgp.auth.psk` 原文。CI 也会对该脚本运行
-bash 自检。
+`v0.1.0-alpha.14`（预发布 tag 准备）。该版本延续 alpha.13 中
+PSK 认证、服务端 relay 默认 deny-all 的安全口径，并新增
+`scripts/smoke-tgp-relay.sh` 作为本地 TGP relay smoke 验证入口。smoke 只绑定
+临时 `127.0.0.1` UDP 端口，覆盖带 PSK 的握手、缺失/错误 PSK 拒绝、ACL
+allow/deny、默认 deny-all、通配全网目标拒绝，以及 echo-like UDP relay 往返。
+它不会启动 TUN、启用系统代理，也不会修改路由、防火墙、systemd、Docker 或真实
+VPS 状态。
 
-该预览版的已知限制：`scripts/verify-server.sh` 只是 alpha 验收辅助，不能替代
-真实 VPS、Docker 主机和目标游戏 UDP 链路验证；relay 路径迁移/重绑定在加入
-authenticated rebind 控制路径前仍为 fail-closed；Windows TUN 仍需真实 Windows
-管理员环境验证；domain ACL 在 Core 启动时解析，暂不动态追踪。
+该预览版的已知限制：本地 smoke 不能替代真实 VPS、真实客户端、运营商/网络和目标
+游戏 UDP 验证；部署后仍应运行 `scripts/verify-server.sh`；relay 路径迁移/重绑定在
+加入 authenticated rebind 控制路径前仍为 fail-closed；Windows TUN 仍需真实
+Windows 管理员环境验证；domain ACL 在 Core 启动时解析，暂不动态追踪。不要公开或
+粘贴 `tgp.auth.psk`，只分享脱敏诊断和 `allowed_targets` 结构。
 
 `main` 分支可能包含比该 tag 更新的未发布提交。只有在 `go test ./...` 和跨平台构建矩阵通过后，才应该创建新的 release tag。
 
@@ -84,7 +86,7 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 `scripts/install-server.sh` 与 `scripts/install-server-docker.sh` 都从
 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的 Linux ZIP 资产。
 脚本的 `--version latest` 会读取 release 列表中的最新 tag，因此包含 alpha
-预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.13`
+预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.14`
 或更新后的固定 tag。
 
 裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把
@@ -100,3 +102,6 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 `0.0.0.0/0`、`::/0` 和未显式填写端口的条目。生成配置也会写入 Relay 资源上限默认值：
 `max_sessions`、`session_queue_size`、`handler_concurrency`、`max_flows` 和
 `max_flows_per_session`。
+
+部署后请按对应模式运行 `scripts/verify-server.sh` 收集只读诊断，再继续使用真实客户端
+和游戏 UDP 流量测试。

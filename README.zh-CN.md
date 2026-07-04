@@ -42,7 +42,9 @@ tachyonctl health --addr 127.0.0.1:55123
 
 ## 实现状态
 
-Tachyon Core 还不是生产完成版本。协议和管道已经可以用于 alpha 集成。Windows TUN 现在有 alpha 级动态 `wintun.dll` 后端，但仍需要在真实 Windows 主机上以管理员权限创建适配器进行运行时验证。
+Tachyon Core 还不是 stable 或生产完成版本。协议和管道已经可以用于 alpha 集成。
+客户端 TUN 自动路由和 DNS hijack 默认保持关闭；Windows TUN 仍需要在真实
+Windows 主机上以管理员权限创建适配器进行运行时验证。
 
 | 领域 | 状态 |
 | --- | --- |
@@ -80,9 +82,10 @@ mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.js
 bash scripts/smoke-tgp-relay.sh
 ```
 
-它只使用临时 `127.0.0.1` UDP 端口，验证 PSK 握手、UDP echo-like relay 和
-`allowed_targets` fail-closed 行为；不会启动 TUN，也不会修改路由、防火墙、
-systemd、Docker 或系统代理状态。
+它只使用临时 `127.0.0.1` UDP 端口，验证 PSK 握手、缺失/错误 PSK 拒绝、
+ACL allow/deny、默认 deny-all、通配全网目标拒绝，以及 echo-like UDP relay
+往返；不会启动 TUN，也不会修改路由、防火墙、systemd、Docker 或系统代理状态。
+本地 smoke 不能替代真实 VPS、真实客户端和真实游戏 UDP 验证。
 
 ## 服务端部署
 
@@ -97,7 +100,7 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 两种安装脚本都会从 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的
 Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 alpha
 预览版；如需可复现部署，可传入明确 tag，例如
-`--version v0.1.0-alpha.13`。Docker 部署会把下载得到的静态
+`--version v0.1.0-alpha.14`。Docker 部署会把下载得到的静态
 `tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
 镜像。
 

@@ -29,6 +29,9 @@ The smoke test only binds temporary `127.0.0.1` UDP ports. It verifies:
 
 It does not start the client pipeline, create TUN devices, or change host
 networking.
+The local smoke test cannot replace verification on the real VPS, cloud
+security group UDP exposure, carrier UDP reachability, or real game UDP
+end-to-end validation.
 
 ## After VPS Deployment
 

@@ -31,15 +31,16 @@ func TestTGPRelaySmokeVerification(t *testing.T) {
 	udpRelay := newUDPRelayPool(nil, time.Second, time.Second)
 	defer udpRelay.Close()
 	echoAddr := netip.MustParseAddrPort(echo.LocalAddr().String())
+	relayACL := mustTargetACL(t, []config.RelayTargetRule{
+		{CIDR: echoAddr.Addr().String() + "/32", Ports: fmt.Sprintf("%d", echoAddr.Port())},
+	})
 	relay, err := tgp.NewRelay(tgp.RelayOptions{
 		Transport: relayTransport,
 		PacerPPS:  100000,
 		AuthKey:   authKey,
 		Handler: serverRelayHandler{
 			relay: udpRelay,
-			acl: mustTargetACL(t, []config.RelayTargetRule{
-				{CIDR: echoAddr.Addr().String() + "/32", Ports: fmt.Sprintf("%d", echoAddr.Port())},
-			}),
+			acl:   relayACL,
 		},
 	})
 	if err != nil {
@@ -80,6 +81,7 @@ func TestTGPRelaySmokeVerification(t *testing.T) {
 	assertNoSmokeTGPResponse(t, gotCh, 150*time.Millisecond)
 
 	unknownAddr := netip.MustParseAddrPort("203.0.113.42:27015")
+	assertSmokeTargetDenied(t, relayACL, unknownAddr)
 	sendSmokeTunnelDatagram(t, ctx, manager, unknownAddr, []byte("blocked-target"))
 	assertNoSmokeTGPResponse(t, gotCh, 150*time.Millisecond)
 
@@ -90,6 +92,13 @@ func TestTGPRelaySmokeVerification(t *testing.T) {
 	}
 
 	assertRelayDoesNotAllowOpenTargets(t)
+}
+
+func assertSmokeTargetDenied(t *testing.T, acl *targetACL, target netip.AddrPort) {
+	t.Helper()
+	if acl.Allows(target) {
+		t.Fatalf("relay ACL unexpectedly allows unknown target %s", target)
+	}
 }
 
 func assertSmokeHandshakeRejected(t *testing.T, remote string, authKey []byte) {

@@ -26,6 +26,7 @@ mise exec -- go test ./internal/app -run '^TestTGPRelaySmokeVerification$' -coun
 - 空 `allowed_targets` 保持 deny-all，通配全网 relay 目标会被拒绝。
 
 它不会启动客户端 pipeline、创建 TUN 设备，也不会修改主机网络配置。
+本地 smoke 不能替代真实 VPS、云安全组、运营商 UDP 可达性和真实游戏 UDP 端到端验证。
 
 ## VPS 部署后
 

@@ -100,7 +100,7 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 两种安装脚本都会从 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的
 Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 alpha
 预览版；如需可复现部署，可传入明确 tag，例如
-`--version v0.1.0-alpha.14`。Docker 部署会把下载得到的静态
+`--version v0.1.0-alpha.15`。Docker 部署会把下载得到的静态
 `tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
 镜像。
 
@@ -121,10 +121,20 @@ sudo bash scripts/verify-server.sh --mode docker
 bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
 ```
 
-如果需要我们协助排查 VPS Relay，请把完整输出发给我们。验收脚本会隐藏 PSK，
-也不会修改防火墙规则，但公开发布前仍应先检查输出。不要公开或粘贴
-`tgp.auth.psk`；只需要说明它是否存在、是否不是占位值，并提供
-`allowed_targets` 摘要即可。
+如果需要我们协助排查 VPS Relay，请生成带时间戳的支持包：
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh
+sudo bash scripts/collect-server-diagnostics.sh --mode docker
+sudo bash scripts/collect-server-diagnostics.sh --format txt
+```
+
+支持包包含 OS/kernel、Core 版本、配置校验、`allowed_targets`、服务或容器状态、
+UDP 监听状态、脱敏日志尾部，以及脱敏后的 `verify-server.sh` 输出。它只读收集信息，
+不会修改防火墙、Docker、systemd、包过滤器、路由或代理状态。回传前请人工检查生成的
+`tachyon-server-diagnostics-*.tar.gz` 或 `.txt`。不要公开或粘贴 `tgp.auth.psk`、
+完整私有订阅/代理 URL、token、UUID、private key、API key 或 password；只需要说明
+PSK 是否存在、是否不是占位值，并提供 `allowed_targets` 摘要即可。
 
 完整的本地 smoke 和 VPS 验收清单请见
 [docs/tgp-server-verification.zh-CN.md](docs/tgp-server-verification.zh-CN.md)。

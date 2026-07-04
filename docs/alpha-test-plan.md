@@ -89,7 +89,7 @@ For reproducible alpha testing, pass the intended release tag instead of relying
 on the moving latest entry:
 
 ```bash
-sudo bash scripts/install-server.sh --version v0.1.0-alpha.14 --port 443 \
+sudo bash scripts/install-server.sh --version v0.1.0-alpha.15 --port 443 \
   --allow-target 'domain=game.example.com,ports=27015'
 ```
 
@@ -107,7 +107,7 @@ Run on the VPS:
 
 ```bash
 sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
-  bash scripts/install-server-docker.sh --version v0.1.0-alpha.14 --port 443
+  bash scripts/install-server-docker.sh --version v0.1.0-alpha.15 --port 443
 ```
 
 The Docker path mounts the downloaded static `tachyon-core` binary into a
@@ -137,6 +137,35 @@ state when requested, summarizes `allowed_targets`, inspects UDP listener state,
 and tails logs with PSK redaction. It does not change firewall rules, cloud
 security groups, Docker, systemd, packet filters, routes, or proxy settings.
 
+## Support Bundle
+
+When asking for help, prefer a read-only support bundle instead of manually
+copying several command outputs:
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh
+sudo bash scripts/collect-server-diagnostics.sh --mode docker
+```
+
+The collector creates a timestamped `tachyon-server-diagnostics-*.tar.gz` in
+the current directory. If chat or email cannot accept archives, generate a
+single text report instead:
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh --format txt
+```
+
+The bundle includes OS/kernel details, Tachyon Core version, config validation
+summary, `allowed_targets` summary, service/container status, UDP listener
+state, redacted journal or Docker log tails, and a redacted `verify-server.sh`
+summary/output. It is intended to be read-only and does not start, stop, reload,
+or reconfigure systemd, Docker, firewall, iptables, nftables, routes, or proxy
+settings.
+
+The collector redacts common PSK, token, UUID, private key, password, and
+subscription/proxy URL forms, but you must still manually inspect the generated
+file before sending it back.
+
 ## VPS Smoke vs Local Smoke
 
 - Local smoke: `scripts/smoke-tgp-relay.sh`; runs only on loopback and proves
@@ -156,7 +185,8 @@ Send:
 - Deployment path: bare metal or Docker.
 - Exact install command with PSK removed.
 - Exact verify command.
-- Full `verify-server.sh` output after reviewing it for secrets.
+- The generated `tachyon-server-diagnostics-*.tar.gz` or `.txt` support bundle
+  after reviewing it for secrets.
 - Whether cloud security group and host firewall allow inbound UDP on
   `server.listen`.
 - Redacted `server.listen` address/port if needed; keep the UDP port visible.
@@ -167,9 +197,10 @@ Send:
 Do not send:
 
 - `tgp.auth.psk`.
-- Full private subscription URLs or tokens.
+- Full private subscription URLs, proxy URLs, tokens, UUIDs, passwords, private
+  keys, or API keys.
 - SSH keys, account IDs, provider console screenshots with unrelated secrets, or
   full public/private infrastructure inventory.
 
-Before posting publicly, review the output even though the verifier redacts
-common PSK forms.
+Before posting publicly, review the output even though the diagnostics scripts
+redact common secret forms.

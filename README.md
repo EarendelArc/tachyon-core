@@ -112,7 +112,7 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 Both installers download the matching Linux ZIP asset from
 `EarendelArc/tachyon-core` GitHub Releases. `--version latest` selects the
 newest release entry, including alpha prereleases; pass an explicit tag such as
-`--version v0.1.0-alpha.14` for reproducible deployment. The Docker path mounts
+`--version v0.1.0-alpha.15` for reproducible deployment. The Docker path mounts
 the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
 container and does not depend on a GHCR image.
 
@@ -133,11 +133,23 @@ sudo bash scripts/verify-server.sh --mode docker
 bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
 ```
 
-Send us the full output when asking for help with VPS relay validation. The
-verify script redacts PSK values and does not change firewall rules, but still
-review the output before posting it publicly. Never paste or publish
-`tgp.auth.psk`; share only whether it is present/non-placeholder and the
-`allowed_targets` summary.
+When asking for help with VPS relay validation, generate a timestamped support
+bundle:
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh
+sudo bash scripts/collect-server-diagnostics.sh --mode docker
+sudo bash scripts/collect-server-diagnostics.sh --format txt
+```
+
+The collector includes OS/kernel details, Core version, config validation,
+`allowed_targets`, service/container status, UDP listener state, redacted log
+tails, and redacted `verify-server.sh` output. It is read-only and does not
+change firewall, Docker, systemd, packet filter, route, or proxy state. Review
+the generated `tachyon-server-diagnostics-*.tar.gz` or `.txt` before sending it
+back. Never paste or publish `tgp.auth.psk`, full private subscription/proxy
+URLs, tokens, UUIDs, private keys, API keys, or passwords; share only whether
+PSK is present/non-placeholder and the `allowed_targets` summary.
 
 See [docs/tgp-server-verification.md](docs/tgp-server-verification.md) for the
 full local smoke and VPS verification checklist.

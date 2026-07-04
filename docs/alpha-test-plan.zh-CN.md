@@ -78,7 +78,7 @@ sudo bash scripts/install-server.sh --port 443 \
 为了让 alpha 测试可复现，建议传入明确 release tag，而不是依赖会变化的 latest：
 
 ```bash
-sudo bash scripts/install-server.sh --version v0.1.0-alpha.14 --port 443 \
+sudo bash scripts/install-server.sh --version v0.1.0-alpha.15 --port 443 \
   --allow-target 'domain=game.example.com,ports=27015'
 ```
 
@@ -94,7 +94,7 @@ sudo bash scripts/install-server.sh --version v0.1.0-alpha.14 --port 443 \
 
 ```bash
 sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
-  bash scripts/install-server-docker.sh --version v0.1.0-alpha.14 --port 443
+  bash scripts/install-server-docker.sh --version v0.1.0-alpha.15 --port 443
 ```
 
 Docker 路径会把下载得到的静态 `tachyon-core` 二进制挂载进
@@ -121,6 +121,30 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 `allowed_targets`，检查 UDP 监听，并在输出日志尾部时隐藏 PSK。它不会修改防火墙规则、
 云安全组、Docker、systemd、包过滤器、路由或代理设置。
 
+## 支持包
+
+需要协助排查时，优先生成只读支持包，而不是手工复制多段命令输出：
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh
+sudo bash scripts/collect-server-diagnostics.sh --mode docker
+```
+
+脚本会在当前目录生成带时间戳的 `tachyon-server-diagnostics-*.tar.gz`。如果聊天或邮件
+不方便发送压缩包，可以生成单个文本报告：
+
+```bash
+sudo bash scripts/collect-server-diagnostics.sh --format txt
+```
+
+支持包包含 OS/kernel、Tachyon Core 版本、配置校验摘要、`allowed_targets` 摘要、
+服务或容器状态、UDP 监听状态、脱敏后的 journal 或 Docker 日志尾部，以及脱敏后的
+`verify-server.sh` 摘要/输出。它只读收集信息，不会启动、停止、重载或重新配置
+systemd、Docker、防火墙、iptables、nftables、路由或代理设置。
+
+脚本会隐藏常见 PSK、token、UUID、private key、password、订阅/代理 URL 形式，
+但回传前仍必须人工检查生成文件。
+
 ## 本地 Smoke 与 VPS Smoke 的区别
 
 - 本地 smoke：`scripts/smoke-tgp-relay.sh`，只在 loopback 上运行，验证 relay 行为，
@@ -140,7 +164,7 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 - 部署路径：裸机或 Docker。
 - 去掉 PSK 后的完整安装命令。
 - 完整验收命令。
-- 检查过敏感信息后的完整 `verify-server.sh` 输出。
+- 人工检查过敏感信息后的 `tachyon-server-diagnostics-*.tar.gz` 或 `.txt` 支持包。
 - 云安全组和宿主防火墙是否允许 `server.listen` 端口的入站 UDP。
 - 如有需要可脱敏 `server.listen` 地址，但保留 UDP 端口。
 - `allowed_targets` 摘要，保留足够排查问题的 CIDR/domain 和 ports。
@@ -150,7 +174,7 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 不要回传：
 
 - `tgp.auth.psk`。
-- 完整私有订阅 URL 或 token。
+- 完整私有订阅 URL、代理 URL、token、UUID、password、private key 或 API key。
 - SSH key、账号 ID、带有无关密钥的云控制台截图，或完整公私有基础设施清单。
 
-公开发布前仍应人工检查输出，即使验收脚本会隐藏常见 PSK 形态。
+公开发布前仍应人工检查输出，即使诊断脚本会隐藏常见敏感信息形态。

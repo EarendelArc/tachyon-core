@@ -142,6 +142,10 @@ review the output before posting it publicly. Never paste or publish
 See [docs/tgp-server-verification.md](docs/tgp-server-verification.md) for the
 full local smoke and VPS verification checklist.
 
+See [docs/alpha-test-plan.md](docs/alpha-test-plan.md) and
+[docs/alpha-test-plan.zh-CN.md](docs/alpha-test-plan.zh-CN.md) for the
+bilingual real VPS alpha relay test plan and redacted result checklist.
+
 See [docs/ipc-api.md](docs/ipc-api.md) and
 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md) for Prism/Core IPC design notes.
 See [docs/tgp-spec.md](docs/tgp-spec.md) for the TGP wire format.

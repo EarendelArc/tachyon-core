@@ -129,4 +129,8 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 完整的本地 smoke 和 VPS 验收清单请见
 [docs/tgp-server-verification.zh-CN.md](docs/tgp-server-verification.zh-CN.md)。
 
+真实 VPS alpha relay 测试计划和脱敏回传清单请见
+[docs/alpha-test-plan.md](docs/alpha-test-plan.md) 和
+[docs/alpha-test-plan.zh-CN.md](docs/alpha-test-plan.zh-CN.md)。
+
 Prism/Core IPC 设计请见 [docs/ipc-api.md](docs/ipc-api.md) 和 [docs/ipc-api.zh-CN.md](docs/ipc-api.zh-CN.md)。TGP 线缆格式请见 [docs/tgp-spec.md](docs/tgp-spec.md)。Prism 使用的 GitHub Release 资产说明请见 [docs/release.md](docs/release.md)。

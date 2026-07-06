@@ -264,7 +264,7 @@ func TestServerConfigTemplateContainsRequiredFields(t *testing.T) {
 
 func TestUsageContainsCommandNames(t *testing.T) {
 	usage := Usage()
-	commands := []string{"run", "validate", "generate-config", "version"}
+	commands := []string{"run", "validate", "doctor", "preflight", "generate-config", "version"}
 	for _, cmd := range commands {
 		if !contains(usage, cmd) {
 			t.Errorf("usage missing command: %s", cmd)

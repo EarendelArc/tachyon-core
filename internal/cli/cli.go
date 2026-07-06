@@ -112,6 +112,10 @@ func Usage() string {
 		"    --config/-c     Path to config file (default: config.json)\n\n" +
 		"  validate          Validate a config file (does not start daemon)\n" +
 		"    --config/-c     Path to config file (default: config.json)\n\n" +
+		"  doctor            Print read-only startup preflight diagnostics as JSON\n" +
+		"  preflight         Alias for doctor\n" +
+		"    --config/-c     Path to config file (default: config.json)\n" +
+		"    --json          Emit structured JSON for Prism/Core orchestration\n\n" +
 		"  generate-config   Print a JSON config template to stdout\n" +
 		"    --mode/-m       \"client\" or \"server\" (default: client)\n\n" +
 		"  version           Print version information\n\n" +
@@ -120,6 +124,9 @@ func Usage() string {
 		"  tachyon-core run --config /etc/tachyon/client.json\n\n" +
 		"  # Validate a config file\n" +
 		"  tachyon-core validate --config client.json\n\n" +
+		"  # Explain TUN/Wintun/permission readiness without starting Core\n" +
+		"  tachyon-core doctor --config client.json --json\n" +
+		"  tachyon-core preflight --config client.json --json\n\n" +
 		"  # Generate a client config template\n" +
 		"  tachyon-core generate-config --mode client > client.json\n"
 }

@@ -1,0 +1,257 @@
+package doctor
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestRunWithFactsClientJSONSchemaAndStatus(t *testing.T) {
+	path := writeClientConfig(t, true)
+	report := RunWithFacts(path, PlatformFacts{
+		OS:               "linux",
+		Arch:             "amd64",
+		LinuxTunExists:   true,
+		LinuxTunOpenable: true,
+		LinuxCAPKnown:    true,
+		LinuxCAPNetAdmin: true,
+	})
+
+	if report.OverallStatus != StatusOK {
+		t.Fatalf("overall_status = %q, want ok; checks=%#v", report.OverallStatus, report.Checks)
+	}
+	if !report.Config.Valid || report.Mode.Value != "client" || !report.Client.Valid || report.Server.Valid {
+		t.Fatalf("unexpected config/mode summary: %#v", report)
+	}
+	if !report.ClientRequiresTUN || !report.Client.RequiresTUN {
+		t.Fatal("client report should require TUN")
+	}
+	if !report.AutoRoute || report.DNSHijack {
+		t.Fatalf("unexpected tun flags: auto_route=%v dns_hijack=%v", report.AutoRoute, report.DNSHijack)
+	}
+
+	data, err := report.JSON()
+	if err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	var parsed struct {
+		OverallStatus string `json:"overall_status"`
+		Checks        []struct {
+			ID          string `json:"id"`
+			Status      string `json:"status"`
+			Message     string `json:"message"`
+			Remediation string `json:"remediation"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+	if parsed.OverallStatus != "ok" {
+		t.Fatalf("json overall_status = %q", parsed.OverallStatus)
+	}
+	for _, id := range []string{CheckConfigValid, CheckClientRequiresTUN, CheckAutoRouteDisabled, CheckTUNDevicePresent, CheckTUNPrivilege} {
+		if !hasCheck(report.Checks, id) {
+			t.Fatalf("missing check id %s in %#v", id, report.Checks)
+		}
+	}
+}
+
+func TestRunWithFactsAutoRouteFalseExplainsTUNStillRequired(t *testing.T) {
+	path := writeClientConfig(t, false)
+	report := RunWithFacts(path, PlatformFacts{
+		OS:               "linux",
+		Arch:             "amd64",
+		LinuxTunExists:   true,
+		LinuxTunOpenable: true,
+		LinuxCAPKnown:    true,
+		LinuxCAPNetAdmin: true,
+	})
+
+	if report.OverallStatus != StatusWarn {
+		t.Fatalf("overall_status = %q, want warn", report.OverallStatus)
+	}
+	check := findCheck(report.Checks, CheckAutoRouteDisabled)
+	if check.Status != StatusWarn {
+		t.Fatalf("AUTO_ROUTE_DISABLED status = %q, want warn", check.Status)
+	}
+	if !strings.Contains(check.Message, "does not mean TUN is unnecessary") {
+		t.Fatalf("auto_route=false message does not explain TUN requirement: %q", check.Message)
+	}
+}
+
+func TestRunWithFactsInvalidConfigReturnsJSONErrorReport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(path, []byte(`{"mode":"client"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	report := RunWithFacts(path, PlatformFacts{OS: "linux", Arch: "amd64"})
+	if report.OverallStatus != StatusError {
+		t.Fatalf("overall_status = %q, want error", report.OverallStatus)
+	}
+	if report.Config.Valid {
+		t.Fatal("config should be invalid")
+	}
+	if findCheck(report.Checks, CheckConfigValid).Status != StatusError {
+		t.Fatalf("CONFIG_VALID should be error: %#v", report.Checks)
+	}
+	if _, err := report.JSON(); err != nil {
+		t.Fatalf("invalid config report should still marshal: %v", err)
+	}
+}
+
+func TestLinuxChecksArePureAndReportDeviceAndCapability(t *testing.T) {
+	checks := linuxChecks(PlatformFacts{
+		OS:               "linux",
+		LinuxTunExists:   false,
+		LinuxCAPKnown:    true,
+		LinuxCAPNetAdmin: false,
+	})
+
+	if findCheck(checks, CheckTUNDevicePresent).Status != StatusError {
+		t.Fatalf("missing /dev/net/tun should be error: %#v", checks)
+	}
+	priv := findCheck(checks, CheckTUNPrivilege)
+	if priv.Status != StatusError || !strings.Contains(priv.Message, "CAP_NET_ADMIN") {
+		t.Fatalf("missing CAP_NET_ADMIN should be error with remediation context: %#v", priv)
+	}
+}
+
+func TestWindowsChecksArePureAndReportDLLAndElevation(t *testing.T) {
+	checks := windowsChecks(PlatformFacts{
+		OS:                "windows",
+		WintunDLLFound:    false,
+		WindowsAdminKnown: true,
+		WindowsAdmin:      false,
+	})
+
+	if findCheck(checks, CheckWintunDLLPresent).Status != StatusError {
+		t.Fatalf("missing wintun.dll should be error: %#v", checks)
+	}
+	priv := findCheck(checks, CheckTUNPrivilege)
+	if priv.Status != StatusError || !strings.Contains(priv.Message, "Administrator") {
+		t.Fatalf("non-elevated Windows should be error: %#v", priv)
+	}
+}
+
+func TestWindowsChecksReportFoundDLLWithoutLoading(t *testing.T) {
+	checks := windowsChecks(PlatformFacts{
+		OS:                "windows",
+		WintunDLLFound:    true,
+		WintunDLLPath:     `C:\Tachyon\wintun.dll`,
+		WindowsAdminKnown: true,
+		WindowsAdmin:      true,
+	})
+
+	dll := findCheck(checks, CheckWintunDLLPresent)
+	if dll.Status != StatusOK {
+		t.Fatalf("found wintun.dll should be ok: %#v", dll)
+	}
+	if strings.Contains(strings.ToLower(dll.Message), "loaded") {
+		t.Fatalf("WINTUN_DLL_PRESENT must not imply DLL loading: %q", dll.Message)
+	}
+	if findCheck(checks, CheckTUNPrivilege).Status != StatusOK {
+		t.Fatalf("elevated Windows should pass privilege check: %#v", checks)
+	}
+}
+
+func TestWindowsDoctorImplementationDoesNotLoadDLL(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(file), "platform_windows.go"))
+	if err != nil {
+		t.Fatalf("read platform_windows.go: %v", err)
+	}
+	source := string(data)
+	for _, forbidden := range []string{"LoadDLL", "LoadLibrary"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("doctor Windows preflight must not call %s", forbidden)
+		}
+	}
+}
+
+func TestDarwinChecksArePureAndReadOnlyWarning(t *testing.T) {
+	checks := darwinChecks(PlatformFacts{
+		OS:                  "darwin",
+		DarwinIfconfigFound: true,
+		DarwinIfconfigPath:  "/sbin/ifconfig",
+		DarwinRouteFound:    true,
+		DarwinRoutePath:     "/sbin/route",
+	})
+
+	priv := findCheck(checks, CheckTUNPrivilege)
+	if priv.Status != StatusWarn || !strings.Contains(priv.Message, "read-only") {
+		t.Fatalf("macOS TUN privilege check should be read-only warning: %#v", priv)
+	}
+	if findCheck(checks, CheckIfconfigPresent).Status != StatusOK {
+		t.Fatalf("ifconfig should be ok: %#v", checks)
+	}
+	if findCheck(checks, CheckRoutePresent).Status != StatusOK {
+		t.Fatalf("route should be ok: %#v", checks)
+	}
+}
+
+func TestReadCapNetAdmin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status")
+	if err := os.WriteFile(path, []byte("Name:\ttachyon\nCapEff:\t0000000000001000\n"), 0o600); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+	hasCap, known, err := readCapNetAdmin(path)
+	if err != nil {
+		t.Fatalf("read cap: %v", err)
+	}
+	if !known || !hasCap {
+		t.Fatalf("CAP_NET_ADMIN should be known and present, known=%v has=%v", known, hasCap)
+	}
+}
+
+func writeClientConfig(t *testing.T, autoRoute bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "client.json")
+	autoRouteValue := "false"
+	if autoRoute {
+		autoRouteValue = "true"
+	}
+	data := `{
+  "mode": "client",
+  "client": {
+    "tun": {
+      "auto_route": ` + autoRouteValue + `,
+      "dns_hijack": false
+    },
+    "proxy": {
+      "server_addr": "game.example.com:443"
+    }
+  },
+  "tgp": {
+    "fec": {
+      "data_shards": 4
+    },
+    "pacing": {
+      "initial_rate_pps": 128
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func hasCheck(checks []Check, id string) bool {
+	return findCheck(checks, id).ID != ""
+}
+
+func findCheck(checks []Check, id string) Check {
+	for _, check := range checks {
+		if check.ID == id {
+			return check
+		}
+	}
+	return Check{}
+}

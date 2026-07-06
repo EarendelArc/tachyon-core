@@ -11,6 +11,10 @@ traffic instead of general TCP proxying.
 # Validate config without starting the daemon
 tachyon-core validate --config client.json
 
+# Explain client TUN/Wintun/permission readiness without starting the daemon
+tachyon-core doctor --config client.json --json
+tachyon-core preflight --config client.json --json
+
 # Start the core daemon
 tachyon-core run --config client.json
 tachyon-core run --config server.json
@@ -31,7 +35,10 @@ tachyonctl health --addr 127.0.0.1:55123
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.
 - Client TUN defaults to TGP-only safe mode: `auto_route` and `dns_hijack` are
-  off unless explicitly enabled by Prism or a hand-written config.
+  off unless explicitly enabled by Prism or a hand-written config. In client
+  mode, `auto_route=false` only means Core will not install a system default
+  route through the TUN device; Core still needs TUN/Wintun and the required
+  OS privileges to start the packet pipeline.
 - JSON is the canonical Core config format. Legacy YAML is accepted only for
   early developer compatibility.
 - Relative file paths in Core JSON are resolved from the directory that contains
@@ -65,6 +72,7 @@ validation with elevated adapter creation on real Windows hosts.
 | Local HTTP routing bridge compatibility | Done |
 | tachyonctl health CLI | Done |
 | tachyon-core validate (dry-run) | Done |
+| tachyon-core doctor/preflight (read-only) | Done |
 | Linux TUN and PID tracking | Done |
 | Windows PID tracking | Done |
 | macOS TUN | Done |
@@ -84,7 +92,20 @@ mise install
 mise exec -- go test ./...
 mise exec -- go build ./...
 mise exec -- go run ./cmd/tachyon-core generate-config --mode client > client.json
+mise exec -- go run ./cmd/tachyon-core doctor --config client.json --json
+mise exec -- go run ./cmd/tachyon-core preflight --config client.json --json
 ```
+
+`tachyon-core doctor` is a read-only preflight command intended for Prism
+startup orchestration. `tachyon-core preflight` is an equivalent alias; use
+whichever command name is clearer for the caller. Both commands load and
+validate the config, report the current `auto_route` and `dns_hijack` values,
+explain whether client mode requires TUN, and emit stable JSON checks such as
+`CONFIG_VALID`,
+`CLIENT_REQUIRES_TUN`, `WINTUN_DLL_PRESENT`, `TUN_DEVICE_PRESENT`,
+`TUN_PRIVILEGE`, and `AUTO_ROUTE_DISABLED`. They do not create a persistent TUN
+adapter, change routes, start services, launch the daemon, or alter firewall,
+system proxy, Docker, systemd, or packet filter state.
 
 Before deploying a VPS, run the local TGP relay smoke test:
 

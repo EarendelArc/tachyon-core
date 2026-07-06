@@ -5,6 +5,7 @@
 //	tachyon-core run --config /etc/tachyon/config.json
 //	tachyon-core version
 //	tachyon-core validate --config config.json
+//	tachyon-core doctor --config config.json --json
 //	tachyon-core generate-config --mode client > config.json
 //	tachyon-core generate-config --mode server > config.json
 package main
@@ -20,6 +21,7 @@ import (
 	"github.com/tachyon-space/tachyon-core/internal/app"
 	"github.com/tachyon-space/tachyon-core/internal/cli"
 	"github.com/tachyon-space/tachyon-core/internal/config"
+	"github.com/tachyon-space/tachyon-core/internal/doctor"
 )
 
 // Version is injected at build time via -ldflags.
@@ -56,6 +58,9 @@ func run(args []string) error {
 
 	case "validate":
 		return cmdValidateConfig(args[1:])
+
+	case "doctor", "preflight":
+		return cmdDoctor(args[1:])
 
 	case "run":
 		return cmdRun(args[1:])
@@ -114,6 +119,21 @@ func cmdValidateConfig(args []string) error {
 		return err
 	}
 	fmt.Printf("config %q is valid (mode: %s)\n", configPath, mode)
+	return nil
+}
+
+func cmdDoctor(args []string) error {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+	}
+	configPath := cli.FlagValue(args, "--config", "-c", "config.json")
+	report := doctor.Run(configPath)
+	data, err := report.JSON()
+	if err != nil {
+		return fmt.Errorf("render doctor report: %w", err)
+	}
+	fmt.Println(string(data))
 	return nil
 }
 

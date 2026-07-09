@@ -89,9 +89,12 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 预发布版本；生产环境如需可复现部署，应显式传入 `--version v0.1.0-alpha.14`
 或更新后的固定 tag。
 
-裸机脚本将二进制安装到 `/opt/tachyon` 并创建 systemd 服务；Docker 脚本会把
-下载的静态二进制放入 `/opt/tachyon-docker/bin`，再挂载到
-`debian:bookworm-slim` 容器中运行，避免依赖尚未发布的 GHCR 镜像。
+裸机脚本将二进制安装到 `/opt/tachyon` 并创建加固后的 systemd 服务。脚本可以代管
+ufw；如果 SSH 使用非 22 端口，应传入 `--ssh-port PORT`，如果防火墙由云安全组、
+nftables、firewalld 或自定义策略管理，应传入 `--no-firewall` 并自行放行端口。Docker
+脚本会把下载的静态二进制放入 `/opt/tachyon-docker/bin`，再挂载到
+`debian:bookworm-slim` 容器中运行，避免依赖尚未发布的 GHCR 镜像；Docker 部署不会修改
+宿主机防火墙，并且有意使用 host network 来避免 UDP NAT/userland proxy 带来的额外抖动。
 
 两个脚本都会在未提供 `TACHYON_PSK` 时生成新的 `tgp.auth.psk`。服务端 Relay
 默认不会成为开放 UDP relay：安装脚本会从 `--allow-target` 参数或分号分隔的
@@ -102,6 +105,12 @@ Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制
 `0.0.0.0/0`、`::/0` 和未显式填写端口的条目。生成配置也会写入 Relay 资源上限默认值：
 `max_sessions`、`session_queue_size`、`handler_concurrency`、`max_flows` 和
 `max_flows_per_session`。
+
+裸机 systemd 服务以 `tachyon` 用户运行，只保留 `CAP_NET_BIND_SERVICE`，启用
+`NoNewPrivileges`、系统路径只读、私有临时目录、受限地址族，并且只允许 Tachyon 日志目录
+可写。Docker compose 部署启用只读 rootfs、`no-new-privileges`、`cap_drop: [ALL]`、
+`cap_add: [NET_BIND_SERVICE]`、tmpfs 临时目录、配置校验健康检查和
+`restart: unless-stopped`。
 
 部署后请按对应模式运行 `scripts/verify-server.sh` 收集只读诊断，再继续使用真实客户端
 和游戏 UDP 流量测试。

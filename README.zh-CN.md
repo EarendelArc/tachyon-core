@@ -91,6 +91,7 @@ ACL allow/deny、默认 deny-all、通配全网目标拒绝，以及 echo-like U
 
 ```bash
 sudo bash scripts/install-server.sh --port 443 \
+  --ssh-port 22 \
   --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
 
 sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
@@ -103,6 +104,17 @@ Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 al
 `--version v0.1.0-alpha.15`。Docker 部署会把下载得到的静态
 `tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
 镜像。
+
+裸机安装脚本可以代管 ufw。脚本会先放行 Tachyon UDP 端口和 SSH TCP 端口，再启用
+ufw；如果服务器 SSH 不是 22 端口，请传入 `--ssh-port PORT`，如果你使用云防火墙、
+nftables、firewalld 或自定义主机防火墙策略，请传入 `--no-firewall` 并自行放行端口。
+生成的 systemd 服务以 `tachyon` 用户运行，只保留 `CAP_NET_BIND_SERVICE`，系统目录只读，
+仅日志目录保持可写。
+
+Docker 安装脚本为了降低游戏 UDP 抖动，仍然有意使用 `network_mode: host`，避免 Docker
+NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-new-privileges、丢弃
+默认 capabilities、仅恢复 `NET_BIND_SERVICE`、tmpfs 临时目录、健康检查和
+`restart: unless-stopped`。Docker 脚本不会修改宿主机防火墙规则。
 
 服务端 Relay 默认采用 fail-closed 安全策略。安装脚本会生成新的
 `tgp.auth.psk` 并写入 `server.json`，需要把该 PSK 复制到 Prism 的 Tachyon

@@ -6,11 +6,12 @@
 #
 # Usage:
 #   sudo bash scripts/install-server.sh --port 443 --version latest \
+#     --ssh-port 22 \
 #     --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
 #
 # Or:
 #   sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
-#     bash scripts/install-server.sh --port 443
+#     bash scripts/install-server.sh --port 443 --no-firewall
 
 set -euo pipefail
 
@@ -25,6 +26,8 @@ TACHYON_VERSION="latest"
 UNINSTALL=false
 TACHYON_PSK="${TACHYON_PSK:-}"
 TACHYON_ALLOWED_TARGETS="${TACHYON_ALLOWED_TARGETS:-}"
+CONFIGURE_FIREWALL="${TACHYON_CONFIGURE_FIREWALL:-true}"
+SSH_PORT="${TACHYON_SSH_PORT:-22}"
 ALLOWED_TARGET_INPUTS=()
 ALLOWED_TARGET_OBJECTS=()
 ALLOWED_TARGETS_JSON="[]"
@@ -36,19 +39,75 @@ TACHYON_USER="tachyon"
 GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
 GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
 
+usage() {
+  cat <<'USAGE'
+Tachyon Core bare-metal TGP server installer for Debian / Ubuntu.
+
+USAGE:
+  sudo bash scripts/install-server.sh [options]
+
+OPTIONS:
+  --port PORT                  UDP listen port for Tachyon TGP (default: 443)
+  --version TAG|latest         Release tag to install (default: latest)
+  --allow-target SPEC          Relay ACL entry; repeatable. Example:
+                               cidr=198.51.100.0/24,ports=27015-27050
+  --ssh-port PORT              SSH TCP port to keep open before enabling ufw
+                               (default: 22, or TACHYON_SSH_PORT)
+  --no-firewall                Do not install/configure/enable ufw. Use this
+                               when cloud firewalls or custom host firewalls are
+                               managed separately.
+  --uninstall                  Remove tachyon-core, config, logs, and service
+  -h, --help                   Show this help
+
+ENV:
+  TACHYON_PSK                  Existing shared TGP PSK; generated if omitted
+  TACHYON_ALLOWED_TARGETS      Semicolon-separated relay ACL entries
+  TACHYON_CONFIGURE_FIREWALL   true/false; same effect as --no-firewall
+  TACHYON_SSH_PORT             SSH TCP port to keep open
+
+Firewall safety:
+  The default path keeps non-interactive deployment compatible: it opens
+  TCP/$TACHYON_SSH_PORT (default 22) and UDP/$TACHYON_PORT before `ufw --force
+  enable`. On hosts using a non-standard SSH port, pass --ssh-port explicitly or
+  pass --no-firewall and configure the firewall yourself.
+USAGE
+}
+
+require_option_value() {
+  local option="$1"
+  if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+    die "$option requires a value"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)
-      [[ $# -ge 2 ]] || die "--port requires a value"
+      require_option_value "$@"
       PORT="$2"
       shift 2
       ;;
-    --version)   TACHYON_VERSION="$2"; shift 2 ;;
+    --version)
+      require_option_value "$@"
+      TACHYON_VERSION="$2"
+      shift 2
+      ;;
     --allow-target)
+      require_option_value "$@"
       ALLOWED_TARGET_INPUTS+=("$2")
       shift 2
       ;;
+    --ssh-port)
+      require_option_value "$@"
+      SSH_PORT="$2"
+      shift 2
+      ;;
+    --no-firewall)
+      CONFIGURE_FIREWALL=false
+      shift
+      ;;
     --uninstall) UNINSTALL=true;       shift ;;
+    -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
 done
@@ -58,12 +117,29 @@ check_root() {
 }
 
 validate_listen_port() {
+  validate_port "$1" "listen port"
+}
+
+validate_ssh_port() {
+  validate_port "$1" "SSH port"
+}
+
+validate_port() {
   local raw="$1"
+  local label="$2"
   [[ "$raw" =~ ^[0-9]+$ && ${#raw} -le 5 ]] \
-    || die "listen port must be a number from 1 to 65535"
+    || die "$label must be a number from 1 to 65535"
   local port=$((10#$raw))
   (( port >= 1 && port <= 65535 )) \
-    || die "listen port must be in range 1..65535: $raw"
+    || die "$label must be in range 1..65535: $raw"
+}
+
+firewall_enabled() {
+  case "${CONFIGURE_FIREWALL,,}" in
+    true|1|yes|on) return 0 ;;
+    false|0|no|off) return 1 ;;
+    *) die "TACHYON_CONFIGURE_FIREWALL must be true or false: $CONFIGURE_FIREWALL" ;;
+  esac
 }
 
 resolve_latest() {
@@ -196,7 +272,11 @@ collect_allowed_targets() {
 install_deps() {
   info "Installing dependencies..."
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl jq unzip ufw
+  local packages=(ca-certificates curl jq unzip)
+  if firewall_enabled; then
+    packages+=(ufw)
+  fi
+  apt-get install -y -qq "${packages[@]}"
   success "Dependencies installed."
 }
 
@@ -287,6 +367,22 @@ Wants=network-online.target
 Type=simple
 User=$TACHYON_USER
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=$LOG_DIR
+WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/tachyon-core run --config $CONFIG_DIR/server.json
 Restart=on-failure
 RestartSec=5
@@ -308,10 +404,22 @@ UNIT
 }
 
 configure_firewall() {
-  ufw allow 22/tcp comment "SSH" || true
-  ufw allow "$PORT"/udp comment "Tachyon TGP" || true
+  if ! firewall_enabled; then
+    warn "Skipping ufw configuration because --no-firewall/TACHYON_CONFIGURE_FIREWALL=false was set."
+    warn "Manually allow inbound UDP/$PORT and keep your SSH TCP port open."
+    return 0
+  fi
+
+  validate_ssh_port "$SSH_PORT"
+  command -v ufw >/dev/null 2>&1 || die "ufw is not installed; rerun without --no-firewall or install ufw manually"
+  warn "Preparing ufw rules before enabling firewall: SSH TCP/$SSH_PORT and Tachyon UDP/$PORT."
+  warn "If SSH uses a different port, rerun with --ssh-port PORT or --no-firewall."
+  ufw allow "$SSH_PORT"/tcp comment "SSH" \
+    || die "failed to add ufw SSH allow rule for TCP/$SSH_PORT; firewall was not enabled"
+  ufw allow "$PORT"/udp comment "Tachyon TGP" \
+    || die "failed to add ufw Tachyon allow rule for UDP/$PORT; firewall was not enabled"
   ufw --force enable
-  success "Firewall configured for UDP/$PORT."
+  success "Firewall configured for UDP/$PORT and SSH TCP/$SSH_PORT."
 }
 
 uninstall() {
@@ -326,6 +434,7 @@ uninstall() {
 
 main() {
   validate_listen_port "$PORT"
+  validate_ssh_port "$SSH_PORT"
   check_root
   if [[ "$UNINSTALL" == "true" ]]; then
     uninstall

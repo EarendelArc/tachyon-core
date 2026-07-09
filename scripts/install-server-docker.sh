@@ -24,19 +24,60 @@ COMPOSE_DIR="/opt/tachyon-docker"
 GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
 GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
 
+usage() {
+  cat <<'USAGE'
+Tachyon Core Docker TGP server deployment for Debian / Ubuntu.
+
+USAGE:
+  sudo bash scripts/install-server-docker.sh [options]
+
+OPTIONS:
+  --port PORT                  UDP listen port for Tachyon TGP (default: 443)
+  --version TAG|latest         Release tag to install (default: latest)
+  --allow-target SPEC          Relay ACL entry; repeatable. Example:
+                               cidr=198.51.100.0/24,ports=27015-27050
+  --uninstall                  Remove Docker compose deployment and service
+  -h, --help                   Show this help
+
+ENV:
+  TACHYON_PSK                  Existing shared TGP PSK; generated if omitted
+  TACHYON_ALLOWED_TARGETS      Semicolon-separated relay ACL entries
+
+Security notes:
+  This deployment intentionally uses host networking to avoid Docker NAT/userland
+  proxy jitter on latency-sensitive UDP. The container is still hardened with a
+  read-only root filesystem, no-new-privileges, dropped capabilities, and only
+  CAP_NET_BIND_SERVICE restored for low-port UDP binding. Configure host/cloud
+  firewalls separately; this script does not change firewall rules.
+USAGE
+}
+
+require_option_value() {
+  local option="$1"
+  if [[ $# -lt 2 || "${2:-}" == --* ]]; then
+    die "$option requires a value"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)
-      [[ $# -ge 2 ]] || die "--port requires a value"
+      require_option_value "$@"
       PORT="$2"
       shift 2
       ;;
-    --version)   TACHYON_VERSION="$2"; shift 2 ;;
+    --version)
+      require_option_value "$@"
+      TACHYON_VERSION="$2"
+      shift 2
+      ;;
     --allow-target)
+      require_option_value "$@"
       ALLOWED_TARGET_INPUTS+=("$2")
       shift 2
       ;;
     --uninstall) UNINSTALL=true;       shift ;;
+    -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
 done
@@ -281,12 +322,31 @@ services:
     image: debian:bookworm-slim
     container_name: tachyon-core
     restart: unless-stopped
+    # Host networking avoids Docker NAT/userland proxy jitter for latency-sensitive UDP.
+    # Risk is reduced by read-only rootfs, no-new-privileges, and a single restored cap.
     network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+      - /run:rw,noexec,nosuid,nodev,size=8m
+    pids_limit: 512
     volumes:
       - $COMPOSE_DIR/bin/tachyon-core:/opt/tachyon/tachyon-core:ro
       - $COMPOSE_DIR/config/server.json:/etc/tachyon/server.json:ro
-      - $COMPOSE_DIR/logs:/var/log/tachyon
+      - $COMPOSE_DIR/logs:/var/log/tachyon:rw
     command: ["/opt/tachyon/tachyon-core", "run", "--config", "/etc/tachyon/server.json"]
+    healthcheck:
+      test: [ "CMD", "/opt/tachyon/tachyon-core", "validate", "--config", "/etc/tachyon/server.json" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     ulimits:
       nofile:
         soft: 1048576
@@ -297,7 +357,6 @@ YAML
 
 start_services() {
   docker compose -f "$COMPOSE_DIR/docker-compose.yaml" pull --quiet
-  docker compose -f "$COMPOSE_DIR/docker-compose.yaml" up -d
   cat > /etc/systemd/system/tachyon-docker.service <<UNIT
 [Unit]
 Description=Tachyon Core Docker TGP relay
@@ -305,17 +364,24 @@ After=docker.service network-online.target
 Requires=docker.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 WorkingDirectory=$COMPOSE_DIR
-ExecStart=/usr/bin/docker compose up -d --remove-orphans
-ExecStop=/usr/bin/docker compose down
+ExecStartPre=/usr/bin/docker compose -f $COMPOSE_DIR/docker-compose.yaml config -q
+ExecStart=/usr/bin/docker compose -f $COMPOSE_DIR/docker-compose.yaml up --remove-orphans
+ExecStop=/usr/bin/docker compose -f $COMPOSE_DIR/docker-compose.yaml down
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable tachyon-docker
+  systemctl enable --now tachyon-docker
   success "Docker service started on UDP/$PORT."
 }
 

@@ -384,6 +384,60 @@ check_docker() {
   fi
   print_cmd docker inspect -f '{{.Name}} status={{.State.Status}} running={{.State.Running}} restart={{.RestartCount}} started={{.State.StartedAt}}' "$container"
 
+  local health
+  health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || true)
+  case "$health" in
+    healthy)
+      success "docker healthcheck is healthy"
+      ;;
+    starting)
+      warn "docker healthcheck is still starting"
+      ;;
+    unhealthy)
+      fail "docker healthcheck is unhealthy"
+      ;;
+    none|"")
+      warn "docker container has no healthcheck"
+      ;;
+    *)
+      warn "docker healthcheck status: $health"
+      ;;
+  esac
+
+  section "Docker security posture"
+  local network_mode readonly_rootfs security_opts cap_drop cap_add
+  network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container" 2>/dev/null || true)
+  readonly_rootfs=$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$container" 2>/dev/null || true)
+  security_opts=$(docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$container" 2>/dev/null || true)
+  cap_drop=$(docker inspect -f '{{json .HostConfig.CapDrop}}' "$container" 2>/dev/null || true)
+  cap_add=$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$container" 2>/dev/null || true)
+
+  if [[ "$network_mode" == "host" ]]; then
+    success "network_mode=host (expected for low-jitter UDP relay)"
+  else
+    warn "network_mode is $network_mode; host networking is expected for the packaged Docker deployment"
+  fi
+  if [[ "$readonly_rootfs" == "true" ]]; then
+    success "container root filesystem is read-only"
+  else
+    warn "container root filesystem is writable"
+  fi
+  if [[ "$security_opts" == *"no-new-privileges:true"* ]]; then
+    success "no-new-privileges is enabled"
+  else
+    warn "no-new-privileges is not enabled"
+  fi
+  if [[ "$cap_drop" == *"ALL"* ]]; then
+    success "container drops all default capabilities"
+  else
+    warn "container does not drop all default capabilities"
+  fi
+  if [[ "$cap_add" == *"NET_BIND_SERVICE"* ]]; then
+    success "container restores only the low-port bind capability"
+  else
+    warn "container does not explicitly restore NET_BIND_SERVICE"
+  fi
+
   if [[ -f "$compose_dir/docker-compose.yaml" ]]; then
     success "docker compose file exists: $compose_dir/docker-compose.yaml"
   else

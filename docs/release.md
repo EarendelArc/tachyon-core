@@ -96,11 +96,14 @@ The bare-metal and Docker server installers consume the same release ZIP assets:
 
 - `scripts/install-server.sh` downloads `tachyon-core_<tag>_linux_<arch>.zip`,
   extracts `tachyon-core`, installs it under `/opt/tachyon`, and creates a
-  systemd service.
+  hardened systemd service. It can configure ufw, but operators should pass
+  `--ssh-port PORT` for non-standard SSH ports or `--no-firewall` when firewall
+  state is managed elsewhere.
 - `scripts/install-server-docker.sh` downloads the same Linux ZIP, stores the
   binary under `/opt/tachyon-docker/bin`, and mounts it into a
   `debian:bookworm-slim` container. The Docker deployment does not require a
-  GHCR image.
+  GHCR image, does not change host firewall rules, and uses host networking
+  intentionally to avoid UDP NAT/userland proxy jitter.
 
 Both scripts resolve `--version latest` from the releases list instead of the
 GitHub `latest` endpoint so alpha prereleases remain deployable during the
@@ -117,6 +120,14 @@ installers reject `0.0.0.0/0`, `::/0`, and entries without explicit ports.
 Generated configs also include the relay resource-limit defaults
 (`max_sessions`, `session_queue_size`, `handler_concurrency`, `max_flows`, and
 `max_flows_per_session`).
+
+The bare-metal systemd service runs as the `tachyon` user, keeps only
+`CAP_NET_BIND_SERVICE`, applies `NoNewPrivileges`, read-only system paths,
+private temporary storage, restricted address families, and writes only to the
+Tachyon log directory. The Docker compose deployment uses a read-only root
+filesystem, `no-new-privileges`, `cap_drop: [ALL]`, `cap_add:
+[NET_BIND_SERVICE]`, tmpfs scratch paths, a config validation healthcheck, and
+`restart: unless-stopped`.
 
 After deployment, run `scripts/verify-server.sh` in the matching mode to collect
 read-only diagnostics before testing with real clients and game UDP traffic.

@@ -124,6 +124,7 @@ validation.
 
 ```bash
 sudo bash scripts/install-server.sh --port 443 \
+  --ssh-port 22 \
   --allow-target 'cidr=198.51.100.0/24,ports=27015-27050'
 
 sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
@@ -136,6 +137,20 @@ newest release entry, including alpha prereleases; pass an explicit tag such as
 `--version v0.1.0-alpha.15` for reproducible deployment. The Docker path mounts
 the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
 container and does not depend on a GHCR image.
+
+The bare-metal installer can manage ufw for you. It opens the configured
+Tachyon UDP port and keeps the SSH TCP port open before enabling ufw; pass
+`--ssh-port PORT` on non-standard SSH hosts, or pass `--no-firewall` when a
+cloud firewall, nftables, firewalld, or custom host policy is managed
+separately. The generated systemd unit runs as the `tachyon` user, keeps only
+`CAP_NET_BIND_SERVICE`, makes system paths read-only, and leaves only the log
+directory writable.
+
+The Docker installer intentionally uses `network_mode: host` to avoid Docker
+NAT/userland proxy jitter for latency-sensitive UDP. The compose file is still
+hardened with a read-only root filesystem, no-new-privileges, dropped default
+capabilities, only `NET_BIND_SERVICE` restored, tmpfs scratch space, a health
+check, and `restart: unless-stopped`. It does not modify host firewall rules.
 
 Server relay security is fail-closed. The installer generates a fresh
 `tgp.auth.psk` and writes it to `server.json`; copy that PSK into the Prism

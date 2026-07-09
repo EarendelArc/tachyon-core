@@ -21,6 +21,7 @@ OPTIONS:
 The smoke test covers:
   - PSK-authenticated handshake succeeds
   - missing/wrong PSK handshakes are rejected
+  - config-driven client/server wiring creates a working TGP relay path
   - UDP echo-like relay works for an allowed target
   - allowed_targets blocks denied ports and unknown targets
   - wildcard relay targets are rejected; empty ACL remains deny-all
@@ -40,7 +41,7 @@ done
 SCRIPT_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_PACKAGE="./internal/app"
-TEST_REGEX="^TestTGPRelaySmokeVerification$"
+TEST_REGEX="^TestTGPRelay(SmokeVerification|ConfigDrivenSmoke)$"
 
 cd "$REPO_ROOT"
 

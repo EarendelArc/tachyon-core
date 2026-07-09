@@ -15,20 +15,22 @@ bash scripts/smoke-tgp-relay.sh
 Equivalent direct command:
 
 ```bash
-mise exec -- go test ./internal/app -run '^TestTGPRelaySmokeVerification$' -count=1 -v
+mise exec -- go test ./internal/app -run '^TestTGPRelay(SmokeVerification|ConfigDrivenSmoke)$' -count=1 -v
 ```
 
 The smoke test only binds temporary `127.0.0.1` UDP ports. It verifies:
 
 - PSK-authenticated TGP handshake succeeds.
 - Missing or wrong PSK handshakes are rejected.
+- Config-driven client/server settings can be wired into a working TGP relay
+  path.
 - An allowed UDP target receives an echo-like relay round trip.
 - Denied ports and unknown targets do not receive relay traffic.
 - Empty `allowed_targets` remains deny-all, and wildcard relay targets are
   rejected.
 
-It does not start the client pipeline, create TUN devices, or change host
-networking.
+It does not start the TUN packet pipeline, create TUN devices, invoke Prism or
+Xray, contact a real game server, or change host networking.
 The local smoke test cannot replace verification on the real VPS, cloud
 security group UDP exposure, carrier UDP reachability, or real game UDP
 end-to-end validation.

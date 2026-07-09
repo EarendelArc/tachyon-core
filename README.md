@@ -114,9 +114,10 @@ bash scripts/smoke-tgp-relay.sh
 ```
 
 It uses only temporary `127.0.0.1` UDP ports and checks PSK handshake behavior,
-missing/wrong PSK rejection, ACL allow/deny behavior, deny-all defaults,
-wildcard target rejection, and an echo-like UDP relay round trip without
-starting TUN or changing routes, firewall, systemd, Docker, or proxy state. This
+missing/wrong PSK rejection, config-driven client/server relay wiring, ACL
+allow/deny behavior, deny-all defaults, wildcard target rejection, and an
+echo-like UDP relay round trip without starting TUN, invoking Prism/Xray, or
+changing routes, firewall, systemd, Docker, or proxy state. This
 local smoke test does not replace real VPS, real client, or real game UDP
 validation.
 

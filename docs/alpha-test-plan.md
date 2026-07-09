@@ -68,13 +68,14 @@ bash scripts/smoke-tgp-relay.sh
 ```
 
 This is a local-only smoke test. It binds temporary `127.0.0.1` UDP ports and
-checks PSK handshake behavior, missing/wrong PSK rejection, ACL allow/deny,
-deny-all defaults, wildcard target rejection, and an echo-like UDP relay round
-trip.
+checks PSK handshake behavior, missing/wrong PSK rejection, config-driven
+client/server relay wiring, ACL allow/deny, deny-all defaults, wildcard target
+rejection, and an echo-like UDP relay round trip.
 
 It does not use your VPS, cloud security group, real client, real game server,
-TUN, routes, firewall, systemd, Docker, or system proxy settings. Passing local
-smoke means the relay logic is sane; it does not prove VPS reachability.
+TUN, Prism, Xray, routes, firewall, systemd, Docker, or system proxy settings.
+Passing local smoke means the relay logic and config-to-runtime mapping are
+sane; it does not prove VPS reachability.
 
 ## Bare-Metal Deployment Path
 
@@ -169,7 +170,8 @@ file before sending it back.
 ## VPS Smoke vs Local Smoke
 
 - Local smoke: `scripts/smoke-tgp-relay.sh`; runs only on loopback and proves
-  relay behavior without host networking changes.
+  relay behavior plus config-driven runtime wiring without host networking
+  changes.
 - VPS verification: `scripts/verify-server.sh`; runs on the deployed server and
   proves the installed binary/config/listener shape.
 - Real client smoke: Prism connects to the VPS Tachyon server profile and

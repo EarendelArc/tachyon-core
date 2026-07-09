@@ -12,10 +12,11 @@ The current preview release is
 PSK-authenticated, deny-all-by-default relay posture and adds
 `scripts/smoke-tgp-relay.sh` as a local TGP relay smoke verification entry
 point. The smoke test binds only temporary `127.0.0.1` UDP ports and covers
-PSK-authenticated handshakes, missing/wrong PSK rejection, ACL allow/deny
-behavior, deny-all defaults, wildcard target rejection, and an echo-like UDP
-relay round trip. It does not start TUN, enable system proxy, or change routes,
-firewall rules, systemd, Docker, or real VPS state.
+PSK-authenticated handshakes, missing/wrong PSK rejection, config-driven
+client/server relay wiring, ACL allow/deny behavior, deny-all defaults,
+wildcard target rejection, and an echo-like UDP relay round trip. It does not
+start TUN, invoke Prism/Xray, enable system proxy, or change routes, firewall
+rules, systemd, Docker, or real VPS state.
 
 Known limitations for this preview: local smoke is not a replacement for real
 VPS, real client, carrier/network, or target-game UDP validation; deployed

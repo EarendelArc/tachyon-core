@@ -14,18 +14,20 @@ bash scripts/smoke-tgp-relay.sh
 等价的直接命令：
 
 ```bash
-mise exec -- go test ./internal/app -run '^TestTGPRelaySmokeVerification$' -count=1 -v
+mise exec -- go test ./internal/app -run '^TestTGPRelay(SmokeVerification|ConfigDrivenSmoke)$' -count=1 -v
 ```
 
 该 smoke 只绑定临时 `127.0.0.1` UDP 端口，验证：
 
 - 带 PSK 的 TGP 握手可以成功。
 - 缺失或错误 PSK 的握手会被拒绝。
+- client/server 配置字段可以接线到可工作的 TGP relay 路径。
 - allow-list 中的 UDP 目标可以完成 echo-like relay 往返。
 - 未授权端口和未知目标不会收到 relay 流量。
 - 空 `allowed_targets` 保持 deny-all，通配全网 relay 目标会被拒绝。
 
-它不会启动客户端 pipeline、创建 TUN 设备，也不会修改主机网络配置。
+它不会启动 TUN packet pipeline、创建 TUN 设备、调用 Prism 或 Xray、连接真实游戏服务器，
+也不会修改主机网络配置。
 本地 smoke 不能替代真实 VPS、云安全组、运营商 UDP 可达性和真实游戏 UDP 端到端验证。
 
 ## VPS 部署后

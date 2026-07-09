@@ -11,9 +11,9 @@ Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 al
 PSK 认证、服务端 relay 默认 deny-all 的安全口径，并新增
 `scripts/smoke-tgp-relay.sh` 作为本地 TGP relay smoke 验证入口。smoke 只绑定
 临时 `127.0.0.1` UDP 端口，覆盖带 PSK 的握手、缺失/错误 PSK 拒绝、ACL
-allow/deny、默认 deny-all、通配全网目标拒绝，以及 echo-like UDP relay 往返。
-它不会启动 TUN、启用系统代理，也不会修改路由、防火墙、systemd、Docker 或真实
-VPS 状态。
+allow/deny、client/server 配置到 relay 的运行时接线、默认 deny-all、通配全网
+目标拒绝，以及 echo-like UDP relay 往返。它不会启动 TUN、调用 Prism/Xray、启用
+系统代理，也不会修改路由、防火墙、systemd、Docker 或真实 VPS 状态。
 
 该预览版的已知限制：本地 smoke 不能替代真实 VPS、真实客户端、运营商/网络和目标
 游戏 UDP 验证；部署后仍应运行 `scripts/verify-server.sh`；relay 路径迁移/重绑定在

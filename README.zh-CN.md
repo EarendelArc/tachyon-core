@@ -83,8 +83,9 @@ bash scripts/smoke-tgp-relay.sh
 ```
 
 它只使用临时 `127.0.0.1` UDP 端口，验证 PSK 握手、缺失/错误 PSK 拒绝、
-ACL allow/deny、默认 deny-all、通配全网目标拒绝，以及 echo-like UDP relay
-往返；不会启动 TUN，也不会修改路由、防火墙、systemd、Docker 或系统代理状态。
+client/server 配置到 TGP relay 的运行时接线、ACL allow/deny、默认 deny-all、
+通配全网目标拒绝，以及 echo-like UDP relay 往返；不会启动 TUN，不会调用 Prism
+或 Xray，也不会修改路由、防火墙、systemd、Docker 或系统代理状态。
 本地 smoke 不能替代真实 VPS、真实客户端和真实游戏 UDP 验证。
 
 ## 服务端部署

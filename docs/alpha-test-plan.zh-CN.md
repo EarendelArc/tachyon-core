@@ -59,12 +59,12 @@ bash scripts/smoke-tgp-relay.sh
 ```
 
 这是纯本地 smoke。它只绑定临时 `127.0.0.1` UDP 端口，检查 PSK 握手、缺失/错误
-PSK 拒绝、ACL allow/deny、默认 deny-all、通配目标拒绝，以及 echo-like UDP relay
-往返。
+PSK 拒绝、client/server 配置到 relay 的运行时接线、ACL allow/deny、默认 deny-all、
+通配目标拒绝，以及 echo-like UDP relay 往返。
 
-它不会使用你的 VPS、云安全组、真实客户端、真实游戏服务器、TUN、路由、防火墙、
-systemd、Docker 或系统代理设置。通过本地 smoke 只能说明 relay 逻辑基本正常，
-不能证明 VPS 可达。
+它不会使用你的 VPS、云安全组、真实客户端、真实游戏服务器、TUN、Prism、Xray、
+路由、防火墙、systemd、Docker 或系统代理设置。通过本地 smoke 只能说明 relay
+逻辑和配置到运行时映射基本正常，不能证明 VPS 可达。
 
 ## 裸机部署路径
 
@@ -147,8 +147,8 @@ systemd、Docker、防火墙、iptables、nftables、路由或代理设置。
 
 ## 本地 Smoke 与 VPS Smoke 的区别
 
-- 本地 smoke：`scripts/smoke-tgp-relay.sh`，只在 loopback 上运行，验证 relay 行为，
-  不改宿主网络。
+- 本地 smoke：`scripts/smoke-tgp-relay.sh`，只在 loopback 上运行，验证 relay 行为和
+  配置驱动运行时接线，不改宿主网络。
 - VPS 验收：`scripts/verify-server.sh`，在已部署服务器上运行，验证安装后的
   二进制、配置和监听状态。
 - 真实客户端 smoke：Prism 使用 Tachyon server profile 连接 VPS，验证客户端配置、

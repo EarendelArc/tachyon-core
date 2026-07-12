@@ -14,16 +14,19 @@ import (
 
 const capturedPacketStream tgp.StreamID = 0
 
-var ErrDirectTrafficCaptured = errors.New("direct traffic captured by TGP-only TUN pipeline")
+var (
+	ErrDirectTrafficCaptured   = errors.New("direct traffic captured but Core has no direct forwarding path")
+	ErrTGPForwarderUnavailable = errors.New("TGP forwarding action selected but no TGP sender is configured")
+	ErrUnsupportedClientAction = errors.New("unsupported client packet action")
+)
 
 type tgpPacketSender interface {
 	SendPacket(ctx context.Context, streamID tgp.StreamID, payload []byte) error
 }
 
 type clientPacketHandler struct {
-	logger       *slog.Logger
-	tgp          tgpPacketSender
-	rejectDirect bool
+	logger *slog.Logger
+	tgp    tgpPacketSender
 }
 
 func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline.Decision, packet []byte) error {
@@ -35,7 +38,7 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 	switch decision.Action {
 	case pipeline.ActionTGP:
 		if h.tgp == nil {
-			return errors.New("tgp handler is not configured")
+			return &pipeline.FatalHandlerError{Err: ErrTGPForwarderUnavailable}
 		}
 		if decision.Flow.Transport != pidtrack.TransportUDP {
 			return errors.New("tgp handler received non-UDP packet")
@@ -78,17 +81,9 @@ func (h clientPacketHandler) HandlePacket(ctx context.Context, decision pipeline
 			"remote_port", decision.Flow.RemotePort,
 		)
 	case pipeline.ActionDirect:
-		if h.rejectDirect {
-			return fmt.Errorf("%w: %s:%d", ErrDirectTrafficCaptured, decision.Flow.RemoteIP, decision.Flow.RemotePort)
-		}
-		logger.Debug("packet route decision bypassed by core",
-			"action", decision.Action,
-			"reason", decision.Reason,
-			"process", decision.Process.Name,
-			"remote", decision.Flow.RemoteIP,
-			"remote_port", decision.Flow.RemotePort,
-			"bytes", len(packet),
-		)
+		return &pipeline.FatalHandlerError{Err: fmt.Errorf("%w: %s:%d", ErrDirectTrafficCaptured, decision.Flow.RemoteIP, decision.Flow.RemotePort)}
+	default:
+		return &pipeline.FatalHandlerError{Err: fmt.Errorf("%w: %q", ErrUnsupportedClientAction, decision.Action)}
 	}
 	return nil
 }

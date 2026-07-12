@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -365,6 +366,7 @@ func TestValidateClientWithProfilesAndServerAddr(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
 		Client: ClientConfig{
+			TUN:   TUNConfig{TGPOnly: true},
 			Proxy: ProxyConfig{ServerAddr: "game.example.com:443"},
 			Routing: RoutingConfig{
 				GameProfiles: []routing.GameProfile{
@@ -390,6 +392,7 @@ func TestValidateRejectsInvalidClientLocalAddr(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
 		Client: ClientConfig{
+			TUN: TUNConfig{TGPOnly: true},
 			Proxy: ProxyConfig{
 				ServerAddr: "game.example.com:443",
 				LocalAddrs: []string{
@@ -411,6 +414,7 @@ func TestValidateRequiresTwoLocalAddrsForMultipath(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
 		Client: ClientConfig{
+			TUN: TUNConfig{TGPOnly: true},
 			Proxy: ProxyConfig{
 				ServerAddr: "game.example.com:443",
 				LocalAddrs: []string{
@@ -439,6 +443,7 @@ func TestValidateRejectsMultipathWithoutConnectionMigration(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
 		Client: ClientConfig{
+			TUN: TUNConfig{TGPOnly: true},
 			Proxy: ProxyConfig{
 				ServerAddr: "game.example.com:443",
 				LocalAddrs: []string{
@@ -595,5 +600,100 @@ func TestValidateClientDuplicateProfileIDs(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error for duplicate profile IDs")
+	}
+}
+
+func TestValidateClientDataPathFailsClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "global auto route",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.AutoRoute = true
+			},
+			wantErr: "client.tun.auto_route=true is not supported",
+		},
+		{
+			name: "DNS hijack",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.DNSHijack = true
+			},
+			wantErr: "client.tun.dns_hijack=true is not supported",
+		},
+		{
+			name: "direct forwarding mode",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.TGPOnly = false
+			},
+			wantErr: "client.tun.tgp_only must be true",
+		},
+		{
+			name: "domain rule",
+			mutate: func(cfg *Config) {
+				cfg.Client.Routing.Rules = []RouteRule{{Domain: "game.example.com", Action: "tgp"}}
+			},
+			wantErr: "domain is not implemented",
+		},
+		{
+			name: "geoip rule",
+			mutate: func(cfg *Config) {
+				cfg.Client.Routing.Rules = []RouteRule{{GeoIPCountry: "CN", Action: "direct"}}
+			},
+			wantErr: "geoip is not implemented",
+		},
+		{
+			name: "TGP rule without UDP protocol",
+			mutate: func(cfg *Config) {
+				cfg.Client.Routing.Rules = []RouteRule{{ProcessName: "game.exe", Action: "tgp"}}
+			},
+			wantErr: "action tgp must set protocol to udp",
+		},
+		{
+			name: "TGP default action",
+			mutate: func(cfg *Config) {
+				cfg.Client.Routing.DefaultAction = "tgp"
+			},
+			wantErr: "default_action cannot be tgp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validClientDataPathConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateClientDataPathAcceptsSupportedIPv4AndIPv6CIDRs(t *testing.T) {
+	cfg := validClientDataPathConfig()
+	cfg.Client.Routing.Rules = []RouteRule{
+		{CIDR: "203.0.113.0/24", Action: "direct"},
+		{CIDR: "2001:db8::/32", Protocol: "udp", Action: "tgp"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected supported dual-stack rules to validate: %v", err)
+	}
+}
+
+func validClientDataPathConfig() Config {
+	return Config{
+		Mode: ModeClient,
+		Client: ClientConfig{
+			TUN:     TUNConfig{TGPOnly: true},
+			Proxy:   ProxyConfig{ServerAddr: "game.example.com:443"},
+			Routing: RoutingConfig{DefaultAction: "direct"},
+		},
+		TGP: TGPConfig{
+			FEC:    FECConfig{DataShards: 4},
+			Pacing: PacingConfig{InitialRatePPS: 128},
+		},
 	}
 }

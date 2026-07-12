@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/netip"
 	"testing"
@@ -77,5 +78,33 @@ func TestPipelineReadsLooksUpAndDecides(t *testing.T) {
 	}
 	if stats := p.Snapshot(); stats.PacketsRead != 1 || stats.DecidedTGP != 1 || stats.BytesRead != uint64(len(packet)) || stats.BytesTGP != uint64(len(packet)) {
 		t.Fatalf("unexpected stats: %#v", stats)
+	}
+}
+
+func TestPipelineStopsOnFatalHandlerError(t *testing.T) {
+	packet := make([]byte, 28)
+	packet[0] = 0x45
+	packet[9] = 17
+	copy(packet[12:16], []byte{198, 18, 0, 2})
+	copy(packet[16:20], []byte{203, 0, 113, 10})
+	binary.BigEndian.PutUint16(packet[20:22], 40000)
+	binary.BigEndian.PutUint16(packet[22:24], 27015)
+
+	sentinel := errors.New("captured direct traffic")
+	p := New(Options{
+		Device:  &fakeDevice{packet: packet},
+		Tracker: fakeTracker{},
+		Router:  NewRouter(config.RoutingConfig{DefaultAction: "direct"}, routing.Engine{}),
+		Handler: HandlerFunc(func(context.Context, Decision, []byte) error {
+			return &FatalHandlerError{Err: sentinel}
+		}),
+	})
+
+	err := p.Run(context.Background())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("pipeline error = %v, want fatal handler error", err)
+	}
+	if stats := p.Snapshot(); stats.HandlerErrors != 1 || stats.DecidedDirect != 1 {
+		t.Fatalf("unexpected fail-closed stats: %#v", stats)
 	}
 }

@@ -23,8 +23,12 @@ tachyonctl health --addr 127.0.0.1:55123
 - Core 负责 Tachyon 协议传输：数据包接管、基于进程的游戏路由、TGP 客户端传输和 TGP 服务端 Relay 行为。
 - Tachyon Core 内部没有 Xray 的运行时或编译期依赖。
 - TCP 代理流量属于 Prism/Xray；UDP 游戏流量属于 Tachyon Core/TGP。
-- 客户端 TUN 默认采用 TGP-only 安全模式：`auto_route` 和 `dns_hijack`
-  默认关闭，只有 Prism 或手写配置显式启用时才会接管全局路由/DNS。
+- 客户端 TUN 当前只支持 TGP-only：`auto_route=true`、`dns_hijack=true` 或
+  `tgp_only=false` 会在配置校验阶段失败，因为 Core 尚无原生 direct/DNS 转发路径。
+  OS 集成层必须只为候选游戏 UDP 目标安装选择性路由；Core 仍需要 TUN/Wintun 和
+  相应权限来处理这些被选中的数据包。
+- 客户端规则当前支持进程名、CIDR 和协议匹配；`domain`、`geoip` 在具备可确定的
+  packet-path 实现前会直接校验失败。
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
 - Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析。
 
@@ -32,9 +36,9 @@ tachyonctl health --addr 127.0.0.1:55123
 
 ```text
 客户端模式
-  TUN 设备 -> PID 追踪器 -> 路由引擎
+  OS 选择性游戏路由 -> TUN 设备 -> PID 追踪器 -> 路由引擎
     UDP 游戏流量 -> TGP 客户端会话
-    TCP/代理流量 -> Core 忽略，由 Prism/Xray 负责
+    direct 决策 -> fail-closed（不应被接管）
 
 服务端模式
   UDP 监听器 -> TGP Relay -> 真实游戏服务器
@@ -43,8 +47,8 @@ tachyonctl health --addr 127.0.0.1:55123
 ## 实现状态
 
 Tachyon Core 还不是 stable 或生产完成版本。协议和管道已经可以用于 alpha 集成。
-客户端 TUN 自动路由和 DNS hijack 默认保持关闭；Windows TUN 仍需要在真实
-Windows 主机上以管理员权限创建适配器进行运行时验证。
+客户端 TUN 自动路由和 DNS hijack 当前不受支持，并会被配置校验拒绝；Windows TUN
+仍需要在真实 Windows 主机上以管理员权限创建适配器进行运行时验证。
 
 | 领域 | 状态 |
 | --- | --- |
@@ -133,6 +137,21 @@ sudo bash scripts/verify-server.sh
 sudo bash scripts/verify-server.sh --mode docker
 bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
 ```
+
+如果要做显式公网 TGP E2E，请使用已经写入 `server.relay.allowed_targets` 的受控
+UDP echo 目标：
+
+```bash
+bash scripts/verify-tgp-e2e.sh --mode public \
+  --server vps.example.com:443 \
+  --target echo.example.com:27015 \
+  --psk-file ./tgp.psk
+```
+
+E2E 验证脚本默认仍是本地 loopback smoke；只有提供 `--server`、`--target` 和
+PSK 时才会访问公网 UDP。它不会创建 TUN、修改路由、改防火墙规则、管理服务或调用
+Prism；它只证明 Core/TGP 客户端到 Relay 再到受控 UDP 目标的闭环，不证明 Prism
+集成、TUN 接管或真实游戏流量。
 
 如果需要我们协助排查 VPS Relay，请生成带时间戳的支持包：
 

@@ -173,16 +173,16 @@ func autoRouteCheck(autoRoute bool) Check {
 	if autoRoute {
 		return Check{
 			ID:          CheckAutoRouteDisabled,
-			Status:      StatusOK,
-			Message:     "auto_route=true means Core may install a default route through the TUN device.",
-			Remediation: "",
+			Status:      StatusError,
+			Message:     "auto_route=true is unsafe because Core has no native direct forwarding path.",
+			Remediation: "Set auto_route=false and install OS-level selective routes only for intended game UDP destinations.",
 		}
 	}
 	return Check{
 		ID:          CheckAutoRouteDisabled,
-		Status:      StatusWarn,
-		Message:     "auto_route=false means Core will not take over the system default route; it does not mean TUN is unnecessary in client mode.",
-		Remediation: "Keep auto_route=false for Prism/Xray-owned general proxy traffic, but still satisfy the TUN and privilege checks before starting client mode.",
+		Status:      StatusOK,
+		Message:     "auto_route=false keeps non-selected traffic on the native OS path; Core still requires TUN for selectively routed game UDP.",
+		Remediation: "Install and verify OS-level selective game routes before expecting traffic to enter Core.",
 	}
 }
 

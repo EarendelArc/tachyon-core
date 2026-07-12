@@ -45,11 +45,6 @@ const ClientConfigTemplate = `{
           "cidr": "192.168.0.0/16",
           "action": "direct",
           "priority": 50
-        },
-        {
-          "geoip": "CN",
-          "action": "direct",
-          "priority": 10
         }
       ]
     },

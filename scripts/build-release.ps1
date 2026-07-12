@@ -79,7 +79,6 @@ $goVersion = ((Invoke-Go -Arguments @("version")) -split "\s+")[2]
 $ldflags = "-s -w -X main.Version=$Tag -X main.BuildTime=$buildTime -X main.GoVersion=$goVersion"
 
 $targets = @(
-    @{ GOOS = "windows"; GOARCH = "386"; AssetOS = "windows"; AssetArch = "386"; Ext = ".exe" },
     @{ GOOS = "windows"; GOARCH = "amd64"; AssetOS = "windows"; AssetArch = "amd64"; Ext = ".exe" },
     @{ GOOS = "windows"; GOARCH = "arm64"; AssetOS = "windows"; AssetArch = "arm64"; Ext = ".exe" },
     @{ GOOS = "darwin"; GOARCH = "amd64"; AssetOS = "darwin"; AssetArch = "amd64"; Ext = "" },

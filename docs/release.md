@@ -2,8 +2,9 @@
 
 Tachyon Core releases are published by GitHub Actions from this repository.
 Releases are currently alpha-quality: client TUN auto-route and DNS hijack are
-disabled by default, Windows TUN still needs real elevated-host validation, and
-the artifacts are intended for Prism-managed downloads and integration testing.
+currently unsupported and rejected by config validation, Windows TUN still
+needs real elevated-host validation, and the artifacts are intended for
+Prism-managed downloads and integration testing.
 
 ## Current Preview
 
@@ -53,7 +54,6 @@ scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-
 
 The workflow builds these ZIP assets:
 
-- `tachyon-core_<tag>_windows_386.zip`
 - `tachyon-core_<tag>_windows_amd64.zip`
 - `tachyon-core_<tag>_windows_arm64.zip`
 - `tachyon-core_<tag>_darwin_amd64.zip`
@@ -80,7 +80,6 @@ Prism should select assets by normalized platform:
 
 | Runtime | Asset suffix |
 | --- | --- |
-| Windows x86 | `windows_386` |
 | Windows x64 | `windows_amd64` |
 | Windows ARM64 | `windows_arm64` |
 | macOS Intel | `darwin_amd64` |

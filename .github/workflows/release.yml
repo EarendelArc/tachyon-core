@@ -45,11 +45,6 @@ jobs:
       matrix:
         include:
           - goos: windows
-            goarch: "386"
-            asset_os: windows
-            asset_arch: "386"
-            ext: ".exe"
-          - goos: windows
             goarch: amd64
             asset_os: windows
             asset_arch: amd64
@@ -176,7 +171,7 @@ jobs:
             echo "Alpha limitations:"
             echo "- Tachyon Core is alpha software and is not stable or complete."
             echo "- System proxy takeover remains disabled by default in Prism-managed alpha flows; Tachyon Core does not modify host proxy settings."
-            echo "- Client TUN auto-route and DNS hijack remain disabled by default."
+            echo "- Client TUN auto-route and DNS hijack are unsupported and rejected by config validation."
             echo "- Real VPS, real client, and real game UDP acceleration paths still need field testing."
             echo "- Windows TUN uses a dynamic wintun.dll backend and still needs elevated-host validation."
             echo "Windows users must place wintun.dll next to tachyon-core.exe."

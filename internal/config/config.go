@@ -90,24 +90,24 @@ type TUNConfig struct {
 	// the network path does not support jumbo frames.
 	MTU int `yaml:"mtu" json:"mtu"`
 
-	// AutoRoute adds a default route pointing at the TUN interface so all
-	// traffic is captured. It defaults to false because Tachyon Core only
-	// accelerates selected UDP game flows; Prism/Xray owns general proxy traffic.
+	// AutoRoute would add a default route pointing at the TUN interface. It must
+	// remain false until Core implements a native direct forwarding path.
 	AutoRoute bool `yaml:"auto_route" json:"auto_route"`
 
-	// DNSHijack intercepts DNS UDP/53 traffic. It should only be enabled in
-	// deployments that intentionally route DNS through the Core TUN pipeline.
+	// DNSHijack is reserved for a future native DNS forwarding path and currently
+	// fails client config validation when enabled.
 	DNSHijack bool `yaml:"dns_hijack" json:"dns_hijack"`
 
 	// TGPOnly rejects captured direct traffic instead of silently consuming it.
-	// Leave enabled unless Core is explicitly paired with an OS bypass route.
+	// It must remain enabled; OS integration owns selective route installation.
 	TGPOnly bool `yaml:"tgp_only" json:"tgp_only"`
 }
 
 // RoutingConfig defines how traffic is classified into routing decisions.
 type RoutingConfig struct {
 	// DefaultAction is the fallback when no rule matches.
-	// One of: "tgp", "direct", "drop". Defaults to "direct".
+	// One of: "direct", "drop", "block". Defaults to "direct". TGP requires
+	// an explicitly UDP-matched rule or game profile.
 	DefaultAction string `yaml:"default_action" json:"default_action"`
 
 	// Rules is evaluated in priority order (highest priority first).
@@ -135,7 +135,7 @@ type RouteRule struct {
 	Protocol     string `yaml:"protocol,omitempty" json:"protocol,omitempty"`         // "tcp" or "udp"
 
 	// Action to take when matched.
-	// One of: "tgp", "direct", "drop"
+	// One of: "tgp", "direct", "drop", "block".
 	Action string `yaml:"action" json:"action"`
 }
 
@@ -437,6 +437,9 @@ func (c *Config) Validate() error {
 		if err := validateGameProfiles(c.Client.Routing.GameProfiles); err != nil {
 			return err
 		}
+		if err := validateClientDataPath(c.Client); err != nil {
+			return err
+		}
 	}
 	if c.Mode == ModeServer {
 		if c.Server.Listen == "" {
@@ -469,6 +472,66 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("server mode requires tgp.auth.psk unless tgp.auth.allow_unauthenticated is true")
 	}
 	return nil
+}
+
+func validateClientDataPath(cfg ClientConfig) error {
+	if cfg.TUN.AutoRoute {
+		return fmt.Errorf("client.tun.auto_route=true is not supported until Core has a native direct forwarding path; use OS-level selective routes for TGP game traffic")
+	}
+	if cfg.TUN.DNSHijack {
+		return fmt.Errorf("client.tun.dns_hijack=true is not supported by the Core-only TGP data path")
+	}
+	if !cfg.TUN.TGPOnly {
+		return fmt.Errorf("client.tun.tgp_only must be true because captured direct traffic cannot be forwarded safely")
+	}
+	return validateRoutingConfig(cfg.Routing)
+}
+
+func validateRoutingConfig(cfg RoutingConfig) error {
+	if action := strings.TrimSpace(cfg.DefaultAction); action != "" {
+		if !isRouteAction(action) {
+			return fmt.Errorf("client.routing.default_action %q must be tgp, direct, drop, or block", cfg.DefaultAction)
+		}
+		if strings.EqualFold(action, "tgp") {
+			return fmt.Errorf("client.routing.default_action cannot be tgp because TGP only forwards explicitly UDP-matched rules and game profiles")
+		}
+	}
+	for idx, rule := range cfg.Rules {
+		if strings.TrimSpace(rule.Domain) != "" {
+			return fmt.Errorf("client.routing.rules[%d].domain is not implemented by the Core-only packet path", idx)
+		}
+		if strings.TrimSpace(rule.GeoIPCountry) != "" {
+			return fmt.Errorf("client.routing.rules[%d].geoip is not implemented by the Core-only packet path", idx)
+		}
+		if strings.TrimSpace(rule.ProcessName) == "" && strings.TrimSpace(rule.CIDR) == "" && strings.TrimSpace(rule.Protocol) == "" {
+			return fmt.Errorf("client.routing.rules[%d] requires process_name, cidr, or protocol", idx)
+		}
+		if value := strings.TrimSpace(rule.CIDR); value != "" {
+			if _, err := netip.ParsePrefix(value); err != nil {
+				return fmt.Errorf("client.routing.rules[%d].cidr %q is invalid: %w", idx, rule.CIDR, err)
+			}
+		}
+		protocol := strings.ToLower(strings.TrimSpace(rule.Protocol))
+		if protocol != "" && protocol != "udp" && protocol != "tcp" {
+			return fmt.Errorf("client.routing.rules[%d].protocol %q must be tcp or udp", idx, rule.Protocol)
+		}
+		if !isRouteAction(rule.Action) {
+			return fmt.Errorf("client.routing.rules[%d].action %q must be tgp, direct, drop, or block", idx, rule.Action)
+		}
+		if strings.EqualFold(strings.TrimSpace(rule.Action), "tgp") && protocol != "udp" {
+			return fmt.Errorf("client.routing.rules[%d] with action tgp must set protocol to udp", idx)
+		}
+	}
+	return nil
+}
+
+func isRouteAction(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "tgp", "direct", "drop", "block":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateRelayTargets(rules []RelayTargetRule) error {

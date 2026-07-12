@@ -138,6 +138,26 @@ state when requested, summarizes `allowed_targets`, inspects UDP listener state,
 and tails logs with PSK redaction. It does not change firewall rules, cloud
 security groups, Docker, systemd, packet filters, routes, or proxy settings.
 
+## Public TGP E2E Before Real Games
+
+Before pointing Prism/game traffic at the VPS, test a controlled UDP echo target
+that is already listed in `server.relay.allowed_targets`:
+
+```bash
+printf '%s\n' '<copy-psk-locally-do-not-share>' > ./tgp.psk
+bash scripts/verify-tgp-e2e.sh --mode public \
+  --server vps.example.com:443 \
+  --target echo.example.com:27015 \
+  --psk-file ./tgp.psk
+```
+
+This sends one TGP probe to the VPS and one relayed UDP probe to the explicit
+echo target. It does not start TUN, change routes, alter firewall rules, or
+touch systemd/Docker or Prism. This opt-in check proves only the Core/TGP
+transport loop, not Prism integration, TUN capture, or real game behavior. It
+is not a default game-server probe; use a target you control, or skip this step
+until you have one.
+
 ## Support Bundle
 
 When asking for help, prefer a read-only support bundle instead of manually
@@ -174,6 +194,9 @@ file before sending it back.
   changes.
 - VPS verification: `scripts/verify-server.sh`; runs on the deployed server and
   proves the installed binary/config/listener shape.
+- Public TGP E2E: `scripts/verify-tgp-e2e.sh --mode public`; runs from a
+  client-like host and proves TGP handshake plus one UDP echo relay to an
+  explicitly allowed target.
 - Real client smoke: Prism connects to the VPS Tachyon server profile and
   validates client-side config, launch, logs, and game-mode/manual rules.
 - Real game smoke: a real game emits UDP that matches the selected profile and

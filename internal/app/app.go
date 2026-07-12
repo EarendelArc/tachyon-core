@@ -53,6 +53,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config must not be nil")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
 	return &App{
 		cfg:    cfg,
 		logger: logger,
@@ -129,7 +132,7 @@ func (a *App) runClient(ctx context.Context) error {
 		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
 		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
-			packet, err := buildIPv4UDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
+			packet, err := buildUDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
 			if err != nil {
 				return err
 			}
@@ -152,9 +155,8 @@ func (a *App) runClient(ctx context.Context) error {
 		Tracker: tracker,
 		Router:  packetRouter,
 		Handler: clientPacketHandler{
-			logger:       a.logger,
-			tgp:          tgpManager,
-			rejectDirect: a.cfg.Client.TUN.TGPOnly,
+			logger: a.logger,
+			tgp:    tgpManager,
 		},
 		Logger: a.logger,
 		OnDecision: func(d pipeline.Decision) {

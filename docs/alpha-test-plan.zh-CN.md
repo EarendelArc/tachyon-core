@@ -121,6 +121,25 @@ bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./s
 `allowed_targets`，检查 UDP 监听，并在输出日志尾部时隐藏 PSK。它不会修改防火墙规则、
 云安全组、Docker、systemd、包过滤器、路由或代理设置。
 
+## 真实游戏前的公网 TGP E2E
+
+在把 Prism 或游戏流量指向 VPS 前，建议先测试一个已经写入
+`server.relay.allowed_targets` 的受控 UDP echo 目标：
+
+```bash
+printf '%s\n' '<仅本地复制 PSK，不要分享>' > ./tgp.psk
+bash scripts/verify-tgp-e2e.sh --mode public \
+  --server vps.example.com:443 \
+  --target echo.example.com:27015 \
+  --psk-file ./tgp.psk
+```
+
+该脚本只向 VPS 发送一个 TGP probe，并把一个 UDP probe relay 到显式允许的 echo
+目标。它不会启动 TUN、修改路由、改防火墙规则、触碰 systemd/Docker 或调用 Prism。
+这个 opt-in 检查只证明 Core/TGP 传输闭环，不证明 Prism 集成、TUN 接管或真实游戏
+行为。它不是默认的游戏服务器探测；请使用你控制的目标，如果暂时没有 echo 目标，
+可以先跳过这一步。
+
 ## 支持包
 
 需要协助排查时，优先生成只读支持包，而不是手工复制多段命令输出：
@@ -151,6 +170,8 @@ systemd、Docker、防火墙、iptables、nftables、路由或代理设置。
   配置驱动运行时接线，不改宿主网络。
 - VPS 验收：`scripts/verify-server.sh`，在已部署服务器上运行，验证安装后的
   二进制、配置和监听状态。
+- 公网 TGP E2E：`scripts/verify-tgp-e2e.sh --mode public`，从类似客户端的机器运行，
+  验证 TGP 握手以及到显式允许目标的一次 UDP echo relay。
 - 真实客户端 smoke：Prism 使用 Tachyon server profile 连接 VPS，验证客户端配置、
   启动、日志、游戏模式或手动规则。
 - 真实游戏 smoke：真实游戏发出匹配 profile 和 `allowed_targets` 的 UDP，这是本地

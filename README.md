@@ -34,11 +34,14 @@ tachyonctl health --addr 127.0.0.1:55123
 - Xray has no runtime or build-time dependency inside Tachyon Core.
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.
-- Client TUN defaults to TGP-only safe mode: `auto_route` and `dns_hijack` are
-  off unless explicitly enabled by Prism or a hand-written config. In client
-  mode, `auto_route=false` only means Core will not install a system default
-  route through the TUN device; Core still needs TUN/Wintun and the required
-  OS privileges to start the packet pipeline.
+- Client TUN is currently TGP-only: `auto_route=true`, `dns_hijack=true`, and
+  `tgp_only=false` fail config validation because Core has no native direct or
+  DNS forwarding path. The OS integration must install selective routes for
+  candidate game UDP destinations; Core still needs TUN/Wintun and the required
+  privileges to process those selected packets.
+- Client route rules support process name, CIDR, and protocol matching.
+  `domain` and `geoip` rules fail validation until Core has implementations
+  that can make deterministic packet-path decisions.
 - JSON is the canonical Core config format. Legacy YAML is accepted only for
   early developer compatibility.
 - Relative file paths in Core JSON are resolved from the directory that contains
@@ -48,9 +51,9 @@ tachyonctl health --addr 127.0.0.1:55123
 
 ```text
 Client mode
-  TUN device -> PID tracker -> routing engine
+  OS selective game routes -> TUN device -> PID tracker -> routing engine
     UDP game traffic -> TGP client session
-    TCP/proxy traffic -> ignored by Core; Prism/Xray owns this path
+    direct decision -> fail closed (must not have been captured)
 
 Server mode
   UDP listener -> TGP relay -> real game server
@@ -60,8 +63,9 @@ Server mode
 
 Tachyon Core is not a stable or production-complete release yet. The protocol
 and pipeline are ready for alpha integration. Client TUN auto-route and DNS
-hijack stay disabled by default, and Windows TUN still requires runtime
-validation with elevated adapter creation on real Windows hosts.
+hijack are currently unsupported and rejected by config validation, and Windows
+TUN still requires runtime validation with elevated adapter creation on real
+Windows hosts.
 
 | Area | Status |
 | --- | --- |
@@ -169,6 +173,22 @@ sudo bash scripts/verify-server.sh
 sudo bash scripts/verify-server.sh --mode docker
 bash scripts/verify-server.sh --mode config --binary ./tachyon-core --config ./server.json
 ```
+
+For an explicit public TGP E2E check, use a controlled UDP echo target already
+listed in `server.relay.allowed_targets`:
+
+```bash
+bash scripts/verify-tgp-e2e.sh --mode public \
+  --server vps.example.com:443 \
+  --target echo.example.com:27015 \
+  --psk-file ./tgp.psk
+```
+
+The E2E verifier defaults to local loopback smoke and never contacts a public
+UDP target unless `--server`, `--target`, and a PSK are provided. It does not
+create TUN devices, change routes, alter firewall rules, manage services, or
+invoke Prism. It proves only the Core/TGP client-to-relay-to-controlled-UDP-target
+loop; it does not prove Prism integration, TUN capture, or real game traffic.
 
 When asking for help with VPS relay validation, generate a timestamped support
 bundle:

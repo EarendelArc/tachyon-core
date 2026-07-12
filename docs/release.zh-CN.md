@@ -1,8 +1,8 @@
 # 发布流程
 
 Tachyon Core 通过本仓库的 GitHub Actions 发布。当前 release 属于 alpha
-质量：客户端 TUN 自动路由和 DNS hijack 默认关闭；Windows TUN 仍需要真实管理员
-环境验证。这些产物主要用于 Prism 托管下载和集成测试。
+质量：客户端 TUN 自动路由和 DNS hijack 当前不受支持，并会被配置校验拒绝；
+Windows TUN 仍需要真实管理员环境验证。这些产物主要用于 Prism 托管下载和集成测试。
 
 ## 当前预览版本
 
@@ -44,7 +44,6 @@ scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-
 
 workflow 会构建以下 ZIP 资产：
 
-- `tachyon-core_<tag>_windows_386.zip`
 - `tachyon-core_<tag>_windows_amd64.zip`
 - `tachyon-core_<tag>_windows_arm64.zip`
 - `tachyon-core_<tag>_darwin_amd64.zip`
@@ -70,7 +69,6 @@ Prism 应按规范化平台选择资产：
 
 | 运行环境 | 资产后缀 |
 | --- | --- |
-| Windows x86 | `windows_386` |
 | Windows x64 | `windows_amd64` |
 | Windows ARM64 | `windows_arm64` |
 | macOS Intel | `darwin_amd64` |

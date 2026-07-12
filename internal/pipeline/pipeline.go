@@ -25,6 +25,15 @@ func (f HandlerFunc) HandlePacket(ctx context.Context, decision Decision, packet
 	return f(ctx, decision, packet)
 }
 
+// FatalHandlerError marks a handler failure that must stop the pipeline. It is
+// reserved for fail-closed conditions where continuing would consume traffic.
+type FatalHandlerError struct {
+	Err error
+}
+
+func (e *FatalHandlerError) Error() string { return e.Err.Error() }
+func (e *FatalHandlerError) Unwrap() error { return e.Err }
+
 type Stats struct {
 	PacketsRead   uint64
 	BytesRead     uint64
@@ -106,6 +115,10 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		atomic.AddUint64(&p.stats.PacketsRead, 1)
 		atomic.AddUint64(&p.stats.BytesRead, uint64(len(packet)))
 		if err := p.handlePacket(ctx, packet); err != nil && ctx.Err() == nil {
+			var fatal *FatalHandlerError
+			if errors.As(err, &fatal) {
+				return err
+			}
 			p.logger.Warn("packet pipeline handler error", "error", err)
 		}
 	}

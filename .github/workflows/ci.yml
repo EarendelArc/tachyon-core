@@ -26,6 +26,12 @@ jobs:
           bash -n scripts/verify-server.sh
           bash scripts/verify-server.sh --self-test
 
+      - name: Verify opt-in TGP E2E script
+        shell: bash
+        run: |
+          bash -n scripts/verify-tgp-e2e.sh
+          bash scripts/verify-tgp-e2e.sh --self-test
+
       - name: Test
         run: go test ./...
 
@@ -38,7 +44,13 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+          - goos: linux
+            goarch: arm64
           - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
             goarch: amd64
           - goos: darwin
             goarch: arm64
@@ -54,6 +66,7 @@ jobs:
 
       - name: Build
         env:
+          CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: go build ./...

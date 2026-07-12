@@ -222,6 +222,7 @@ func smokeClientConfig(psk string, remoteAddr string) *config.Config {
 	return &config.Config{
 		Mode: config.ModeClient,
 		Client: config.ClientConfig{
+			TUN: config.TUNConfig{TGPOnly: true},
 			Proxy: config.ProxyConfig{
 				ServerAddr: remoteAddr,
 				LocalAddrs: []string{

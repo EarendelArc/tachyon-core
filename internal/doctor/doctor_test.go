@@ -10,7 +10,7 @@ import (
 )
 
 func TestRunWithFactsClientJSONSchemaAndStatus(t *testing.T) {
-	path := writeClientConfig(t, true)
+	path := writeClientConfig(t, false)
 	report := RunWithFacts(path, PlatformFacts{
 		OS:               "linux",
 		Arch:             "amd64",
@@ -29,7 +29,7 @@ func TestRunWithFactsClientJSONSchemaAndStatus(t *testing.T) {
 	if !report.ClientRequiresTUN || !report.Client.RequiresTUN {
 		t.Fatal("client report should require TUN")
 	}
-	if !report.AutoRoute || report.DNSHijack {
+	if report.AutoRoute || report.DNSHijack {
 		t.Fatalf("unexpected tun flags: auto_route=%v dns_hijack=%v", report.AutoRoute, report.DNSHijack)
 	}
 
@@ -59,7 +59,7 @@ func TestRunWithFactsClientJSONSchemaAndStatus(t *testing.T) {
 	}
 }
 
-func TestRunWithFactsAutoRouteFalseExplainsTUNStillRequired(t *testing.T) {
+func TestRunWithFactsAutoRouteFalseRequiresSelectiveRoutes(t *testing.T) {
 	path := writeClientConfig(t, false)
 	report := RunWithFacts(path, PlatformFacts{
 		OS:               "linux",
@@ -70,15 +70,23 @@ func TestRunWithFactsAutoRouteFalseExplainsTUNStillRequired(t *testing.T) {
 		LinuxCAPNetAdmin: true,
 	})
 
-	if report.OverallStatus != StatusWarn {
-		t.Fatalf("overall_status = %q, want warn", report.OverallStatus)
+	if report.OverallStatus != StatusOK {
+		t.Fatalf("overall_status = %q, want ok", report.OverallStatus)
 	}
 	check := findCheck(report.Checks, CheckAutoRouteDisabled)
-	if check.Status != StatusWarn {
-		t.Fatalf("AUTO_ROUTE_DISABLED status = %q, want warn", check.Status)
+	if check.Status != StatusOK {
+		t.Fatalf("AUTO_ROUTE_DISABLED status = %q, want ok", check.Status)
 	}
-	if !strings.Contains(check.Message, "does not mean TUN is unnecessary") {
-		t.Fatalf("auto_route=false message does not explain TUN requirement: %q", check.Message)
+	if !strings.Contains(check.Message, "selectively routed game UDP") || !strings.Contains(check.Remediation, "selective game routes") {
+		t.Fatalf("auto_route=false check does not explain selective routing: %#v", check)
+	}
+}
+
+func TestRunWithFactsAutoRouteTrueFailsConfigValidation(t *testing.T) {
+	path := writeClientConfig(t, true)
+	report := RunWithFacts(path, PlatformFacts{OS: "linux", Arch: "amd64"})
+	if report.OverallStatus != StatusError || report.Config.Valid {
+		t.Fatalf("auto_route=true report must fail config validation: %#v", report)
 	}
 }
 

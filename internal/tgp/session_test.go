@@ -314,6 +314,63 @@ func TestDatagramSessionReplayFromAlternateSourceDoesNotMigrate(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionRejectsValidCiphertextFromUnknownMultipathSource(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	path := newMigrationTestTransport()
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessionID SessionID
+	copy(sessionID[:], []byte("client-source-id"))
+	known := mustUDPAddr(t, "127.0.0.1:32100")
+	unknown := mustUDPAddr(t, "127.0.0.1:32101")
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 23
+	if err := transport.EnablePathAuthentication(sessionID, pathKey, known); err != nil {
+		t.Fatal(err)
+	}
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	recvKey[0] = 87
+	session, err := NewDatagramSession(SessionOptions{
+		ID: sessionID, Transport: transport, RemoteAddr: known,
+		SendKey: sendKey, RecvKey: recvKey, Pacer: NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("valid but wrong source")
+	header, err := NewDataHeader(sessionID, 14, 91, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := codec.Seal(91, header, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path.inject(wire, unknown)
+	path.inject(wire, known)
+	got, err := session.RecvPacket(ctx, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	if stats := session.Stats(); stats.Migrations != 0 {
+		t.Fatalf("unknown source changed client remote: %#v", stats)
+	}
+}
+
 func TestPacketDedupWindowRejectsReplayAfterEviction(t *testing.T) {
 	window := newPacketDedupWindow(4)
 	for packetNumber := uint64(10); packetNumber <= 14; packetNumber++ {

@@ -104,6 +104,47 @@ func TestMultipathTransportClosesAllPaths(t *testing.T) {
 	}
 }
 
+func TestMultipathTransportAuthorizesOnlyConfiguredOrAuthenticatedServerSources(t *testing.T) {
+	path := newFakeMultipathPath("127.0.0.1:10001")
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	configured := mustMultipathUDPAddr(t, "127.0.0.1:443")
+	authenticated := mustMultipathUDPAddr(t, "127.0.0.2:443")
+	unknown := mustMultipathUDPAddr(t, "127.0.0.3:443")
+	var sessionID SessionID
+	copy(sessionID[:], []byte("client-source-id"))
+	var key [trafficKeySize]byte
+	key[0] = 17
+	if err := transport.EnablePathAuthentication(sessionID, key, configured); err != nil {
+		t.Fatal(err)
+	}
+	request := mustParsePathControl(t, path.nextWrite(t).packet)
+	if !transport.IsSourceAuthorized(configured) {
+		t.Fatal("configured server source was not authorized")
+	}
+	if transport.IsSourceAuthorized(unknown) {
+		t.Fatal("unknown server source was authorized")
+	}
+
+	serverNonce := [pathControlNonceSize]byte{4, 3, 2, 1}
+	challenge, err := marshalPathControl(pathControlChallenge, sessionID, request.clientNonce, serverNonce, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path.reads <- fakeMultipathRead{packet: challenge, from: authenticated}
+	response := path.nextWrite(t)
+	if msg := mustParsePathControl(t, response.packet); msg.msgType != pathControlResponse {
+		t.Fatalf("path control type = %d, want response", msg.msgType)
+	}
+	if !transport.IsSourceAuthorized(authenticated) {
+		t.Fatal("authenticated challenge source was not authorized")
+	}
+}
+
 type fakeMultipathPath struct {
 	local    net.Addr
 	writes   chan fakeMultipathWrite

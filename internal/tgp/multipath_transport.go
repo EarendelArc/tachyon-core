@@ -26,10 +26,11 @@ type MultipathTransport struct {
 }
 
 type clientPathAuthentication struct {
-	sessionID SessionID
-	key       [trafficKeySize]byte
-	remote    net.Addr
-	nonces    [][pathControlNonceSize]byte
+	sessionID        SessionID
+	key              [trafficKeySize]byte
+	remote           net.Addr
+	nonces           [][pathControlNonceSize]byte
+	authorizedSource map[sourceAddrKey]struct{}
 }
 
 type multipathRead struct {
@@ -65,12 +66,17 @@ func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [
 	if t == nil || remote == nil {
 		return errors.New("path authentication requires a transport and remote address")
 	}
+	remoteKey, ok := newSourceAddrKey(remote)
+	if !ok {
+		return errors.New("path authentication requires a routable remote address")
+	}
 	t.pathAuthMu.Lock()
 	t.pathAuth = &clientPathAuthentication{
-		sessionID: sessionID,
-		key:       key,
-		remote:    remote,
-		nonces:    make([][pathControlNonceSize]byte, len(t.paths)),
+		sessionID:        sessionID,
+		key:              key,
+		remote:           remote,
+		nonces:           make([][pathControlNonceSize]byte, len(t.paths)),
+		authorizedSource: map[sourceAddrKey]struct{}{remoteKey: {}},
 	}
 	t.pathAuthMu.Unlock()
 
@@ -79,6 +85,20 @@ func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [
 	}
 	t.pathAuthOnce.Do(func() { go t.pathAuthenticationLoop() })
 	return nil
+}
+
+func (t *MultipathTransport) IsSourceAuthorized(addr net.Addr) bool {
+	key, ok := newSourceAddrKey(addr)
+	if !ok {
+		return false
+	}
+	t.pathAuthMu.RLock()
+	defer t.pathAuthMu.RUnlock()
+	if t.pathAuth == nil {
+		return false
+	}
+	_, ok = t.pathAuth.authorizedSource[key]
+	return ok
 }
 
 func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {
@@ -196,6 +216,15 @@ func (t *MultipathTransport) handlePathControl(index int, path Transport, packet
 	if msg.sessionID != sessionID || msg.clientNonce != wantNonce || !verifyPathControl(msg, key) {
 		return true
 	}
+	sourceKey, ok := newSourceAddrKey(from)
+	if !ok {
+		return true
+	}
+	t.pathAuthMu.Lock()
+	if t.pathAuth != nil && t.pathAuth.sessionID == sessionID {
+		t.pathAuth.authorizedSource[sourceKey] = struct{}{}
+	}
+	t.pathAuthMu.Unlock()
 
 	response, err := marshalPathControl(pathControlResponse, sessionID, msg.clientNonce, msg.serverNonce, key)
 	if err == nil {
@@ -267,3 +296,4 @@ func (t *MultipathTransport) refreshPathAuthentication() error {
 }
 
 var _ Transport = (*MultipathTransport)(nil)
+var _ sourceAuthorizer = (*MultipathTransport)(nil)

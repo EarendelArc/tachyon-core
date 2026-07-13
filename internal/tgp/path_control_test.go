@@ -1,6 +1,9 @@
 package tgp
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestPathControlAuthenticatesChallengeResponse(t *testing.T) {
 	var sessionID SessionID
@@ -56,5 +59,32 @@ func TestPathControlKeyIsSessionBound(t *testing.T) {
 	}
 	if verifyPathControl(msg, secondKey) {
 		t.Fatal("path control authenticated with a different session key")
+	}
+}
+
+func TestPathCookieIsSourceBoundAndExpires(t *testing.T) {
+	var sessionID SessionID
+	copy(sessionID[:], []byte("cookie-source-id"))
+	var key [trafficKeySize]byte
+	key[0] = 73
+	clientNonce := [pathControlNonceSize]byte{1, 9, 8, 4}
+	first, ok := newSourceAddrKey(mustUDPAddr(t, "127.0.0.1:41001"))
+	if !ok {
+		t.Fatal("first source key is invalid")
+	}
+	second, ok := newSourceAddrKey(mustUDPAddr(t, "127.0.0.1:41002"))
+	if !ok {
+		t.Fatal("second source key is invalid")
+	}
+	now := time.Now()
+	cookie := newPathCookie(key, sessionID, first, clientNonce, now)
+	if !verifyPathCookie(cookie, key, sessionID, first, clientNonce, now, pathChallengeLifetime) {
+		t.Fatal("fresh source-bound cookie was rejected")
+	}
+	if verifyPathCookie(cookie, key, sessionID, second, clientNonce, now, pathChallengeLifetime) {
+		t.Fatal("path cookie authenticated from a different source")
+	}
+	if verifyPathCookie(cookie, key, sessionID, first, clientNonce, now.Add(pathChallengeLifetime+time.Second), pathChallengeLifetime) {
+		t.Fatal("expired path cookie was accepted")
 	}
 }

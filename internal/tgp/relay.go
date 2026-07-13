@@ -16,7 +16,7 @@ const (
 	defaultRelayHandlerConcurrency = 1024
 	defaultRelayHandshakeQueueSize = 64
 	defaultRelayMaxPathsPerSession = 8
-	defaultRelayMaxPendingPaths    = 4096
+	defaultRelayUsedPathCookies    = 64
 	pathChallengeLifetime          = 5 * time.Second
 )
 
@@ -352,7 +352,6 @@ type relayTransportRouter struct {
 	done               chan struct{}
 	sessions           map[SessionID]*relaySessionTransport
 	sources            map[sourceAddrKey]*relaySessionTransport
-	pendingPaths       map[pendingPathKey]pendingPathChallenge
 	sessionQueueSize   int
 	droppedHandshakes  atomic.Uint64
 	droppedData        atomic.Uint64
@@ -360,18 +359,6 @@ type relayTransportRouter struct {
 	droppedPathControl atomic.Uint64
 	closed             bool
 	closeOnce          sync.Once
-}
-
-type pendingPathKey struct {
-	sessionID SessionID
-	source    sourceAddrKey
-}
-
-type pendingPathChallenge struct {
-	session     *relaySessionTransport
-	clientNonce [pathControlNonceSize]byte
-	serverNonce [pathControlNonceSize]byte
-	expiresAt   time.Time
 }
 
 func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshakeQueueSize int) *relayTransportRouter {
@@ -387,7 +374,6 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 		done:             make(chan struct{}),
 		sessions:         make(map[SessionID]*relaySessionTransport),
 		sources:          make(map[sourceAddrKey]*relaySessionTransport),
-		pendingPaths:     make(map[pendingPathKey]pendingPathChallenge),
 		sessionQueueSize: sessionQueueSize,
 	}
 }
@@ -458,6 +444,7 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 		sourceKeys:           map[sourceAddrKey]struct{}{addrKey: {}},
 		sourceAddrs:          map[sourceAddrKey]net.Addr{addrKey: addr},
 		activeSource:         addrKey,
+		usedPathCookies:      make(map[[pathControlNonceSize]byte]time.Time),
 		pathKey:              pathKey,
 		allowAdditionalPaths: allowAdditionalPaths,
 		packets:              make(chan relayPacketEnvelope, r.sessionQueueSize),
@@ -477,11 +464,6 @@ func (r *relayTransportRouter) unregister(id SessionID, session *relaySessionTra
 	for source := range session.sourceKeys {
 		if r.sources[source] == session {
 			delete(r.sources, source)
-		}
-	}
-	for key, pending := range r.pendingPaths {
-		if pending.session == session {
-			delete(r.pendingPaths, key)
 		}
 	}
 }
@@ -525,7 +507,6 @@ func (r *relayTransportRouter) handlePathControl(ctx context.Context, envelope r
 
 func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.Addr, source sourceAddrKey, msg pathControlMessage) {
 	r.mu.Lock()
-	r.purgeExpiredPathChallengesLocked(time.Now())
 	session := r.sessions[msg.sessionID]
 	if session == nil || !session.allowAdditionalPaths || session.activeSource == source {
 		r.mu.Unlock()
@@ -543,88 +524,70 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 		return
 	}
 
-	serverNonce, err := newPathNonce()
-	if err != nil {
-		r.droppedPathControl.Add(1)
-		return
-	}
+	serverNonce := newPathCookie(pathKey, msg.sessionID, source, msg.clientNonce, time.Now())
 	challenge, err := marshalPathControl(pathControlChallenge, msg.sessionID, msg.clientNonce, serverNonce, pathKey)
 	if err != nil {
 		r.droppedPathControl.Add(1)
 		return
 	}
 
-	r.mu.Lock()
-	if r.closed || r.sessions[msg.sessionID] != session || len(r.pendingPaths) >= defaultRelayMaxPendingPaths {
-		r.mu.Unlock()
-		r.droppedPathControl.Add(1)
-		return
-	}
-	r.pendingPaths[pendingPathKey{sessionID: msg.sessionID, source: source}] = pendingPathChallenge{
-		session:     session,
-		clientNonce: msg.clientNonce,
-		serverNonce: serverNonce,
-		expiresAt:   time.Now().Add(pathChallengeLifetime),
-	}
-	r.mu.Unlock()
 	if r.transport == nil || r.transport.WritePacket(ctx, challenge, from) != nil {
-		r.mu.Lock()
-		key := pendingPathKey{sessionID: msg.sessionID, source: source}
-		pending, ok := r.pendingPaths[key]
-		if ok && pending.session == session && pending.clientNonce == msg.clientNonce && pending.serverNonce == serverNonce {
-			delete(r.pendingPaths, key)
-		}
-		r.mu.Unlock()
 		r.droppedPathControl.Add(1)
 	}
 }
 
 func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAddrKey, msg pathControlMessage) {
-	key := pendingPathKey{sessionID: msg.sessionID, source: source}
+	now := time.Now()
 	r.mu.Lock()
-	pending, ok := r.pendingPaths[key]
-	if !ok || time.Now().After(pending.expiresAt) || r.sessions[msg.sessionID] != pending.session {
-		delete(r.pendingPaths, key)
+	session := r.sessions[msg.sessionID]
+	if session == nil || !session.allowAdditionalPaths {
 		r.mu.Unlock()
 		r.droppedPathControl.Add(1)
 		return
 	}
-	pathKey := pending.session.pathKey
+	if owner := r.sources[source]; owner != nil && owner != session {
+		r.mu.Unlock()
+		r.droppedPathControl.Add(1)
+		return
+	}
+	pathKey := session.pathKey
 	r.mu.Unlock()
-	if msg.clientNonce != pending.clientNonce || msg.serverNonce != pending.serverNonce || !verifyPathControl(msg, pathKey) {
+	if !verifyPathControl(msg, pathKey) || !verifyPathCookie(msg.serverNonce, pathKey, msg.sessionID, source, msg.clientNonce, now, pathChallengeLifetime) {
 		r.droppedPathControl.Add(1)
 		return
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	pending, ok = r.pendingPaths[key]
-	if !ok || time.Now().After(pending.expiresAt) || r.sessions[msg.sessionID] != pending.session ||
-		msg.clientNonce != pending.clientNonce || msg.serverNonce != pending.serverNonce {
-		delete(r.pendingPaths, key)
+	if r.sessions[msg.sessionID] != session {
 		r.droppedPathControl.Add(1)
 		return
 	}
-	delete(r.pendingPaths, key)
-	if owner := r.sources[source]; owner != nil && owner != pending.session {
+	if owner := r.sources[source]; owner != nil && owner != session {
 		r.droppedPathControl.Add(1)
 		return
 	}
-	_, alreadyAuthorized := pending.session.sourceKeys[source]
-	if !alreadyAuthorized && len(pending.session.sourceKeys) >= defaultRelayMaxPathsPerSession {
+	r.purgeUsedPathCookiesLocked(session, now)
+	if _, used := session.usedPathCookies[msg.serverNonce]; used || len(session.usedPathCookies) >= defaultRelayUsedPathCookies {
 		r.droppedPathControl.Add(1)
 		return
 	}
-	pending.session.sourceKeys[source] = struct{}{}
-	pending.session.sourceAddrs[source] = from
-	pending.session.activeSource = source
-	r.sources[source] = pending.session
+	session.usedPathCookies[msg.serverNonce] = now.Add(pathChallengeLifetime)
+	_, alreadyAuthorized := session.sourceKeys[source]
+	if !alreadyAuthorized && len(session.sourceKeys) >= defaultRelayMaxPathsPerSession {
+		r.droppedPathControl.Add(1)
+		return
+	}
+	session.sourceKeys[source] = struct{}{}
+	session.sourceAddrs[source] = from
+	session.activeSource = source
+	r.sources[source] = session
 }
 
-func (r *relayTransportRouter) purgeExpiredPathChallengesLocked(now time.Time) {
-	for key, pending := range r.pendingPaths {
-		if now.After(pending.expiresAt) {
-			delete(r.pendingPaths, key)
+func (r *relayTransportRouter) purgeUsedPathCookiesLocked(session *relaySessionTransport, now time.Time) {
+	for cookie, expiresAt := range session.usedPathCookies {
+		if !now.Before(expiresAt) {
+			delete(session.usedPathCookies, cookie)
 		}
 	}
 }
@@ -639,7 +602,6 @@ func (r *relayTransportRouter) close() {
 		}
 		r.sessions = make(map[SessionID]*relaySessionTransport)
 		r.sources = make(map[sourceAddrKey]*relaySessionTransport)
-		r.pendingPaths = make(map[pendingPathKey]pendingPathChallenge)
 		close(r.done)
 		r.mu.Unlock()
 
@@ -655,6 +617,7 @@ type relaySessionTransport struct {
 	sourceKeys           map[sourceAddrKey]struct{}
 	sourceAddrs          map[sourceAddrKey]net.Addr
 	activeSource         sourceAddrKey
+	usedPathCookies      map[[pathControlNonceSize]byte]time.Time
 	pathKey              [trafficKeySize]byte
 	allowAdditionalPaths bool
 	packets              chan relayPacketEnvelope

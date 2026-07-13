@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const (
@@ -52,6 +54,41 @@ func newPathNonce() ([pathControlNonceSize]byte, error) {
 		return nonce, fmt.Errorf("generate path nonce: %w", err)
 	}
 	return nonce, nil
+}
+
+func newPathCookie(key [trafficKeySize]byte, sessionID SessionID, source sourceAddrKey, clientNonce [pathControlNonceSize]byte, issuedAt time.Time) [pathControlNonceSize]byte {
+	var cookie [pathControlNonceSize]byte
+	binary.BigEndian.PutUint64(cookie[:8], uint64(issuedAt.Unix()))
+	tag := pathCookieTag(key, sessionID, source, clientNonce, cookie[:8])
+	copy(cookie[8:], tag[:8])
+	return cookie
+}
+
+func verifyPathCookie(cookie [pathControlNonceSize]byte, key [trafficKeySize]byte, sessionID SessionID, source sourceAddrKey, clientNonce [pathControlNonceSize]byte, now time.Time, maxAge time.Duration) bool {
+	issuedUnix := binary.BigEndian.Uint64(cookie[:8])
+	if issuedUnix > uint64(^uint64(0)>>1) {
+		return false
+	}
+	issuedAt := time.Unix(int64(issuedUnix), 0)
+	if issuedAt.After(now.Add(time.Second)) || now.Sub(issuedAt) > maxAge {
+		return false
+	}
+	want := pathCookieTag(key, sessionID, source, clientNonce, cookie[:8])
+	return subtle.ConstantTimeCompare(cookie[8:], want[:8]) == 1
+}
+
+func pathCookieTag(key [trafficKeySize]byte, sessionID SessionID, source sourceAddrKey, clientNonce [pathControlNonceSize]byte, issued []byte) [pathControlTagSize]byte {
+	mac := hmac.New(sha256.New, key[:])
+	_, _ = mac.Write([]byte("tachyon-tgp-v1 path cookie"))
+	_, _ = mac.Write(sessionID[:])
+	_, _ = mac.Write(clientNonce[:])
+	_, _ = mac.Write(issued)
+	_, _ = mac.Write([]byte(source.network))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(source.address))
+	var tag [pathControlTagSize]byte
+	copy(tag[:], mac.Sum(nil))
+	return tag
 }
 
 func marshalPathControl(msgType pathControlType, sessionID SessionID, clientNonce, serverNonce [pathControlNonceSize]byte, key [trafficKeySize]byte) ([]byte, error) {

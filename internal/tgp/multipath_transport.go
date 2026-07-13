@@ -209,22 +209,19 @@ func (t *MultipathTransport) handlePathControl(index int, path Transport, packet
 		t.pathAuthMu.RUnlock()
 		return true
 	}
+	sourceKey, sourceKnown := newSourceAddrKey(from)
+	if !sourceKnown {
+		t.pathAuthMu.RUnlock()
+		return true
+	}
 	sessionID := auth.sessionID
 	key := auth.key
 	wantNonce := auth.nonces[index]
+	_, sourceAuthorized := auth.authorizedSource[sourceKey]
 	t.pathAuthMu.RUnlock()
-	if msg.sessionID != sessionID || msg.clientNonce != wantNonce || !verifyPathControl(msg, key) {
+	if !sourceAuthorized || msg.sessionID != sessionID || msg.clientNonce != wantNonce || !verifyPathControl(msg, key) {
 		return true
 	}
-	sourceKey, ok := newSourceAddrKey(from)
-	if !ok {
-		return true
-	}
-	t.pathAuthMu.Lock()
-	if t.pathAuth != nil && t.pathAuth.sessionID == sessionID {
-		t.pathAuth.authorizedSource[sourceKey] = struct{}{}
-	}
-	t.pathAuthMu.Unlock()
 
 	response, err := marshalPathControl(pathControlResponse, sessionID, msg.clientNonce, msg.serverNonce, key)
 	if err == nil {

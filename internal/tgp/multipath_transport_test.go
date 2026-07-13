@@ -104,7 +104,7 @@ func TestMultipathTransportClosesAllPaths(t *testing.T) {
 	}
 }
 
-func TestMultipathTransportAuthorizesOnlyConfiguredOrAuthenticatedServerSources(t *testing.T) {
+func TestMultipathTransportRejectsForwardedChallengeFromUnknownSource(t *testing.T) {
 	path := newFakeMultipathPath("127.0.0.1:10001")
 	transport, err := NewMultipathTransport(path)
 	if err != nil {
@@ -113,8 +113,7 @@ func TestMultipathTransportAuthorizesOnlyConfiguredOrAuthenticatedServerSources(
 	defer transport.Close()
 
 	configured := mustMultipathUDPAddr(t, "127.0.0.1:443")
-	authenticated := mustMultipathUDPAddr(t, "127.0.0.2:443")
-	unknown := mustMultipathUDPAddr(t, "127.0.0.3:443")
+	unknown := mustMultipathUDPAddr(t, "127.0.0.2:443")
 	var sessionID SessionID
 	copy(sessionID[:], []byte("client-source-id"))
 	var key [trafficKeySize]byte
@@ -135,13 +134,19 @@ func TestMultipathTransportAuthorizesOnlyConfiguredOrAuthenticatedServerSources(
 	if err != nil {
 		t.Fatal(err)
 	}
-	path.reads <- fakeMultipathRead{packet: challenge, from: authenticated}
+	path.reads <- fakeMultipathRead{packet: challenge, from: unknown}
+	path.assertNoWrite(t)
+	if transport.IsSourceAuthorized(unknown) {
+		t.Fatal("forwarded challenge authorized an unknown server source")
+	}
+
+	path.reads <- fakeMultipathRead{packet: challenge, from: configured}
 	response := path.nextWrite(t)
 	if msg := mustParsePathControl(t, response.packet); msg.msgType != pathControlResponse {
 		t.Fatalf("path control type = %d, want response", msg.msgType)
 	}
-	if !transport.IsSourceAuthorized(authenticated) {
-		t.Fatal("authenticated challenge source was not authorized")
+	if response.addr.String() != configured.String() {
+		t.Fatalf("response destination = %v, want configured relay %v", response.addr, configured)
 	}
 }
 
@@ -209,6 +214,15 @@ func (p *fakeMultipathPath) nextWrite(t *testing.T) fakeMultipathWrite {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for multipath write")
 		return fakeMultipathWrite{}
+	}
+}
+
+func (p *fakeMultipathPath) assertNoWrite(t *testing.T) {
+	t.Helper()
+	select {
+	case write := <-p.writes:
+		t.Fatalf("unexpected multipath write to %v", write.addr)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 

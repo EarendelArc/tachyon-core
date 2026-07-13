@@ -332,6 +332,25 @@ func TestDatagramSessionRejectsValidCiphertextFromUnknownMultipathSource(t *test
 	if err := transport.EnablePathAuthentication(sessionID, pathKey, known); err != nil {
 		t.Fatal(err)
 	}
+	request := mustParsePathControl(t, path.nextWritePacket(ctx))
+	if got := path.nextWriteAddr(ctx); !sameAddr(got, known) {
+		t.Fatalf("path request destination = %v, want %v", got, known)
+	}
+	serverNonce := [pathControlNonceSize]byte{9, 8, 7, 6}
+	challenge, err := marshalPathControl(pathControlChallenge, sessionID, request.clientNonce, serverNonce, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path.inject(challenge, unknown)
+	noResponseCtx, cancelNoResponse := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	if response := path.nextWritePacket(noResponseCtx); response != nil {
+		cancelNoResponse()
+		t.Fatal("forwarded challenge from unknown source produced a response")
+	}
+	cancelNoResponse()
+	if transport.IsSourceAuthorized(unknown) {
+		t.Fatal("forwarded challenge authorized an unknown relay source")
+	}
 	var sendKey [trafficKeySize]byte
 	var recvKey [trafficKeySize]byte
 	recvKey[0] = 87

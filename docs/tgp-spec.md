@@ -255,9 +255,12 @@ session queue:
 
 The request tag alone never registers a source. `ClientNonce` carries an
 authenticated timestamp and requests outside the 10-second window are rejected.
-Fresh requests allocate no global pending state and share a strict per-CID token
-bucket (burst 8, refill 2/second) before request HMAC and response work. Thus a
-captured request can produce only bounded reflection and CPU cost. Replayed
+Fresh requests allocate no global pending state. A fixed-state global bucket
+(burst 64, refill 32/second) bounds pre-authentication lookup and HMAC work.
+Only requests with a valid HMAC then consume the session's per-CID bucket
+(burst 8, refill 2/second) before response generation, so random tags cannot
+drain a legitimate migration quota. Thus a captured request can produce only
+bounded reflection and CPU cost. Replayed
 responses fail the bounded per-session consumed-cookie check. Unknown
 non-control data remains fail-closed and is not broadcast for trial decryption.
 

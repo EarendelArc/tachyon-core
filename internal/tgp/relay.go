@@ -17,6 +17,8 @@ const (
 	defaultRelayHandshakeQueueSize = 64
 	defaultRelayMaxPathsPerSession = 8
 	defaultRelayUsedPathCookies    = 64
+	globalPathRequestTokenBurst    = 64
+	globalPathRequestTokensPerSec  = 32
 	pathRequestTokenBurst          = 8
 	pathRequestTokensPerSecond     = 2
 	pathChallengeLifetime          = 5 * time.Second
@@ -363,18 +365,23 @@ type relayTransportRouter struct {
 	transport Transport
 	now       func() time.Time
 
-	mu                 sync.Mutex
-	handshakes         chan relayPacketEnvelope
-	done               chan struct{}
-	sessions           map[SessionID]*relaySessionTransport
-	sources            map[sourceAddrKey]*relaySessionTransport
-	sessionQueueSize   int
-	droppedHandshakes  atomic.Uint64
-	droppedData        atomic.Uint64
-	droppedUnknownData atomic.Uint64
-	droppedPathControl atomic.Uint64
-	closed             bool
-	closeOnce          sync.Once
+	pathRequestLimitMu        sync.Mutex
+	globalPathRequestTokens   float64
+	globalPathRequestRefillAt time.Time
+
+	mu                    sync.Mutex
+	handshakes            chan relayPacketEnvelope
+	done                  chan struct{}
+	sessions              map[SessionID]*relaySessionTransport
+	sources               map[sourceAddrKey]*relaySessionTransport
+	sessionQueueSize      int
+	droppedHandshakes     atomic.Uint64
+	droppedData           atomic.Uint64
+	droppedUnknownData    atomic.Uint64
+	droppedPathControl    atomic.Uint64
+	pathRequestAuthChecks atomic.Uint64
+	closed                bool
+	closeOnce             sync.Once
 }
 
 func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshakeQueueSize int) *relayTransportRouter {
@@ -385,13 +392,14 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 		handshakeQueueSize = defaultRelayHandshakeQueueSize
 	}
 	return &relayTransportRouter{
-		transport:        transport,
-		now:              time.Now,
-		handshakes:       make(chan relayPacketEnvelope, handshakeQueueSize),
-		done:             make(chan struct{}),
-		sessions:         make(map[SessionID]*relaySessionTransport),
-		sources:          make(map[sourceAddrKey]*relaySessionTransport),
-		sessionQueueSize: sessionQueueSize,
+		transport:               transport,
+		now:                     time.Now,
+		globalPathRequestTokens: globalPathRequestTokenBurst,
+		handshakes:              make(chan relayPacketEnvelope, handshakeQueueSize),
+		done:                    make(chan struct{}),
+		sessions:                make(map[SessionID]*relaySessionTransport),
+		sources:                 make(map[sourceAddrKey]*relaySessionTransport),
+		sessionQueueSize:        sessionQueueSize,
 	}
 }
 
@@ -534,10 +542,33 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 		r.droppedPathControl.Add(1)
 		return
 	}
+	if !r.consumeGlobalPathRequestToken(now) {
+		r.droppedPathControl.Add(1)
+		return
+	}
 	r.mu.Lock()
 	session := r.sessions[msg.sessionID]
 	if session == nil || !session.allowAdditionalPaths || session.activeSource == source {
 		r.mu.Unlock()
+		return
+	}
+	if owner := r.sources[source]; owner != nil && owner != session {
+		r.mu.Unlock()
+		r.droppedPathControl.Add(1)
+		return
+	}
+	pathKey := session.pathKey
+	r.mu.Unlock()
+	r.pathRequestAuthChecks.Add(1)
+	if !verifyPathControl(msg, pathKey) {
+		r.droppedPathControl.Add(1)
+		return
+	}
+
+	r.mu.Lock()
+	if r.sessions[msg.sessionID] != session || !session.allowAdditionalPaths || session.activeSource == source {
+		r.mu.Unlock()
+		r.droppedPathControl.Add(1)
 		return
 	}
 	if owner := r.sources[source]; owner != nil && owner != session {
@@ -550,12 +581,7 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 		r.droppedPathControl.Add(1)
 		return
 	}
-	pathKey := session.pathKey
 	r.mu.Unlock()
-	if !verifyPathControl(msg, pathKey) {
-		r.droppedPathControl.Add(1)
-		return
-	}
 
 	serverNonce := newPathCookie(pathKey, msg.sessionID, source, msg.clientNonce, now)
 	challenge, err := marshalPathControl(pathControlChallenge, msg.sessionID, msg.clientNonce, serverNonce, pathKey)
@@ -567,6 +593,24 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 	if r.transport == nil || r.transport.WritePacket(ctx, challenge, from) != nil {
 		r.droppedPathControl.Add(1)
 	}
+}
+
+func (r *relayTransportRouter) consumeGlobalPathRequestToken(now time.Time) bool {
+	r.pathRequestLimitMu.Lock()
+	defer r.pathRequestLimitMu.Unlock()
+	if r.globalPathRequestRefillAt.IsZero() {
+		r.globalPathRequestRefillAt = now
+	}
+	if now.After(r.globalPathRequestRefillAt) {
+		elapsed := now.Sub(r.globalPathRequestRefillAt).Seconds()
+		r.globalPathRequestTokens = min(float64(globalPathRequestTokenBurst), r.globalPathRequestTokens+elapsed*globalPathRequestTokensPerSec)
+		r.globalPathRequestRefillAt = now
+	}
+	if r.globalPathRequestTokens < 1 {
+		return false
+	}
+	r.globalPathRequestTokens--
+	return true
 }
 
 func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAddrKey, msg pathControlMessage) {

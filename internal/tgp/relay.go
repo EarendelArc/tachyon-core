@@ -78,6 +78,9 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 	if opts.Transport == nil && opts.ListenAddr == "" {
 		return nil, errors.New("relay listen address or transport is required")
 	}
+	if err := validateFECOptions(opts.FEC); err != nil {
+		return nil, err
+	}
 	handler := opts.Handler
 	if handler == nil {
 		handler = RelayHandlerFunc(func(context.Context, RelayPacket) error { return nil })

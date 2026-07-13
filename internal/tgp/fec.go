@@ -9,9 +9,22 @@ import (
 	"github.com/klauspost/reedsolomon"
 )
 
-const fecLengthPrefixSize = 2
+const (
+	fecLengthPrefixSize       = 2
+	MaxFECDataShards          = 32
+	MaxFECParityShards        = 16
+	MaxFECTotalShards         = MaxFECDataShards + MaxFECParityShards
+	MaxFECReceiveGroups       = 64
+	MaxFECCompletedGroups     = 4096
+	MaxFECReceiveBufferedByte = 4 << 20
+	fecReceiveGroupLifetime   = 30 * time.Second
+)
 
-var ErrInvalidFECParams = errors.New("invalid fec parameters")
+var (
+	ErrInvalidFECParams = errors.New("invalid fec parameters")
+	ErrFECResourceLimit = errors.New("fec receive resource limit exceeded")
+	ErrFECShardTooLarge = errors.New("fec shard exceeds protocol limit")
+)
 
 type ReedSolomonCodec struct{}
 
@@ -29,8 +42,8 @@ func (c *ReedSolomonCodec) Encode(data [][]byte, dataShards, parityShards int) (
 
 	shardSize := fecLengthPrefixSize
 	for _, shard := range data {
-		if len(shard) > 0xffff {
-			return nil, fmt.Errorf("%w: data shard exceeds 65535 bytes", ErrInvalidFECParams)
+		if len(shard)+fecLengthPrefixSize > maxTGPDataPayloadSize {
+			return nil, fmt.Errorf("%w: %d > %d", ErrFECShardTooLarge, len(shard)+fecLengthPrefixSize, maxTGPDataPayloadSize)
 		}
 		if len(shard)+fecLengthPrefixSize > shardSize {
 			shardSize = len(shard) + fecLengthPrefixSize
@@ -71,6 +84,11 @@ func (c *ReedSolomonCodec) Reconstruct(shards [][]byte, dataShards, parityShards
 	if len(shards) != dataShards+parityShards {
 		return fmt.Errorf("%w: shard count %d does not match data+parity %d", ErrInvalidFECParams, len(shards), dataShards+parityShards)
 	}
+	for _, shard := range shards {
+		if len(shard) > maxTGPDataPayloadSize {
+			return fmt.Errorf("%w: %d > %d", ErrFECShardTooLarge, len(shard), maxTGPDataPayloadSize)
+		}
+	}
 	normalizeFECShardLengths(shards)
 
 	encoder, err := reedsolomon.New(dataShards, parityShards)
@@ -94,6 +112,28 @@ func validateFECParams(dataShards, parityShards int) error {
 	if dataShards < 1 || parityShards < 1 {
 		return fmt.Errorf("%w: data and parity shards must be positive", ErrInvalidFECParams)
 	}
+	if dataShards > MaxFECDataShards {
+		return fmt.Errorf("%w: data shards %d exceed %d", ErrInvalidFECParams, dataShards, MaxFECDataShards)
+	}
+	if parityShards > MaxFECParityShards {
+		return fmt.Errorf("%w: parity shards %d exceed %d", ErrInvalidFECParams, parityShards, MaxFECParityShards)
+	}
+	if dataShards+parityShards > MaxFECTotalShards {
+		return fmt.Errorf("%w: total shards %d exceed %d", ErrInvalidFECParams, dataShards+parityShards, MaxFECTotalShards)
+	}
+	return nil
+}
+
+func validateFECOptions(options FECOptions) error {
+	if options.DataShards == 0 && options.ParityShards == 0 {
+		return nil
+	}
+	if err := validateFECParams(options.DataShards, options.ParityShards); err != nil {
+		return err
+	}
+	if options.MaxReceiveGroups < 0 || options.MaxReceiveGroups > MaxFECReceiveGroups {
+		return fmt.Errorf("%w: receive groups %d must be between 0 and %d", ErrInvalidFECParams, options.MaxReceiveGroups, MaxFECReceiveGroups)
+	}
 	return nil
 }
 
@@ -104,9 +144,12 @@ type FECReceiveResult struct {
 }
 
 type FECReceiveBuffer struct {
-	codec     FECCodec
-	groups    map[uint32]*FECGroupState
-	maxGroups int
+	codec            FECCodec
+	groups           map[uint32]*FECGroupState
+	completedGroups  map[uint32]time.Time
+	maxGroups        int
+	maxBufferedBytes int
+	bufferedBytes    int
 }
 
 func NewFECReceiveBuffer(codec FECCodec, maxGroups int) *FECReceiveBuffer {
@@ -114,18 +157,26 @@ func NewFECReceiveBuffer(codec FECCodec, maxGroups int) *FECReceiveBuffer {
 		codec = NewReedSolomonCodec()
 	}
 	if maxGroups <= 0 {
-		maxGroups = 128
+		maxGroups = MaxFECReceiveGroups
+	}
+	if maxGroups > MaxFECReceiveGroups {
+		maxGroups = MaxFECReceiveGroups
 	}
 	return &FECReceiveBuffer{
-		codec:     codec,
-		groups:    make(map[uint32]*FECGroupState),
-		maxGroups: maxGroups,
+		codec:            codec,
+		groups:           make(map[uint32]*FECGroupState),
+		completedGroups:  make(map[uint32]time.Time),
+		maxGroups:        maxGroups,
+		maxBufferedBytes: MaxFECReceiveBufferedByte,
 	}
 }
 
 func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 	header := packet.Inner
 	if header.FECTotal == 0 || header.FECDataShards == 0 {
+		if len(packet.Payload) > maxTGPDataPayloadSize {
+			return FECReceiveResult{}, fmt.Errorf("%w: %d > %d", ErrFECShardTooLarge, len(packet.Payload), maxTGPDataPayloadSize)
+		}
 		return FECReceiveResult{
 			Payloads: [][]byte{append([]byte(nil), packet.Payload...)},
 			Ready:    true,
@@ -134,6 +185,14 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 	if header.FECDataShards >= header.FECTotal {
 		return FECReceiveResult{}, fmt.Errorf("%w: fec data shards must be smaller than total shards", ErrInvalidFECParams)
 	}
+	dataShards := int(header.FECDataShards)
+	parityShards := int(header.FECTotal) - dataShards
+	if err := validateFECParams(dataShards, parityShards); err != nil {
+		return FECReceiveResult{}, err
+	}
+	if len(packet.Payload) > maxTGPDataPayloadSize {
+		return FECReceiveResult{}, fmt.Errorf("%w: %d > %d", ErrFECShardTooLarge, len(packet.Payload), maxTGPDataPayloadSize)
+	}
 	if header.FECIndex >= header.FECTotal {
 		return FECReceiveResult{}, fmt.Errorf("%w: fec index %d exceeds total %d", ErrInvalidFECParams, header.FECIndex, header.FECTotal)
 	}
@@ -141,7 +200,14 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 		b = NewFECReceiveBuffer(nil, 0)
 	}
 
-	group := b.group(header)
+	b.purgeExpiredGroups(time.Now())
+	if _, completed := b.completedGroups[header.FECGroup]; completed {
+		return FECReceiveResult{}, nil
+	}
+	group, err := b.group(header)
+	if err != nil {
+		return FECReceiveResult{}, err
+	}
 	if group.DataShards != int(header.FECDataShards) || len(group.Shards) != int(header.FECTotal) {
 		return FECReceiveResult{}, fmt.Errorf("%w: inconsistent fec group metadata", ErrInvalidFECParams)
 	}
@@ -150,7 +216,11 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 	if group.Shards[index] != nil {
 		return FECReceiveResult{}, nil
 	}
+	if b.bufferedBytes+len(packet.Payload) > b.maxBufferedBytes {
+		return FECReceiveResult{}, fmt.Errorf("%w: buffered bytes %d + shard %d > %d", ErrFECResourceLimit, b.bufferedBytes, len(packet.Payload), b.maxBufferedBytes)
+	}
 	group.Shards[index] = append([]byte(nil), packet.Payload...)
+	b.bufferedBytes += len(packet.Payload)
 
 	if index < group.DataShards && header.Flags&FlagFEC == 0 {
 		payload, err := decodeFECDataShard(group.Shards[index])
@@ -161,10 +231,12 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 			return FECReceiveResult{}, nil
 		}
 		group.Delivered[index] = true
-		return FECReceiveResult{
+		result := FECReceiveResult{
 			Payloads: [][]byte{payload},
 			Ready:    true,
-		}, nil
+		}
+		b.completeGroupIfDelivered(group)
+		return result, nil
 	}
 
 	if !hasEnoughFECShards(group) {
@@ -175,9 +247,9 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 	if len(missing) == 0 {
 		return FECReceiveResult{}, nil
 	}
-	dataShards := group.DataShards
-	parityShards := len(group.Shards) - dataShards
-	if err := b.codec.Reconstruct(group.Shards, dataShards, parityShards); err != nil {
+	groupDataShards := group.DataShards
+	groupParityShards := len(group.Shards) - groupDataShards
+	if err := b.codec.Reconstruct(group.Shards, groupDataShards, groupParityShards); err != nil {
 		return FECReceiveResult{}, err
 	}
 	group.Recovered = true
@@ -191,6 +263,7 @@ func (b *FECReceiveBuffer) AddPacket(packet Packet) (FECReceiveResult, error) {
 		group.Delivered[missingIndex] = true
 		payloads = append(payloads, payload)
 	}
+	b.completeGroupIfDelivered(group)
 	return FECReceiveResult{
 		Payloads:        payloads,
 		Ready:           len(payloads) > 0,
@@ -205,23 +278,20 @@ func (b *FECReceiveBuffer) PendingGroups() int {
 	return len(b.groups)
 }
 
-func (b *FECReceiveBuffer) group(header InnerHeader) *FECGroupState {
+func (b *FECReceiveBuffer) BufferedBytes() int {
+	if b == nil {
+		return 0
+	}
+	return b.bufferedBytes
+}
+
+func (b *FECReceiveBuffer) group(header InnerHeader) (*FECGroupState, error) {
 	group, ok := b.groups[header.FECGroup]
 	if ok {
-		return group
+		return group, nil
 	}
 	if len(b.groups) >= b.maxGroups {
-		var oldestID uint32
-		var oldestAt time.Time
-		first := true
-		for id, candidate := range b.groups {
-			if first || candidate.ReceivedAt.Before(oldestAt) {
-				oldestID = id
-				oldestAt = candidate.ReceivedAt
-				first = false
-			}
-		}
-		delete(b.groups, oldestID)
+		return nil, fmt.Errorf("%w: groups %d >= %d", ErrFECResourceLimit, len(b.groups), b.maxGroups)
 	}
 	group = &FECGroupState{
 		GroupID:    header.FECGroup,
@@ -231,7 +301,59 @@ func (b *FECReceiveBuffer) group(header InnerHeader) *FECGroupState {
 		ReceivedAt: time.Now(),
 	}
 	b.groups[header.FECGroup] = group
-	return group
+	return group, nil
+}
+
+func (b *FECReceiveBuffer) completeGroupIfDelivered(group *FECGroupState) {
+	for _, delivered := range group.Delivered {
+		if !delivered {
+			return
+		}
+	}
+	b.releaseGroupShards(group)
+	delete(b.groups, group.GroupID)
+	b.rememberCompletedGroup(group.GroupID, time.Now())
+}
+
+func (b *FECReceiveBuffer) purgeExpiredGroups(now time.Time) {
+	for id, group := range b.groups {
+		if now.Sub(group.ReceivedAt) >= fecReceiveGroupLifetime {
+			b.releaseGroupShards(group)
+			delete(b.groups, id)
+		}
+	}
+	for id, completedAt := range b.completedGroups {
+		if now.Sub(completedAt) >= fecReceiveGroupLifetime {
+			delete(b.completedGroups, id)
+		}
+	}
+}
+
+func (b *FECReceiveBuffer) rememberCompletedGroup(id uint32, completedAt time.Time) {
+	if len(b.completedGroups) >= MaxFECCompletedGroups {
+		var oldestID uint32
+		var oldestAt time.Time
+		first := true
+		for candidateID, candidateAt := range b.completedGroups {
+			if first || candidateAt.Before(oldestAt) {
+				oldestID = candidateID
+				oldestAt = candidateAt
+				first = false
+			}
+		}
+		delete(b.completedGroups, oldestID)
+	}
+	b.completedGroups[id] = completedAt
+}
+
+func (b *FECReceiveBuffer) releaseGroupShards(group *FECGroupState) {
+	for index, shard := range group.Shards {
+		b.bufferedBytes -= len(shard)
+		group.Shards[index] = nil
+	}
+	if b.bufferedBytes < 0 {
+		b.bufferedBytes = 0
+	}
 }
 
 func hasEnoughFECShards(group *FECGroupState) bool {
@@ -255,8 +377,8 @@ func missingDataShardIndexes(group *FECGroupState) []int {
 }
 
 func frameFECData(payload []byte, shardSize int) ([]byte, error) {
-	if len(payload) > 0xffff {
-		return nil, fmt.Errorf("%w: data shard exceeds 65535 bytes", ErrInvalidFECParams)
+	if len(payload)+fecLengthPrefixSize > maxTGPDataPayloadSize || shardSize > maxTGPDataPayloadSize {
+		return nil, fmt.Errorf("%w: shard size %d exceeds %d", ErrFECShardTooLarge, shardSize, maxTGPDataPayloadSize)
 	}
 	if shardSize < len(payload)+fecLengthPrefixSize {
 		return nil, fmt.Errorf("%w: fec shard size too small", ErrInvalidFECParams)

@@ -119,6 +119,9 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	if opts.RemoteAddr == nil {
 		return nil, errors.New("tgp session remote address is required")
 	}
+	if err := validateFECOptions(opts.FEC); err != nil {
+		return nil, err
+	}
 	sendCodec, err := NewCodec(opts.SendKey)
 	if err != nil {
 		return nil, fmt.Errorf("send codec: %w", err)

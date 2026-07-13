@@ -2,6 +2,7 @@ package tgp
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -184,6 +185,86 @@ func TestFECReceiveBufferDoesNotDeliverFECOnlyDataShard(t *testing.T) {
 	}
 	if result.Ready || len(result.Payloads) != 0 {
 		t.Fatalf("fec-only data shard was delivered: %#v", result)
+	}
+}
+
+func TestFECRejectsShardCountsAboveProtocolLimit(t *testing.T) {
+	codec := NewReedSolomonCodec()
+	if _, err := codec.Encode(nil, MaxFECDataShards+1, 1); !errors.Is(err, ErrInvalidFECParams) {
+		t.Fatalf("data shard limit error = %v", err)
+	}
+	if _, err := codec.Encode(nil, 1, MaxFECParityShards+1); !errors.Is(err, ErrInvalidFECParams) {
+		t.Fatalf("parity shard limit error = %v", err)
+	}
+	buffer := NewFECReceiveBuffer(codec, 0)
+	packet := fecPacket(1, 0, 255, 1, []byte{0, 0})
+	if _, err := buffer.AddPacket(packet); !errors.Is(err, ErrInvalidFECParams) {
+		t.Fatalf("wire shard count error = %v, want %v", err, ErrInvalidFECParams)
+	}
+	if buffer.PendingGroups() != 0 || buffer.BufferedBytes() != 0 {
+		t.Fatalf("invalid shard counts allocated state: groups=%d bytes=%d", buffer.PendingGroups(), buffer.BufferedBytes())
+	}
+}
+
+func TestFECRejectsOversizedShardBeforeBuffering(t *testing.T) {
+	codec := NewReedSolomonCodec()
+	if _, err := codec.Encode([][]byte{make([]byte, maxTGPDataPayloadSize)}, 1, 1); !errors.Is(err, ErrFECShardTooLarge) {
+		t.Fatalf("encode oversized shard error = %v", err)
+	}
+	buffer := NewFECReceiveBuffer(codec, 0)
+	packet := fecPacket(2, 0, 2, 1, make([]byte, maxTGPDataPayloadSize+1))
+	if _, err := buffer.AddPacket(packet); !errors.Is(err, ErrFECShardTooLarge) {
+		t.Fatalf("receive oversized shard error = %v", err)
+	}
+	if buffer.PendingGroups() != 0 || buffer.BufferedBytes() != 0 {
+		t.Fatalf("oversized shard allocated state: groups=%d bytes=%d", buffer.PendingGroups(), buffer.BufferedBytes())
+	}
+}
+
+func TestFECReceiveBufferFailsClosedAtGroupLimit(t *testing.T) {
+	buffer := NewFECReceiveBuffer(nil, 1)
+	first := fecPacketWithFlags(10, 2, 3, 2, []byte{1, 2, 3}, FlagFEC)
+	if _, err := buffer.AddPacket(first); err != nil {
+		t.Fatal(err)
+	}
+	second := fecPacketWithFlags(11, 2, 3, 2, []byte{4, 5, 6}, FlagFEC)
+	if _, err := buffer.AddPacket(second); !errors.Is(err, ErrFECResourceLimit) {
+		t.Fatalf("group limit error = %v, want %v", err, ErrFECResourceLimit)
+	}
+	if buffer.PendingGroups() != 1 || buffer.BufferedBytes() != len(first.Payload) {
+		t.Fatalf("group limit mutated state: groups=%d bytes=%d", buffer.PendingGroups(), buffer.BufferedBytes())
+	}
+}
+
+func TestFECReceiveBufferFailsClosedAtByteLimit(t *testing.T) {
+	buffer := NewFECReceiveBuffer(nil, 2)
+	buffer.maxBufferedBytes = 5
+	first := fecPacketWithFlags(20, 2, 3, 2, []byte{1, 2, 3, 4}, FlagFEC)
+	if _, err := buffer.AddPacket(first); err != nil {
+		t.Fatal(err)
+	}
+	second := fecPacket(20, 0, 3, 2, []byte{0, 0, 5, 6})
+	if _, err := buffer.AddPacket(second); !errors.Is(err, ErrFECResourceLimit) {
+		t.Fatalf("byte limit error = %v, want %v", err, ErrFECResourceLimit)
+	}
+	if buffer.BufferedBytes() != len(first.Payload) {
+		t.Fatalf("byte limit mutated buffer: got %d want %d", buffer.BufferedBytes(), len(first.Payload))
+	}
+}
+
+func TestFECCompletedGroupsDoNotConsumeActiveGroupCapacity(t *testing.T) {
+	buffer := NewFECReceiveBuffer(nil, 1)
+	for group := uint32(1); group <= 100; group++ {
+		result, err := buffer.AddPacket(fecPacket(group, 0, 2, 1, []byte{0, 0}))
+		if err != nil {
+			t.Fatalf("complete group %d: %v", group, err)
+		}
+		if !result.Ready {
+			t.Fatalf("complete group %d was not delivered", group)
+		}
+	}
+	if buffer.PendingGroups() != 0 || buffer.BufferedBytes() != 0 {
+		t.Fatalf("completed groups retained payload state: groups=%d bytes=%d", buffer.PendingGroups(), buffer.BufferedBytes())
 	}
 }
 

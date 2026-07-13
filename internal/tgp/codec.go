@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	outerHeaderSize = 13
-	innerHeaderSize = 43
-	maxDTLSSequence = 1<<48 - 1
+	outerHeaderSize       = 13
+	innerHeaderSize       = 43
+	MaxTGPDatagramSize    = 1452
+	maxTGPDataPayloadSize = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - chacha20poly1305.Overhead
+	maxDTLSSequence       = 1<<48 - 1
 )
 
 var (
@@ -22,6 +24,7 @@ var (
 	ErrInvalidMagic     = errors.New("invalid tgp magic")
 	ErrInvalidLength    = errors.New("invalid tgp length")
 	ErrSequenceOverflow = errors.New("dtls sequence number exceeds 48 bits")
+	ErrDatagramTooLarge = errors.New("tgp datagram exceeds protocol limit")
 )
 
 type Codec struct {
@@ -81,6 +84,10 @@ func (c *Codec) Seal(sequence uint64, inner InnerHeader, payload []byte) ([]byte
 	if len(payload) > 0xffff {
 		return nil, ErrInvalidLength
 	}
+	wireSize := outerHeaderSize + innerHeaderSize + len(payload) + c.aead.Overhead()
+	if wireSize > MaxTGPDatagramSize {
+		return nil, fmt.Errorf("%w: %d > %d", ErrDatagramTooLarge, wireSize, MaxTGPDatagramSize)
+	}
 	inner.PayloadLength = uint16(len(payload))
 	inner.Flags |= FlagEncrypted
 
@@ -105,6 +112,9 @@ func (c *Codec) Seal(sequence uint64, inner InnerHeader, payload []byte) ([]byte
 func (c *Codec) Open(wire []byte) (Packet, error) {
 	if c == nil || c.aead == nil {
 		return Packet{}, errors.New("nil tgp codec")
+	}
+	if len(wire) > MaxTGPDatagramSize {
+		return Packet{}, fmt.Errorf("%w: %d > %d", ErrDatagramTooLarge, len(wire), MaxTGPDatagramSize)
 	}
 	if len(wire) < outerHeaderSize+c.aead.Overhead()+innerHeaderSize {
 		return Packet{}, ErrPacketTooShort

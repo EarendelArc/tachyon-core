@@ -2,6 +2,7 @@ package tgp
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -62,5 +63,24 @@ func TestCodecRejectsTamperedPacket(t *testing.T) {
 	wire[len(wire)-1] ^= 0x80
 	if _, err := codec.Open(wire); err == nil {
 		t.Fatal("expected tampered packet to fail authentication")
+	}
+}
+
+func TestCodecRejectsDatagramsAboveProtocolLimit(t *testing.T) {
+	var key [trafficKeySize]byte
+	codec, err := NewCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, maxTGPDataPayloadSize+1)
+	header, err := NewDataHeader(SessionID{}, 1, 1, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codec.Seal(1, header, payload); !errors.Is(err, ErrDatagramTooLarge) {
+		t.Fatalf("oversized seal error = %v, want %v", err, ErrDatagramTooLarge)
+	}
+	if _, err := codec.Open(make([]byte, MaxTGPDatagramSize+1)); !errors.Is(err, ErrDatagramTooLarge) {
+		t.Fatalf("oversized open error = %v, want %v", err, ErrDatagramTooLarge)
 	}
 }

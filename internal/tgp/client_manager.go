@@ -47,6 +47,9 @@ type ClientManager struct {
 }
 
 func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
+	if err := validateFECOptions(opts.FEC); err != nil {
+		return nil, err
+	}
 	remote := strings.TrimSpace(opts.RemoteAddr)
 	if remote == "" {
 		return nil, errors.New("tgp remote address is required")

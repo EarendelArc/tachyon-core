@@ -562,6 +562,91 @@ func TestRelayInvalidFECDoesNotChangeActiveReturnPath(t *testing.T) {
 	}
 }
 
+func TestRelayContinuousNATRebindSafelyReplacesInactivePaths(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 4, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("many-rebinds-id!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 93
+	original := mustRelayUDPAddr(t, "127.0.0.1:10801")
+	session, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	var firstRebind net.Addr
+	var latest net.Addr
+	for index := 0; index < defaultRelayMaxPathsPerSession+12; index++ {
+		source := mustRelayUDPAddr(t, fmt.Sprintf("127.0.0.1:%d", 13000+index))
+		if index == 0 {
+			firstRebind = source
+		}
+		latest = source
+		authenticateRelayTestPath(t, router, transport, sessionID, pathKey, source)
+		if !session.IsSourceAuthorized(source) {
+			t.Fatalf("rebind %d was not authorized", index)
+		}
+		router.mu.Lock()
+		pathCount := len(session.paths)
+		active := session.activeSource
+		router.mu.Unlock()
+		wantActive, _ := newSourceAddrKey(source)
+		if pathCount > defaultRelayMaxPathsPerSession {
+			t.Fatalf("path count = %d, exceeds %d", pathCount, defaultRelayMaxPathsPerSession)
+		}
+		if active != wantActive {
+			t.Fatalf("active source after rebind %d = %#v, want %#v", index, active, wantActive)
+		}
+	}
+	if session.IsSourceAuthorized(firstRebind) {
+		t.Fatal("oldest inactive path survived bounded replacement")
+	}
+	if err := session.WritePacket(context.Background(), []byte("reply"), original); err != nil {
+		t.Fatal(err)
+	}
+	if write := transport.nextWrite(t); !sameAddr(write.addr, latest) {
+		t.Fatalf("reply path = %v, want latest rebind %v", write.addr, latest)
+	}
+}
+
+func TestRelayAgesOutInactivePathWithoutRemovingActivePath(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 4, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("aged-path-id!!!!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 94
+	original := mustRelayUDPAddr(t, "127.0.0.1:10901")
+	active := mustRelayUDPAddr(t, "127.0.0.1:10902")
+	session, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	authenticateRelayTestPath(t, router, transport, sessionID, pathKey, active)
+	originalKey, _ := newSourceAddrKey(original)
+	router.mu.Lock()
+	old := session.paths[originalKey]
+	old.lastSeen = time.Now().Add(-pathAuthorizationLifetime - time.Second)
+	session.paths[originalKey] = old
+	router.mu.Unlock()
+
+	if session.IsSourceAuthorized(original) {
+		t.Fatal("expired inactive path remained authorized")
+	}
+	if !session.IsSourceAuthorized(active) {
+		t.Fatal("active path was removed by path aging")
+	}
+	router.mu.Lock()
+	_, globallyMapped := router.sources[originalKey]
+	router.mu.Unlock()
+	if globallyMapped {
+		t.Fatal("expired path remained in relay source demux")
+	}
+}
+
 func TestRelayMultipathRegistersSourcesAndDeduplicatesData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

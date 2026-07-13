@@ -44,6 +44,10 @@ type managedReturnPath interface {
 	ManagesReturnPath() bool
 }
 
+type sourceActivityObserver interface {
+	ObserveAuthorizedSource(net.Addr)
+}
+
 type FECOptions struct {
 	DataShards       int
 	ParityShards     int
@@ -479,7 +483,13 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			continue
 		}
 		result, err := s.fecRx.AddPacket(packet)
-		if err != nil || !result.Ready {
+		if err != nil {
+			continue
+		}
+		if observer, ok := s.transport.(sourceActivityObserver); ok {
+			observer.ObserveAuthorizedSource(from)
+		}
+		if !result.Ready {
 			continue
 		}
 		if result.RecoveredShards > 0 {

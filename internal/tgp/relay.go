@@ -18,6 +18,7 @@ const (
 	defaultRelayMaxPathsPerSession = 8
 	defaultRelayUsedPathCookies    = 64
 	pathChallengeLifetime          = 5 * time.Second
+	pathAuthorizationLifetime      = 45 * time.Second
 )
 
 var ErrRelayResourceLimit = errors.New("tgp relay resource limit reached")
@@ -439,10 +440,13 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 		return nil, ErrInvalidHandshake
 	}
 	session := &relaySessionTransport{
-		id:                   id,
-		router:               r,
-		sourceKeys:           map[sourceAddrKey]struct{}{addrKey: {}},
-		sourceAddrs:          map[sourceAddrKey]net.Addr{addrKey: addr},
+		id:     id,
+		router: r,
+		paths: map[sourceAddrKey]relayPathState{addrKey: {
+			addr:            addr,
+			authenticatedAt: time.Now(),
+			lastSeen:        time.Now(),
+		}},
 		activeSource:         addrKey,
 		usedPathCookies:      make(map[[pathControlNonceSize]byte]time.Time),
 		pathKey:              pathKey,
@@ -461,7 +465,7 @@ func (r *relayTransportRouter) unregister(id SessionID, session *relaySessionTra
 	if r.sessions[id] == session {
 		delete(r.sessions, id)
 	}
-	for source := range session.sourceKeys {
+	for source := range session.paths {
 		if r.sources[source] == session {
 			delete(r.sources, source)
 		}
@@ -572,14 +576,20 @@ func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAd
 		r.droppedPathControl.Add(1)
 		return
 	}
-	session.usedPathCookies[msg.serverNonce] = now.Add(pathChallengeLifetime)
-	_, alreadyAuthorized := session.sourceKeys[source]
-	if !alreadyAuthorized && len(session.sourceKeys) >= defaultRelayMaxPathsPerSession {
-		r.droppedPathControl.Add(1)
-		return
+	r.purgeExpiredPathsLocked(session, now)
+	_, alreadyAuthorized := session.paths[source]
+	if !alreadyAuthorized && len(session.paths) >= defaultRelayMaxPathsPerSession {
+		if !r.evictOldestInactivePathLocked(session) {
+			r.droppedPathControl.Add(1)
+			return
+		}
 	}
-	session.sourceKeys[source] = struct{}{}
-	session.sourceAddrs[source] = from
+	if previous, ok := session.paths[session.activeSource]; ok && session.activeSource != source {
+		previous.lastSeen = now
+		session.paths[session.activeSource] = previous
+	}
+	session.usedPathCookies[msg.serverNonce] = now.Add(pathChallengeLifetime)
+	session.paths[source] = relayPathState{addr: from, authenticatedAt: now, lastSeen: now}
 	session.activeSource = source
 	r.sources[source] = session
 }
@@ -590,6 +600,42 @@ func (r *relayTransportRouter) purgeUsedPathCookiesLocked(session *relaySessionT
 			delete(session.usedPathCookies, cookie)
 		}
 	}
+}
+
+func (r *relayTransportRouter) purgeExpiredPathsLocked(session *relaySessionTransport, now time.Time) {
+	for source, path := range session.paths {
+		if source == session.activeSource || now.Sub(path.lastSeen) < pathAuthorizationLifetime {
+			continue
+		}
+		delete(session.paths, source)
+		if r.sources[source] == session {
+			delete(r.sources, source)
+		}
+	}
+}
+
+func (r *relayTransportRouter) evictOldestInactivePathLocked(session *relaySessionTransport) bool {
+	var oldestSource sourceAddrKey
+	var oldestAt time.Time
+	found := false
+	for source, path := range session.paths {
+		if source == session.activeSource {
+			continue
+		}
+		if !found || path.lastSeen.Before(oldestAt) {
+			oldestSource = source
+			oldestAt = path.lastSeen
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(session.paths, oldestSource)
+	if r.sources[oldestSource] == session {
+		delete(r.sources, oldestSource)
+	}
+	return true
 }
 
 func (r *relayTransportRouter) close() {
@@ -614,8 +660,7 @@ func (r *relayTransportRouter) close() {
 type relaySessionTransport struct {
 	id                   SessionID
 	router               *relayTransportRouter
-	sourceKeys           map[sourceAddrKey]struct{}
-	sourceAddrs          map[sourceAddrKey]net.Addr
+	paths                map[sourceAddrKey]relayPathState
 	activeSource         sourceAddrKey
 	usedPathCookies      map[[pathControlNonceSize]byte]time.Time
 	pathKey              [trafficKeySize]byte
@@ -625,13 +670,19 @@ type relaySessionTransport struct {
 	closeOnce            sync.Once
 }
 
+type relayPathState struct {
+	addr            net.Addr
+	authenticatedAt time.Time
+	lastSeen        time.Time
+}
+
 func (t *relaySessionTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {
 	if t == nil || t.router == nil {
 		return ErrSessionClosed
 	}
 	t.router.mu.Lock()
 	transport := t.router.transport
-	activeAddr := t.sourceAddrs[t.activeSource]
+	activeAddr := t.paths[t.activeSource].addr
 	t.router.mu.Unlock()
 	if transport == nil || activeAddr == nil {
 		return ErrSessionClosed
@@ -661,8 +712,24 @@ func (t *relaySessionTransport) IsSourceAuthorized(addr net.Addr) bool {
 	}
 	t.router.mu.Lock()
 	defer t.router.mu.Unlock()
-	_, ok = t.sourceKeys[key]
+	t.router.purgeExpiredPathsLocked(t, time.Now())
+	_, ok = t.paths[key]
 	return ok
+}
+
+func (t *relaySessionTransport) ObserveAuthorizedSource(addr net.Addr) {
+	key, ok := newSourceAddrKey(addr)
+	if !ok {
+		return
+	}
+	t.router.mu.Lock()
+	defer t.router.mu.Unlock()
+	path, ok := t.paths[key]
+	if !ok {
+		return
+	}
+	path.lastSeen = time.Now()
+	t.paths[key] = path
 }
 
 func (t *relaySessionTransport) ManagesReturnPath() bool { return true }

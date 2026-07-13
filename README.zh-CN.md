@@ -126,9 +126,9 @@ NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-n
 服务器配置中。`server.relay.allowed_targets` 是显式 UDP 目标 allow-list；
 如果安装时没有提供目标，服务端会以安全 deny-all 模式启动，不会转发游戏 UDP，
 需要配置后再测试。脚本和 Core 配置校验都会拒绝 `0.0.0.0/0`、`::/0`
-这类全网目标，并要求每条 allow 规则显式填写 `ports` 列表或范围。Relay 路径
-迁移/重绑定当前是 fail-closed；后续协议版本会补充 authenticated rebind
-控制路径。
+这类全网目标，并要求每条 allow 规则显式填写 `ports` 列表或范围。迁移和多路径
+新增源地址默认 fail-closed；只有完成基于会话 ECDH 派生密钥的
+request/challenge/response 校验后才会接入，重复响应和数据包不能注册路径。
 
 部署完成后，可以用只读验收脚本收集诊断信息：
 

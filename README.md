@@ -84,6 +84,7 @@ Windows hosts.
 | macOS PID tracking | Alpha lsof/ps backend |
 | TGP X25519 handshake and AEAD | Done |
 | Multipath transport adapter | Done; interface discovery not wired |
+| Authenticated relay path migration | Done; ECDH-derived challenge-response |
 | Persistent TGP UDP relay pool | Done |
 | Client TUN -> routing -> TGP writeback test | Done |
 
@@ -163,8 +164,10 @@ Tachyon server profile. `server.relay.allowed_targets` is an explicit UDP
 allow-list. If no targets are supplied, the server starts in safe deny-all mode
 and will not forward game UDP until you edit the config. Wildcard targets such
 as `0.0.0.0/0` and `::/0` are rejected, and each allow rule must include an
-explicit `ports` list or range. Relay path migration/rebind is currently
-fail-closed; future protocol work will add an authenticated rebind control path.
+explicit `ports` list or range. Additional migration and multipath source
+addresses are fail-closed until they complete a per-session, ECDH-derived
+request/challenge/response exchange; replayed responses and data packets cannot
+register a path.
 
 After deployment, collect read-only diagnostics with:
 

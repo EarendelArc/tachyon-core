@@ -17,7 +17,8 @@ parity generation, low-traffic FEC timeout flush, conservative dynamic FEC
 ratio adjustment, and a sliding receive-side packet deduplication window in
 `internal/tgp`. Core also includes a `MultipathTransport` adapter that fans out
 writes across multiple underlying transports and merges reads from any path.
-Relay path rebind/migration and explicit peer loss feedback are planned next.
+Explicit peer loss feedback remains planned; authenticated relay path
+rebind/migration is implemented as described below.
 
 ---
 
@@ -227,29 +228,46 @@ future control-plane upgrade.
 
 ## 5. Connection Migration
 
-The relay currently binds an accepted session to the UDP source address that
-completed the authenticated handshake. Encrypted data packets from unknown
-source addresses are dropped before they reach any session queue; they are not
-broadcast to active sessions for trial decryption.
+The relay initially binds a session to the UDP source address that completed
+the authenticated handshake. An additional migration or multipath source must
+complete this control exchange before encrypted data from it can enter the
+session queue:
 
-Within a session transport, packet numbers are still deduplicated, so duplicate
-packets from the established path do not reach the game socket twice.
+1. The client sends `PathRequest(SessionID, ClientNonce, Tag)` from each path.
+2. The relay verifies `Tag` with a path key derived from that session's
+   client-to-server traffic key, then sends a fresh `ServerNonce` back to the
+   observed UDP source.
+3. The client verifies the challenge and returns
+   `PathResponse(SessionID, ClientNonce, ServerNonce, Tag)` through the same
+   local transport that received it.
+4. The relay registers that observed source only while the matching challenge
+   is pending and unexpired. The challenge is consumed once, source mappings
+   owned by another session cannot be stolen, and each session has a bounded
+   source count.
 
-Current relay path migration/rebind is fail-closed. A future protocol version
-should add a handshake-like authenticated rebind control path before the relay
-updates its source-address mapping.
+The request tag alone never registers a source, so replaying a captured request
+from another address only produces a challenge that cannot be answered without
+the per-session key. Replayed responses have no pending challenge and fail.
+Unknown non-control data remains fail-closed and is not broadcast for trial
+decryption.
+
+Packet numbers use a bounded sliding anti-replay window. Duplicates and packets
+older than the window are rejected before they can update migration state, so a
+valid historical ciphertext cannot move the relay's return path.
 
 ---
 
 ## 6. Multipath
 
 The receive path deduplicates authenticated packet numbers, and
-`MultipathTransport` can now compose multiple `Transport` implementations. Each
-write is attempted on every path, while reads are merged from whichever path
-delivers first. The remaining integration work is system-interface discovery
-and policy selection, for example choosing Wi-Fi plus cellular paths on mobile.
-The current adapter relies on PacketNumber deduplication; explicit
-`FlagMultipath` marking remains reserved for a future control-plane integration.
+`MultipathTransport` composes multiple `Transport` implementations. Each write
+is attempted on every path, reads are merged from whichever path delivers
+first, and each local path performs the authenticated registration exchange
+above. Registration refreshes periodically so changed NAT mappings remain
+fail-closed until reauthenticated. The remaining integration work is
+system-interface discovery and policy selection, for example choosing Wi-Fi
+plus cellular paths on mobile. Explicit `FlagMultipath` marking remains
+reserved for a future control-plane integration.
 
 ---
 
@@ -268,8 +286,8 @@ The current adapter relies on PacketNumber deduplication; explicit
 
 - No explicit peer loss feedback yet; dynamic FEC currently uses receive-side
   recovery ratio as a conservative local estimate.
-- Relay path migration/rebind is fail-closed until an authenticated rebind
-  control path is added.
+- Relay path migration/rebind is fail-closed until the authenticated rebind
+  exchange succeeds for the observed source address.
 - Multipath interface discovery and policy selection are not wired yet; the
   transport adapter and receive-side deduplication are implemented.
 - `FlagMultipath` is reserved; current fan-out does not rewrite encrypted inner

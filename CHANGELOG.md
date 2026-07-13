@@ -5,10 +5,20 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- TGP packet-number deduplication is now a sliding anti-replay window: packets
+  older than the retained window remain rejected instead of becoming eligible
+  again after insertion-order eviction.
 
 ### Added
+- Added per-session path request/challenge/response authentication for relay
+  migration and multipath sources. Additional UDP sources are registered only
+  after proving possession of an ECDH-derived path key from the requesting
+  source with a short-lived, one-time server challenge.
 
 ### Fixed
+- Replayed authenticated packets can no longer update a session's return path;
+  source authorization and anti-replay checks complete before migration state
+  changes.
 - Linux IPv4/IPv6 and Windows IPv4 UDP process tracking now falls back to
   wildcard socket bindings after checking exact local-address matches, so
   process-based game profiles can identify games that bind `0.0.0.0` or `::`

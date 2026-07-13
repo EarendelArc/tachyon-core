@@ -254,6 +254,233 @@ func TestRelayDropsDataFromMigratedUnknownAddressWithoutAffectingOriginal(t *tes
 	assertNextPacket(t, sessionTransport, "from original")
 }
 
+func TestRelayAuthenticatesAdditionalPathWithOneTimeChallenge(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 4, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("path-admission!!!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 91
+	original := mustRelayUDPAddr(t, "127.0.0.1:10101")
+	additional := mustRelayUDPAddr(t, "127.0.0.1:10102")
+	session, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	clientNonce := [pathControlNonceSize]byte{1, 3, 3, 7}
+	request, err := marshalPathControl(pathControlRequest, sessionID, clientNonce, [pathControlNonceSize]byte{}, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: additional}, mustParsePathControl(t, request))
+	challengeWrite := transport.nextWrite(t)
+	if !sameAddr(challengeWrite.addr, additional) {
+		t.Fatalf("challenge sent to %v, want %v", challengeWrite.addr, additional)
+	}
+	challenge := mustParsePathControl(t, challengeWrite.packet)
+	response, err := marshalPathControl(pathControlResponse, sessionID, challenge.clientNonce, challenge.serverNonce, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrongSource := mustRelayUDPAddr(t, "127.0.0.1:10103")
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: wrongSource}, mustParsePathControl(t, response))
+	if session.IsSourceAuthorized(wrongSource) {
+		t.Fatal("challenge response was accepted from a different source")
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: additional}, mustParsePathControl(t, response))
+	if !session.IsSourceAuthorized(additional) {
+		t.Fatal("valid additional path was not registered")
+	}
+
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: additional}, mustParsePathControl(t, response))
+	if got := router.droppedPathControl.Load(); got < 2 {
+		t.Fatalf("wrong-source and replayed responses were not rejected: drops=%d", got)
+	}
+	router.routeData(relayPacketEnvelope{packet: []byte("authenticated path"), from: additional})
+	assertNextPacket(t, session, "authenticated path")
+}
+
+func TestRelayRejectsInvalidPathKeyAndSourceHijack(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 2, 1)
+	var firstID SessionID
+	copy(firstID[:], []byte("first-auth-path!"))
+	var secondID SessionID
+	copy(secondID[:], []byte("second-auth-path"))
+	var firstKey [trafficKeySize]byte
+	firstKey[0] = 11
+	var secondKey [trafficKeySize]byte
+	secondKey[0] = 22
+	firstAddr := mustRelayUDPAddr(t, "127.0.0.1:10201")
+	secondAddr := mustRelayUDPAddr(t, "127.0.0.1:10202")
+	first, err := router.registerWithPathAuth(firstID, firstAddr, firstKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := router.registerWithPathAuth(secondID, secondAddr, secondKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	nonce := [pathControlNonceSize]byte{4, 2}
+	wrongKeyRequest, err := marshalPathControl(pathControlRequest, firstID, nonce, [pathControlNonceSize]byte{}, secondKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := mustRelayUDPAddr(t, "127.0.0.1:10203")
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: wrongKeyRequest, from: unknown}, mustParsePathControl(t, wrongKeyRequest))
+	transport.assertNoWrite(t)
+	if first.IsSourceAuthorized(unknown) {
+		t.Fatal("source with an invalid path key was registered")
+	}
+
+	hijackRequest, err := marshalPathControl(pathControlRequest, firstID, nonce, [pathControlNonceSize]byte{}, firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: hijackRequest, from: secondAddr}, mustParsePathControl(t, hijackRequest))
+	transport.assertNoWrite(t)
+	if !second.IsSourceAuthorized(secondAddr) || first.IsSourceAuthorized(secondAddr) {
+		t.Fatal("an existing source mapping was stolen by another CID")
+	}
+}
+
+func TestRelayRejectsExpiredPathChallenge(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 2, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("expired-path!!!!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 31
+	original := mustRelayUDPAddr(t, "127.0.0.1:10301")
+	additional := mustRelayUDPAddr(t, "127.0.0.1:10302")
+	session, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	clientNonce := [pathControlNonceSize]byte{8, 6, 7, 5}
+	request, err := marshalPathControl(pathControlRequest, sessionID, clientNonce, [pathControlNonceSize]byte{}, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: additional}, mustParsePathControl(t, request))
+	challenge := mustParsePathControl(t, transport.nextWrite(t).packet)
+	key, ok := newSourceAddrKey(additional)
+	if !ok {
+		t.Fatal("additional source address is not routable")
+	}
+	pendingKey := pendingPathKey{sessionID: sessionID, source: key}
+	router.mu.Lock()
+	pending := router.pendingPaths[pendingKey]
+	pending.expiresAt = time.Now().Add(-time.Second)
+	router.pendingPaths[pendingKey] = pending
+	router.mu.Unlock()
+
+	response, err := marshalPathControl(pathControlResponse, sessionID, challenge.clientNonce, challenge.serverNonce, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: additional}, mustParsePathControl(t, response))
+	if session.IsSourceAuthorized(additional) {
+		t.Fatal("expired path challenge was accepted")
+	}
+}
+
+func TestRelayDoesNotAdmitAdditionalPathWhenMigrationDisabled(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 2, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("fixed-path-only!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 41
+	original := mustRelayUDPAddr(t, "127.0.0.1:10401")
+	additional := mustRelayUDPAddr(t, "127.0.0.1:10402")
+	session, err := router.registerWithPathAuth(sessionID, original, pathKey, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	nonce := [pathControlNonceSize]byte{1, 2, 3, 4}
+	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: additional}, mustParsePathControl(t, request))
+	transport.assertNoWrite(t)
+	if session.IsSourceAuthorized(additional) {
+		t.Fatal("additional path was admitted while migration was disabled")
+	}
+}
+
+func TestRelayMultipathRegistersSourcesAndDeduplicatesData(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverTransport, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCh := make(chan RelayPacket, 4)
+	relay, err := NewRelay(RelayOptions{
+		Transport: serverTransport, PacerPPS: 100000,
+		AuthKey: []byte("multipath-test-psk-0123456789"),
+		Handler: RelayHandlerFunc(func(_ context.Context, packet RelayPacket) error {
+			gotCh <- packet
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	go func() { _ = relay.ListenAndServe(ctx) }()
+
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: serverTransport.LocalAddr().String(),
+		LocalAddrs: []string{"127.0.0.1:0", "127.0.0.1:0"},
+		PacerPPS:   100000, HandshakeTimeout: time.Second,
+		AuthKey: []byte("multipath-test-psk-0123456789"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if err := manager.SendPacket(ctx, capturedPacketStreamID, mustTunnelPayload(t, "first multipath")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gotCh:
+	case <-ctx.Done():
+		t.Fatal("first multipath packet was not delivered")
+	}
+
+	waitForRelaySourceCount(t, relay, 2)
+	if err := manager.SendPacket(ctx, capturedPacketStreamID, mustTunnelPayload(t, "deduplicated multipath")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case packet := <-gotCh:
+		datagram, err := ParseTunnelDatagram(packet.Payload)
+		if err != nil || string(datagram.Payload) != "deduplicated multipath" {
+			t.Fatalf("unexpected multipath payload: %q err=%v", datagram.Payload, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("multipath packet was not delivered")
+	}
+	select {
+	case duplicate := <-gotCh:
+		t.Fatalf("multipath duplicate reached relay handler: %q", duplicate.Payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func newTestClientManager(t *testing.T, remote string, timeout time.Duration) *ClientManager {
 	t.Helper()
 	manager, err := NewClientManager(ClientManagerOptions{
@@ -390,4 +617,87 @@ func TestRelayReceivesConcurrentClientSessions(t *testing.T) {
 	if len(seenSessions) != 2 {
 		t.Fatalf("expected two relay sessions, got %d", len(seenSessions))
 	}
+}
+
+type pathControlWrite struct {
+	packet []byte
+	addr   net.Addr
+}
+
+type pathControlCaptureTransport struct {
+	writes chan pathControlWrite
+}
+
+func newPathControlCaptureTransport() *pathControlCaptureTransport {
+	return &pathControlCaptureTransport{writes: make(chan pathControlWrite, 8)}
+}
+
+func (t *pathControlCaptureTransport) WritePacket(ctx context.Context, packet []byte, addr net.Addr) error {
+	select {
+	case t.writes <- pathControlWrite{packet: append([]byte(nil), packet...), addr: addr}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *pathControlCaptureTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {
+	<-ctx.Done()
+	return nil, nil, ctx.Err()
+}
+
+func (t *pathControlCaptureTransport) LocalAddr() net.Addr {
+	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:443")
+	return addr
+}
+
+func (t *pathControlCaptureTransport) Close() error { return nil }
+
+func (t *pathControlCaptureTransport) nextWrite(testingT *testing.T) pathControlWrite {
+	testingT.Helper()
+	select {
+	case write := <-t.writes:
+		return write
+	case <-time.After(time.Second):
+		testingT.Fatal("timed out waiting for path control write")
+		return pathControlWrite{}
+	}
+}
+
+func (t *pathControlCaptureTransport) assertNoWrite(testingT *testing.T) {
+	testingT.Helper()
+	select {
+	case write := <-t.writes:
+		testingT.Fatalf("unexpected path control write to %v: %x", write.addr, write.packet)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func mustParsePathControl(t *testing.T, wire []byte) pathControlMessage {
+	t.Helper()
+	msg, err := parsePathControl(wire)
+	if err != nil {
+		t.Fatalf("parse path control: %v", err)
+	}
+	return msg
+}
+
+func waitForRelaySourceCount(t *testing.T, relay *Relay, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		relay.mu.Lock()
+		router := relay.router
+		relay.mu.Unlock()
+		if router != nil {
+			router.mu.Lock()
+			count := len(router.sources)
+			router.mu.Unlock()
+			if count == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("relay source count did not reach %d", want)
 }

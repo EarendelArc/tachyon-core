@@ -36,6 +36,10 @@ type SessionOptions struct {
 	DisableMigration bool
 }
 
+type sourceAuthorizer interface {
+	IsSourceAuthorized(net.Addr) bool
+}
+
 type FECOptions struct {
 	DataShards       int
 	ParityShards     int
@@ -458,10 +462,13 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			continue
 		}
 		packet.SourceAddr = from
-		if !s.acceptSource(from) {
+		if !s.sourceEligibleForReplay(from) {
 			continue
 		}
 		if !s.dedup.SeenFirst(packet.Inner.PacketNumber) {
+			continue
+		}
+		if !s.acceptSource(from) {
 			continue
 		}
 		result, err := s.fecRx.AddPacket(packet)
@@ -482,6 +489,30 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			}
 		}
 	}
+}
+
+func (s *DatagramSession) sourceEligibleForReplay(from net.Addr) bool {
+	if from == nil {
+		return true
+	}
+	s.mu.RLock()
+	remote := s.remote
+	disableMigration := s.disableMigration
+	closed := s.state == SessionClosed
+	s.mu.RUnlock()
+	if closed {
+		return false
+	}
+	if sameAddr(remote, from) {
+		return true
+	}
+	if disableMigration {
+		return false
+	}
+	if authorizer, ok := s.transport.(sourceAuthorizer); ok {
+		return authorizer.IsSourceAuthorized(from)
+	}
+	return true
 }
 
 func (s *DatagramSession) observeFECDelivery(delivered, recovered int) {
@@ -534,9 +565,10 @@ func cloneShardRange(shards [][]byte) [][]byte {
 }
 
 type packetDedupWindow struct {
-	max   int
-	seen  map[uint64]struct{}
-	order []uint64
+	max         uint64
+	highest     uint64
+	initialized bool
+	seen        map[uint64]struct{}
 }
 
 func newPacketDedupWindow(max int) *packetDedupWindow {
@@ -544,7 +576,7 @@ func newPacketDedupWindow(max int) *packetDedupWindow {
 		max = defaultDedupWindow
 	}
 	return &packetDedupWindow{
-		max:  max,
+		max:  uint64(max),
 		seen: make(map[uint64]struct{}, max),
 	}
 }
@@ -553,17 +585,30 @@ func (w *packetDedupWindow) SeenFirst(packetNumber uint64) bool {
 	if w == nil {
 		return true
 	}
+	if !w.initialized {
+		w.initialized = true
+		w.highest = packetNumber
+		w.seen[packetNumber] = struct{}{}
+		return true
+	}
+	if packetNumber > w.highest {
+		w.highest = packetNumber
+		var oldest uint64
+		if w.highest >= w.max {
+			oldest = w.highest - w.max + 1
+		}
+		for seen := range w.seen {
+			if seen < oldest {
+				delete(w.seen, seen)
+			}
+		}
+	} else if w.highest-packetNumber >= w.max {
+		return false
+	}
 	if _, ok := w.seen[packetNumber]; ok {
 		return false
 	}
 	w.seen[packetNumber] = struct{}{}
-	w.order = append(w.order, packetNumber)
-	if len(w.order) > w.max {
-		evicted := w.order[0]
-		copy(w.order, w.order[1:])
-		w.order = w.order[:len(w.order)-1]
-		delete(w.seen, evicted)
-	}
 	return true
 }
 

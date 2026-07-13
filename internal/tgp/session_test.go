@@ -263,6 +263,80 @@ func TestDatagramSessionDropsDuplicatePacketNumbers(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionReplayFromAlternateSourceDoesNotMigrate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sessionID SessionID
+	copy(sessionID[:], []byte("replay-no-migrate"))
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	recvKey[0] = 77
+	initialAddr := mustUDPAddr(t, "127.0.0.1:31100")
+	replayAddr := mustUDPAddr(t, "127.0.0.1:31101")
+	transport := newMigrationTestTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		ID: sessionID, Transport: transport, RemoteAddr: initialAddr,
+		SendKey: sendKey, RecvKey: recvKey, Pacer: NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("authenticated once")
+	header, err := NewDataHeader(sessionID, 13, 7, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := codec.Seal(7, header, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.inject(wire, initialAddr)
+	if _, err := session.RecvPacket(ctx, 13); err != nil {
+		t.Fatal(err)
+	}
+	transport.inject(wire, replayAddr)
+	time.Sleep(20 * time.Millisecond)
+	if stats := session.Stats(); stats.Migrations != 0 {
+		t.Fatalf("replayed packet changed the session path: %#v", stats)
+	}
+	if err := session.SendPacket(ctx, 13, []byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.nextWriteAddr(ctx); !sameAddr(got, initialAddr) {
+		t.Fatalf("reply path = %v, want original %v", got, initialAddr)
+	}
+}
+
+func TestPacketDedupWindowRejectsReplayAfterEviction(t *testing.T) {
+	window := newPacketDedupWindow(4)
+	for packetNumber := uint64(10); packetNumber <= 14; packetNumber++ {
+		if !window.SeenFirst(packetNumber) {
+			t.Fatalf("new packet %d was rejected", packetNumber)
+		}
+	}
+	if window.SeenFirst(10) {
+		t.Fatal("packet older than the anti-replay window was accepted")
+	}
+	if window.SeenFirst(14) {
+		t.Fatal("duplicate packet inside the anti-replay window was accepted")
+	}
+	if !window.SeenFirst(15) {
+		t.Fatal("new packet after replay checks was rejected")
+	}
+
+	outOfOrder := newPacketDedupWindow(4)
+	if !outOfOrder.SeenFirst(20) || !outOfOrder.SeenFirst(22) || !outOfOrder.SeenFirst(21) {
+		t.Fatal("unseen out-of-order packet inside the anti-replay window was rejected")
+	}
+}
+
 func TestDatagramSessionRecoversFECMissingShard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

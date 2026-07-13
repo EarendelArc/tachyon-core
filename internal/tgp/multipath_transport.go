@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 var ErrMultipathTransportClosed = errors.New("multipath transport closed")
+
+const pathAuthenticationRefreshInterval = 10 * time.Second
 
 type MultipathTransport struct {
 	paths  []Transport
@@ -16,6 +19,17 @@ type MultipathTransport struct {
 	cancel context.CancelFunc
 	reads  chan multipathRead
 	once   sync.Once
+
+	pathAuthMu   sync.RWMutex
+	pathAuth     *clientPathAuthentication
+	pathAuthOnce sync.Once
+}
+
+type clientPathAuthentication struct {
+	sessionID SessionID
+	key       [trafficKeySize]byte
+	remote    net.Addr
+	nonces    [][pathControlNonceSize]byte
 }
 
 type multipathRead struct {
@@ -41,10 +55,30 @@ func NewMultipathTransport(paths ...Transport) (*MultipathTransport, error) {
 		cancel: cancel,
 		reads:  make(chan multipathRead, len(filtered)),
 	}
-	for _, path := range filtered {
-		go t.readLoop(path)
+	for index, path := range filtered {
+		go t.readLoop(index, path)
 	}
 	return t, nil
+}
+
+func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [trafficKeySize]byte, remote net.Addr) error {
+	if t == nil || remote == nil {
+		return errors.New("path authentication requires a transport and remote address")
+	}
+	t.pathAuthMu.Lock()
+	t.pathAuth = &clientPathAuthentication{
+		sessionID: sessionID,
+		key:       key,
+		remote:    remote,
+		nonces:    make([][pathControlNonceSize]byte, len(t.paths)),
+	}
+	t.pathAuthMu.Unlock()
+
+	if err := t.refreshPathAuthentication(); err != nil {
+		return err
+	}
+	t.pathAuthOnce.Do(func() { go t.pathAuthenticationLoop() })
+	return nil
 }
 
 func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {
@@ -122,11 +156,14 @@ func (t *MultipathTransport) Close() error {
 	return errors.Join(failures...)
 }
 
-func (t *MultipathTransport) readLoop(path Transport) {
+func (t *MultipathTransport) readLoop(index int, path Transport) {
 	for {
 		packet, from, err := path.ReadPacket(t.ctx)
 		if err != nil {
 			return
+		}
+		if t.handlePathControl(index, path, packet, from) {
+			continue
 		}
 		copied := append([]byte(nil), packet...)
 		select {
@@ -135,6 +172,98 @@ func (t *MultipathTransport) readLoop(path Transport) {
 		case t.reads <- multipathRead{packet: copied, from: from}:
 		}
 	}
+}
+
+func (t *MultipathTransport) handlePathControl(index int, path Transport, packet []byte, from net.Addr) bool {
+	msg, err := parsePathControl(packet)
+	if err != nil {
+		return false
+	}
+	if msg.msgType != pathControlChallenge {
+		return true
+	}
+
+	t.pathAuthMu.RLock()
+	auth := t.pathAuth
+	if auth == nil || index < 0 || index >= len(auth.nonces) {
+		t.pathAuthMu.RUnlock()
+		return true
+	}
+	sessionID := auth.sessionID
+	key := auth.key
+	wantNonce := auth.nonces[index]
+	t.pathAuthMu.RUnlock()
+	if msg.sessionID != sessionID || msg.clientNonce != wantNonce || !verifyPathControl(msg, key) {
+		return true
+	}
+
+	response, err := marshalPathControl(pathControlResponse, sessionID, msg.clientNonce, msg.serverNonce, key)
+	if err == nil {
+		_ = path.WritePacket(t.ctx, response, from)
+	}
+	return true
+}
+
+func (t *MultipathTransport) pathAuthenticationLoop() {
+	ticker := time.NewTicker(pathAuthenticationRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			_ = t.refreshPathAuthentication()
+		}
+	}
+}
+
+func (t *MultipathTransport) refreshPathAuthentication() error {
+	t.pathAuthMu.RLock()
+	auth := t.pathAuth
+	if auth == nil {
+		t.pathAuthMu.RUnlock()
+		return errors.New("path authentication is not configured")
+	}
+	sessionID := auth.sessionID
+	key := auth.key
+	remote := auth.remote
+	t.pathAuthMu.RUnlock()
+
+	type request struct {
+		index int
+		wire  []byte
+	}
+	requests := make([]request, 0, len(t.paths))
+	for index := range t.paths {
+		nonce, err := newPathNonce()
+		if err != nil {
+			return err
+		}
+		wire, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, key)
+		if err != nil {
+			return err
+		}
+		t.pathAuthMu.Lock()
+		if t.pathAuth != nil && index < len(t.pathAuth.nonces) {
+			t.pathAuth.nonces[index] = nonce
+		}
+		t.pathAuthMu.Unlock()
+		requests = append(requests, request{index: index, wire: wire})
+	}
+
+	successes := 0
+	var failures []error
+	for _, item := range requests {
+		if err := t.paths[item.index].WritePacket(t.ctx, item.wire, remote); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		successes++
+	}
+	if successes > 0 {
+		return nil
+	}
+	return fmt.Errorf("send path authentication requests: %w", errors.Join(failures...))
 }
 
 var _ Transport = (*MultipathTransport)(nil)

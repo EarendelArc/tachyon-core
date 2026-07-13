@@ -51,8 +51,13 @@ func DialSessionWithOptions(ctx context.Context, localAddr string, remoteAddr ne
 	if remoteAddr == nil {
 		return nil, errors.New("remote address is required")
 	}
-	transport, err := ListenUDP(localAddr)
+	path, err := ListenUDP(localAddr)
 	if err != nil {
+		return nil, err
+	}
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		_ = path.Close()
 		return nil, err
 	}
 	return dialSessionWithTransport(ctx, transport, remoteAddr, opts)
@@ -131,6 +136,17 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		if err != nil {
 			_ = transport.Close()
 			return nil, err
+		}
+		if !opts.DisableMigration {
+			if pathTransport, ok := transport.(interface {
+				EnablePathAuthentication(SessionID, [trafficKeySize]byte, net.Addr) error
+			}); ok {
+				pathKey := derivePathAuthKey(keys.SendKey, sessionID)
+				if err := pathTransport.EnablePathAuthentication(sessionID, pathKey, from); err != nil {
+					_ = transport.Close()
+					return nil, fmt.Errorf("enable tgp path authentication: %w", err)
+				}
+			}
 		}
 		return NewDatagramSession(SessionOptions{
 			ID:               sessionID,

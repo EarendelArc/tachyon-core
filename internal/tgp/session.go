@@ -40,6 +40,10 @@ type sourceAuthorizer interface {
 	IsSourceAuthorized(net.Addr) bool
 }
 
+type managedReturnPath interface {
+	ManagesReturnPath() bool
+}
+
 type FECOptions struct {
 	DataShards       int
 	ParityShards     int
@@ -545,6 +549,9 @@ func (s *DatagramSession) acceptSource(from net.Addr) bool {
 	}
 	if disableMigration {
 		return false
+	}
+	if manager, ok := s.transport.(managedReturnPath); ok && manager.ManagesReturnPath() {
+		return true
 	}
 	return s.Migrate(s.ctx, from) == nil
 }

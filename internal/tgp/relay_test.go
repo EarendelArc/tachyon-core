@@ -420,6 +420,120 @@ func TestRelayDoesNotAdmitAdditionalPathWhenMigrationDisabled(t *testing.T) {
 	}
 }
 
+func TestRelayOldPathUnseenPacketDoesNotChangeActiveReturnPath(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 4, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("stable-return-id"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 51
+	original := mustRelayUDPAddr(t, "127.0.0.1:10501")
+	additional := mustRelayUDPAddr(t, "127.0.0.1:10502")
+	sessionTransport, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionTransport.Close()
+	authenticateRelayTestPath(t, router, transport, sessionID, pathKey, additional)
+
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	recvKey[0] = 61
+	session, err := NewDatagramSession(SessionOptions{
+		ID: sessionID, Transport: sessionTransport, RemoteAddr: original,
+		SendKey: sendKey, RecvKey: recvKey, Pacer: NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("unseen old path packet")
+	header, err := NewDataHeader(sessionID, 15, 101, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := codec.Seal(101, header, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.routeData(relayPacketEnvelope{packet: wire, from: original})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got, err := session.RecvPacket(ctx, 15); err != nil || string(got) != string(payload) {
+		t.Fatalf("old path payload = %q, err=%v", got, err)
+	}
+	if err := session.SendPacket(ctx, 15, []byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	write := transport.nextWrite(t)
+	if !sameAddr(write.addr, additional) {
+		t.Fatalf("reply path = %v, want challenge-selected %v", write.addr, additional)
+	}
+	if stats := session.Stats(); stats.Migrations != 0 {
+		t.Fatalf("business data changed session return state: %#v", stats)
+	}
+}
+
+func TestRelayInvalidFECDoesNotChangeActiveReturnPath(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 4, 1)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("bad-fec-return!!"))
+	var pathKey [trafficKeySize]byte
+	pathKey[0] = 71
+	original := mustRelayUDPAddr(t, "127.0.0.1:10601")
+	additional := mustRelayUDPAddr(t, "127.0.0.1:10602")
+	sessionTransport, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionTransport.Close()
+	authenticateRelayTestPath(t, router, transport, sessionID, pathKey, additional)
+
+	var sendKey [trafficKeySize]byte
+	var recvKey [trafficKeySize]byte
+	recvKey[0] = 81
+	session, err := NewDatagramSession(SessionOptions{
+		ID: sessionID, Transport: sessionTransport, RemoteAddr: original,
+		SendKey: sendKey, RecvKey: recvKey, Pacer: NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	codec, err := NewCodec(recvKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := NewDataHeader(sessionID, 16, 102, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header.FECGroup = 1
+	header.FECIndex = 0
+	header.FECTotal = 2
+	header.FECDataShards = 2
+	wire, err := codec.Seal(102, header, []byte("bad"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.routeData(relayPacketEnvelope{packet: wire, from: original})
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := session.SendPacket(ctx, 16, []byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	write := transport.nextWrite(t)
+	if !sameAddr(write.addr, additional) {
+		t.Fatalf("reply path after invalid FEC = %v, want %v", write.addr, additional)
+	}
+}
+
 func TestRelayMultipathRegistersSourcesAndDeduplicatesData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -700,4 +814,23 @@ func waitForRelaySourceCount(t *testing.T, relay *Relay, want int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("relay source count did not reach %d", want)
+}
+
+func authenticateRelayTestPath(t *testing.T, router *relayTransportRouter, transport *pathControlCaptureTransport, sessionID SessionID, pathKey [trafficKeySize]byte, source net.Addr) {
+	t.Helper()
+	nonce, err := newPathNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: source}, mustParsePathControl(t, request))
+	challenge := mustParsePathControl(t, transport.nextWrite(t).packet)
+	response, err := marshalPathControl(pathControlResponse, sessionID, challenge.clientNonce, challenge.serverNonce, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: source}, mustParsePathControl(t, response))
 }

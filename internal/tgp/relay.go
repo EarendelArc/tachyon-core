@@ -453,6 +453,8 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 		id:                   id,
 		router:               r,
 		sourceKeys:           map[sourceAddrKey]struct{}{addrKey: {}},
+		sourceAddrs:          map[sourceAddrKey]net.Addr{addrKey: addr},
+		activeSource:         addrKey,
 		pathKey:              pathKey,
 		allowAdditionalPaths: allowAdditionalPaths,
 		packets:              make(chan relayPacketEnvelope, r.sessionQueueSize),
@@ -512,7 +514,7 @@ func (r *relayTransportRouter) handlePathControl(ctx context.Context, envelope r
 	case pathControlRequest:
 		r.handlePathRequest(ctx, envelope.from, source, msg)
 	case pathControlResponse:
-		r.handlePathResponse(source, msg)
+		r.handlePathResponse(envelope.from, source, msg)
 	default:
 		r.droppedPathControl.Add(1)
 	}
@@ -522,7 +524,7 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 	r.mu.Lock()
 	r.purgeExpiredPathChallengesLocked(time.Now())
 	session := r.sessions[msg.sessionID]
-	if session == nil || !session.allowAdditionalPaths || r.sources[source] == session {
+	if session == nil || !session.allowAdditionalPaths || session.activeSource == source {
 		r.mu.Unlock()
 		return
 	}
@@ -574,7 +576,7 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 	}
 }
 
-func (r *relayTransportRouter) handlePathResponse(source sourceAddrKey, msg pathControlMessage) {
+func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAddrKey, msg pathControlMessage) {
 	key := pendingPathKey{sessionID: msg.sessionID, source: source}
 	r.mu.Lock()
 	pending, ok := r.pendingPaths[key]
@@ -605,11 +607,14 @@ func (r *relayTransportRouter) handlePathResponse(source sourceAddrKey, msg path
 		r.droppedPathControl.Add(1)
 		return
 	}
-	if len(pending.session.sourceKeys) >= defaultRelayMaxPathsPerSession {
+	_, alreadyAuthorized := pending.session.sourceKeys[source]
+	if !alreadyAuthorized && len(pending.session.sourceKeys) >= defaultRelayMaxPathsPerSession {
 		r.droppedPathControl.Add(1)
 		return
 	}
 	pending.session.sourceKeys[source] = struct{}{}
+	pending.session.sourceAddrs[source] = from
+	pending.session.activeSource = source
 	r.sources[source] = pending.session
 }
 
@@ -645,6 +650,8 @@ type relaySessionTransport struct {
 	id                   SessionID
 	router               *relayTransportRouter
 	sourceKeys           map[sourceAddrKey]struct{}
+	sourceAddrs          map[sourceAddrKey]net.Addr
+	activeSource         sourceAddrKey
 	pathKey              [trafficKeySize]byte
 	allowAdditionalPaths bool
 	packets              chan relayPacketEnvelope
@@ -653,7 +660,17 @@ type relaySessionTransport struct {
 }
 
 func (t *relaySessionTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {
-	return t.router.transport.WritePacket(ctx, pkt, addr)
+	if t == nil || t.router == nil {
+		return ErrSessionClosed
+	}
+	t.router.mu.Lock()
+	transport := t.router.transport
+	activeAddr := t.sourceAddrs[t.activeSource]
+	t.router.mu.Unlock()
+	if transport == nil || activeAddr == nil {
+		return ErrSessionClosed
+	}
+	return transport.WritePacket(ctx, pkt, activeAddr)
 }
 
 func (t *relaySessionTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {
@@ -681,6 +698,8 @@ func (t *relaySessionTransport) IsSourceAuthorized(addr net.Addr) bool {
 	_, ok = t.sourceKeys[key]
 	return ok
 }
+
+func (t *relaySessionTransport) ManagesReturnPath() bool { return true }
 
 func (t *relaySessionTransport) Close() error {
 	t.closeOnce.Do(func() {

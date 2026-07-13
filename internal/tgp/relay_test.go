@@ -270,7 +270,7 @@ func TestRelayAuthenticatesAdditionalPathWithOneTimeChallenge(t *testing.T) {
 	}
 	defer session.Close()
 
-	clientNonce := [pathControlNonceSize]byte{1, 3, 3, 7}
+	clientNonce := mustNewPathRequestNonce(t, router.now())
 	request, err := marshalPathControl(pathControlRequest, sessionID, clientNonce, [pathControlNonceSize]byte{}, pathKey)
 	if err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func TestRelayRejectsInvalidPathKeyAndSourceHijack(t *testing.T) {
 	}
 	defer second.Close()
 
-	nonce := [pathControlNonceSize]byte{4, 2}
+	nonce := mustNewPathRequestNonce(t, router.now())
 	wrongKeyRequest, err := marshalPathControl(pathControlRequest, firstID, nonce, [pathControlNonceSize]byte{}, secondKey)
 	if err != nil {
 		t.Fatal(err)
@@ -351,9 +351,11 @@ func TestRelayRejectsInvalidPathKeyAndSourceHijack(t *testing.T) {
 	}
 }
 
-func TestRelayPathRequestReplayCannotSaturateGlobalChallengeState(t *testing.T) {
+func TestRelayPathRequestTimeWindowAndTokenBucket(t *testing.T) {
 	transport := newPathControlCaptureTransport()
 	router := newRelayTransportRouter(transport, 2, 1)
+	now := time.Unix(1_700_000_000, 0)
+	router.now = func() time.Time { return now }
 	var sessionID SessionID
 	copy(sessionID[:], []byte("stateless-path-id"))
 	var pathKey [trafficKeySize]byte
@@ -365,18 +367,40 @@ func TestRelayPathRequestReplayCannotSaturateGlobalChallengeState(t *testing.T) 
 	}
 	defer session.Close()
 
-	nonce := [pathControlNonceSize]byte{7, 7, 7, 7}
+	expiredNonce := mustNewPathRequestNonce(t, now.Add(-pathRequestLifetime-time.Second))
+	expiredRequest, err := marshalPathControl(pathControlRequest, sessionID, expiredNonce, [pathControlNonceSize]byte{}, pathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredSource := mustRelayUDPAddr(t, "127.0.0.1:11999")
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: expiredRequest, from: expiredSource}, mustParsePathControl(t, expiredRequest))
+	if got := len(transport.writes); got != 0 {
+		t.Fatalf("expired request produced %d challenges, want 0", got)
+	}
+
+	nonce := mustNewPathRequestNonce(t, now)
 	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const replayCount = 5000
-	for port := 0; port < replayCount; port++ {
+	for port := 0; port < pathRequestTokenBurst+1; port++ {
 		source := mustRelayUDPAddr(t, fmt.Sprintf("127.0.0.1:%d", 12000+port))
 		router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: source}, mustParsePathControl(t, request))
 	}
-	if got := len(transport.writes); got != replayCount {
-		t.Fatalf("stateless challenges = %d, want %d; request replay exhausted shared state", got, replayCount)
+	if got := len(transport.writes); got != pathRequestTokenBurst {
+		t.Fatalf("burst challenges = %d, want strict cap %d", got, pathRequestTokenBurst)
+	}
+
+	now = now.Add(time.Second / pathRequestTokensPerSecond)
+	recoveredSource := mustRelayUDPAddr(t, "127.0.0.1:12020")
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: recoveredSource}, mustParsePathControl(t, request))
+	if got := len(transport.writes); got != pathRequestTokenBurst+1 {
+		t.Fatalf("challenges after refill = %d, want %d", got, pathRequestTokenBurst+1)
+	}
+	excessSource := mustRelayUDPAddr(t, "127.0.0.1:12021")
+	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: excessSource}, mustParsePathControl(t, request))
+	if got := len(transport.writes); got != pathRequestTokenBurst+1 {
+		t.Fatalf("recovered token allowed excess challenge: got %d", got)
 	}
 	firstSource := mustRelayUDPAddr(t, "127.0.0.1:12000")
 	challenge := mustParsePathControl(t, transport.nextWrite(t).packet)
@@ -436,7 +460,7 @@ func TestRelayDoesNotAdmitAdditionalPathWhenMigrationDisabled(t *testing.T) {
 	}
 	defer session.Close()
 
-	nonce := [pathControlNonceSize]byte{1, 2, 3, 4}
+	nonce := mustNewPathRequestNonce(t, router.now())
 	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
 	if err != nil {
 		t.Fatal(err)
@@ -565,6 +589,8 @@ func TestRelayInvalidFECDoesNotChangeActiveReturnPath(t *testing.T) {
 func TestRelayContinuousNATRebindSafelyReplacesInactivePaths(t *testing.T) {
 	transport := newPathControlCaptureTransport()
 	router := newRelayTransportRouter(transport, 4, 1)
+	now := time.Unix(1_700_100_000, 0)
+	router.now = func() time.Time { return now }
 	var sessionID SessionID
 	copy(sessionID[:], []byte("many-rebinds-id!"))
 	var pathKey [trafficKeySize]byte
@@ -579,6 +605,7 @@ func TestRelayContinuousNATRebindSafelyReplacesInactivePaths(t *testing.T) {
 	var latest net.Addr
 	allSources := []net.Addr{original}
 	for index := 0; index < defaultRelayMaxPathsPerSession+12; index++ {
+		now = now.Add(time.Second / pathRequestTokensPerSecond)
 		source := mustRelayUDPAddr(t, fmt.Sprintf("127.0.0.1:%d", 13000+index))
 		allSources = append(allSources, source)
 		latest = source
@@ -935,10 +962,7 @@ func waitForRelaySourceCount(t *testing.T, relay *Relay, want int) {
 
 func authenticateRelayTestPath(t *testing.T, router *relayTransportRouter, transport *pathControlCaptureTransport, sessionID SessionID, pathKey [trafficKeySize]byte, source net.Addr) {
 	t.Helper()
-	nonce, err := newPathNonce()
-	if err != nil {
-		t.Fatal(err)
-	}
+	nonce := mustNewPathRequestNonce(t, router.now())
 	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
 	if err != nil {
 		t.Fatal(err)
@@ -950,4 +974,13 @@ func authenticateRelayTestPath(t *testing.T, router *relayTransportRouter, trans
 		t.Fatal(err)
 	}
 	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: response, from: source}, mustParsePathControl(t, response))
+}
+
+func mustNewPathRequestNonce(t *testing.T, now time.Time) [pathControlNonceSize]byte {
+	t.Helper()
+	nonce, err := newPathRequestNonce(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nonce
 }

@@ -253,9 +253,11 @@ session queue:
    `ServerNonce`. Consumed cookies enter a short-lived per-session replay set;
    source mappings owned by another session cannot be stolen.
 
-The request tag alone never registers a source, so replaying a captured request
-from another address only produces a challenge that cannot be answered without
-the per-session key. Requests allocate no global pending state. Replayed
+The request tag alone never registers a source. `ClientNonce` carries an
+authenticated timestamp and requests outside the 10-second window are rejected.
+Fresh requests allocate no global pending state and share a strict per-CID token
+bucket (burst 8, refill 2/second) before request HMAC and response work. Thus a
+captured request can produce only bounded reflection and CPU cost. Replayed
 responses fail the bounded per-session consumed-cookie check. Unknown
 non-control data remains fail-closed and is not broadcast for trial decryption.
 

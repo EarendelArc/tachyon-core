@@ -16,6 +16,7 @@ const (
 	pathControlTagSize   = sha256.Size
 	pathRequestSize      = 4 + 1 + 16 + pathControlNonceSize + pathControlTagSize
 	pathChallengeSize    = pathRequestSize + pathControlNonceSize
+	pathRequestLifetime  = 10 * time.Second
 )
 
 var (
@@ -48,12 +49,22 @@ func derivePathAuthKey(clientToServer [trafficKeySize]byte, sessionID SessionID)
 	return key
 }
 
-func newPathNonce() ([pathControlNonceSize]byte, error) {
+func newPathRequestNonce(now time.Time) ([pathControlNonceSize]byte, error) {
 	var nonce [pathControlNonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nonce, fmt.Errorf("generate path nonce: %w", err)
+	binary.BigEndian.PutUint64(nonce[:8], uint64(now.Unix()))
+	if _, err := rand.Read(nonce[8:]); err != nil {
+		return nonce, fmt.Errorf("generate path request nonce: %w", err)
 	}
 	return nonce, nil
+}
+
+func verifyPathRequestTime(nonce [pathControlNonceSize]byte, now time.Time, maxAge time.Duration) bool {
+	issuedUnix := binary.BigEndian.Uint64(nonce[:8])
+	if issuedUnix > uint64(^uint64(0)>>1) {
+		return false
+	}
+	issuedAt := time.Unix(int64(issuedUnix), 0)
+	return !issuedAt.After(now.Add(time.Second)) && now.Sub(issuedAt) <= maxAge
 }
 
 func newPathCookie(key [trafficKeySize]byte, sessionID SessionID, source sourceAddrKey, clientNonce [pathControlNonceSize]byte, issuedAt time.Time) [pathControlNonceSize]byte {

@@ -170,6 +170,8 @@ request/challenge/response exchange; replayed responses and data packets cannot
 register a path. Challenges use stateless source-bound cookies, and only a
 fresh completed challenge changes the active relay return path; business data
 from an older authorized path cannot switch it.
+Path requests carry an authenticated 10-second timestamp and are limited before
+HMAC/response work by a per-session burst-8, 2-per-second token bucket.
 
 The generated client uses `client.tun.mtu=1280` and
 `tgp.max_datagram_size=1352`, bounding its worst-case outer IPv6/UDP packet to

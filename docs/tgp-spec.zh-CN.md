@@ -145,7 +145,7 @@ Relay 首先把 session 绑定到完成认证握手的 UDP 来源地址。新增
 3. 客户端验证 challenge，并从收到 challenge 的同一本地 transport 返回同时覆盖两个 nonce 的 `PathResponse`。
 4. Relay 校验 `ServerNonce` 中无状态、绑定来源地址的 cookie；已消费 cookie 进入短时、每会话有界 replay set，已有来源映射不能被其他 session 抢占。
 
-仅重放 `PathRequest` 只能让攻击来源收到无法回答的 challenge，并且不会分配全局 pending 状态；重复响应会被已消费 cookie 检查拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
+`ClientNonce` 携带认证时间戳，超过 10 秒时间窗的 `PathRequest` 会被拒绝。新鲜请求不分配全局 pending 状态，并在请求 HMAC 与响应开销前受每 CID 严格 token bucket 限制（burst 8、每秒恢复 2）；因此捕获请求造成的反射与 CPU 开销有明确上界。重复响应会被已消费 cookie 检查拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
 
 PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可以交付，但业务数据永远不能改变 active 回程路径；只有完成新鲜 challenge 才能切换。非 active 路径 45 秒后老化，达到 8 条上限时安全替换最久未使用的非 active 条目。
 

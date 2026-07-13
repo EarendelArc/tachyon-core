@@ -17,6 +17,8 @@ const (
 	defaultRelayHandshakeQueueSize = 64
 	defaultRelayMaxPathsPerSession = 8
 	defaultRelayUsedPathCookies    = 64
+	pathRequestTokenBurst          = 8
+	pathRequestTokensPerSecond     = 2
 	pathChallengeLifetime          = 5 * time.Second
 	pathAuthorizationLifetime      = 45 * time.Second
 )
@@ -359,6 +361,7 @@ func newSourceAddrKey(addr net.Addr) (sourceAddrKey, bool) {
 
 type relayTransportRouter struct {
 	transport Transport
+	now       func() time.Time
 
 	mu                 sync.Mutex
 	handshakes         chan relayPacketEnvelope
@@ -383,6 +386,7 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 	}
 	return &relayTransportRouter{
 		transport:        transport,
+		now:              time.Now,
 		handshakes:       make(chan relayPacketEnvelope, handshakeQueueSize),
 		done:             make(chan struct{}),
 		sessions:         make(map[SessionID]*relaySessionTransport),
@@ -451,17 +455,20 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 	if _, ok := r.sources[addrKey]; ok {
 		return nil, ErrInvalidHandshake
 	}
+	now := r.now()
 	session := &relaySessionTransport{
 		id:     id,
 		router: r,
 		paths: map[sourceAddrKey]relayPathState{addrKey: {
 			addr:            addr,
-			authenticatedAt: time.Now(),
-			lastSeen:        time.Now(),
+			authenticatedAt: now,
+			lastSeen:        now,
 		}},
 		activeSource:         addrKey,
 		usedPathCookies:      make(map[[pathControlNonceSize]byte]time.Time),
 		pathKey:              pathKey,
+		pathRequestTokens:    pathRequestTokenBurst,
+		pathRequestRefillAt:  now,
 		allowAdditionalPaths: allowAdditionalPaths,
 		packets:              make(chan relayPacketEnvelope, r.sessionQueueSize),
 		done:                 make(chan struct{}),
@@ -522,6 +529,11 @@ func (r *relayTransportRouter) handlePathControl(ctx context.Context, envelope r
 }
 
 func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.Addr, source sourceAddrKey, msg pathControlMessage) {
+	now := r.now()
+	if !verifyPathRequestTime(msg.clientNonce, now, pathRequestLifetime) {
+		r.droppedPathControl.Add(1)
+		return
+	}
 	r.mu.Lock()
 	session := r.sessions[msg.sessionID]
 	if session == nil || !session.allowAdditionalPaths || session.activeSource == source {
@@ -533,6 +545,11 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 		r.droppedPathControl.Add(1)
 		return
 	}
+	if !consumePathRequestTokenLocked(session, now) {
+		r.mu.Unlock()
+		r.droppedPathControl.Add(1)
+		return
+	}
 	pathKey := session.pathKey
 	r.mu.Unlock()
 	if !verifyPathControl(msg, pathKey) {
@@ -540,7 +557,7 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 		return
 	}
 
-	serverNonce := newPathCookie(pathKey, msg.sessionID, source, msg.clientNonce, time.Now())
+	serverNonce := newPathCookie(pathKey, msg.sessionID, source, msg.clientNonce, now)
 	challenge, err := marshalPathControl(pathControlChallenge, msg.sessionID, msg.clientNonce, serverNonce, pathKey)
 	if err != nil {
 		r.droppedPathControl.Add(1)
@@ -553,7 +570,7 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 }
 
 func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAddrKey, msg pathControlMessage) {
-	now := time.Now()
+	now := r.now()
 	r.mu.Lock()
 	session := r.sessions[msg.sessionID]
 	if session == nil || !session.allowAdditionalPaths {
@@ -604,6 +621,19 @@ func (r *relayTransportRouter) handlePathResponse(from net.Addr, source sourceAd
 	session.paths[source] = relayPathState{addr: from, authenticatedAt: now, lastSeen: now}
 	session.activeSource = source
 	r.sources[source] = session
+}
+
+func consumePathRequestTokenLocked(session *relaySessionTransport, now time.Time) bool {
+	if now.After(session.pathRequestRefillAt) {
+		elapsed := now.Sub(session.pathRequestRefillAt).Seconds()
+		session.pathRequestTokens = min(float64(pathRequestTokenBurst), session.pathRequestTokens+elapsed*pathRequestTokensPerSecond)
+		session.pathRequestRefillAt = now
+	}
+	if session.pathRequestTokens < 1 {
+		return false
+	}
+	session.pathRequestTokens--
+	return true
 }
 
 func (r *relayTransportRouter) purgeUsedPathCookiesLocked(session *relaySessionTransport, now time.Time) {
@@ -676,6 +706,8 @@ type relaySessionTransport struct {
 	activeSource         sourceAddrKey
 	usedPathCookies      map[[pathControlNonceSize]byte]time.Time
 	pathKey              [trafficKeySize]byte
+	pathRequestTokens    float64
+	pathRequestRefillAt  time.Time
 	allowAdditionalPaths bool
 	packets              chan relayPacketEnvelope
 	done                 chan struct{}
@@ -724,7 +756,7 @@ func (t *relaySessionTransport) IsSourceAuthorized(addr net.Addr) bool {
 	}
 	t.router.mu.Lock()
 	defer t.router.mu.Unlock()
-	t.router.purgeExpiredPathsLocked(t, time.Now())
+	t.router.purgeExpiredPathsLocked(t, t.router.now())
 	_, ok = t.paths[key]
 	return ok
 }
@@ -740,7 +772,7 @@ func (t *relaySessionTransport) ObserveAuthorizedSource(addr net.Addr) {
 	if !ok {
 		return
 	}
-	path.lastSeen = time.Now()
+	path.lastSeen = t.router.now()
 	t.paths[key] = path
 }
 

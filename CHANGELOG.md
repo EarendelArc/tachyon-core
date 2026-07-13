@@ -12,6 +12,8 @@ All notable changes to Tachyon Core will be documented in this file.
   completion; authorized business data from old paths cannot switch it.
 - Relay paths now expire and safely replace the least-recently-used inactive
   entry instead of permanently exhausting the eight-path session bound.
+- Path requests now carry an authenticated 10-second timestamp and pass a
+  strict per-CID burst-8, 2-per-second token bucket before HMAC/response work.
 - Codec and FEC processing now enforce protocol limits for datagram size,
   shard counts and size, active/completed groups, and total buffered bytes.
 - The default client TUN MTU is now 1280 with a 1352-byte TGP budget. The

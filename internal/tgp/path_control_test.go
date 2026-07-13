@@ -62,6 +62,42 @@ func TestPathControlKeyIsSessionBound(t *testing.T) {
 	}
 }
 
+func TestPathRequestNonceTimeWindow(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	nonce, err := newPathRequestNonce(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifyPathRequestTime(nonce, now, pathRequestLifetime) {
+		t.Fatal("fresh path request nonce was rejected")
+	}
+	if verifyPathRequestTime(nonce, now.Add(pathRequestLifetime+2*time.Second), pathRequestLifetime) {
+		t.Fatal("expired path request nonce was accepted")
+	}
+	future, err := newPathRequestNonce(now.Add(2 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifyPathRequestTime(future, now, pathRequestLifetime) {
+		t.Fatal("path request nonce beyond clock-skew allowance was accepted")
+	}
+
+	var key [trafficKeySize]byte
+	key[0] = 99
+	wire, err := marshalPathControl(pathControlRequest, SessionID{}, nonce, [pathControlNonceSize]byte{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire[21] ^= 0x01
+	tampered, err := parsePathControl(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifyPathControl(tampered, key) {
+		t.Fatal("tampered path request timestamp remained authenticated")
+	}
+}
+
 func TestPathCookieIsSourceBoundAndExpires(t *testing.T) {
 	var sessionID SessionID
 	copy(sessionID[:], []byte("cookie-source-id"))

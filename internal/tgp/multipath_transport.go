@@ -261,7 +261,7 @@ func (t *MultipathTransport) refreshPathAuthentication() error {
 	}
 	requests := make([]request, 0, len(t.paths))
 	for index := range t.paths {
-		nonce, err := newPathNonce()
+		nonce, err := newPathRequestNonce(time.Now())
 		if err != nil {
 			return err
 		}

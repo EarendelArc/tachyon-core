@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestReedSolomonCodecReconstructsMissingShard(t *testing.T) {
@@ -265,6 +266,38 @@ func TestFECCompletedGroupsDoNotConsumeActiveGroupCapacity(t *testing.T) {
 	}
 	if buffer.PendingGroups() != 0 || buffer.BufferedBytes() != 0 {
 		t.Fatalf("completed groups retained payload state: groups=%d bytes=%d", buffer.PendingGroups(), buffer.BufferedBytes())
+	}
+}
+
+func TestFECCompletedGroupMaintenanceIsAmortizedConstantTime(t *testing.T) {
+	buffer := NewFECReceiveBuffer(nil, 1)
+	completedAt := time.Unix(1_700_000_000, 0)
+	for id := uint32(0); id < MaxFECCompletedGroups; id++ {
+		buffer.rememberCompletedGroup(id, completedAt)
+	}
+
+	before := buffer.completedMaintenanceOps
+	const packets = 10_000
+	for range packets {
+		buffer.purgeExpiredGroups(completedAt.Add(time.Second))
+	}
+	work := buffer.completedMaintenanceOps - before
+	if work > packets {
+		t.Fatalf("completed tombstone maintenance operations = %d for %d packets, want <= %d", work, packets, packets)
+	}
+	if len(buffer.completedGroups) != MaxFECCompletedGroups {
+		t.Fatalf("completed tombstones = %d, want %d", len(buffer.completedGroups), MaxFECCompletedGroups)
+	}
+
+	buffer.rememberCompletedGroup(MaxFECCompletedGroups, completedAt.Add(2*time.Second))
+	if len(buffer.completedGroups) != MaxFECCompletedGroups {
+		t.Fatalf("bounded completed tombstones = %d, want %d", len(buffer.completedGroups), MaxFECCompletedGroups)
+	}
+	if _, retained := buffer.completedGroups[0]; retained {
+		t.Fatal("oldest completed tombstone was not evicted in O(1)")
+	}
+	if _, retained := buffer.completedGroups[MaxFECCompletedGroups]; !retained {
+		t.Fatal("new completed tombstone was not retained")
 	}
 }
 

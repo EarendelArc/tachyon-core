@@ -151,13 +151,21 @@ type FECReceiveResult struct {
 	RecoveredShards int
 }
 
+type completedFECGroup struct {
+	id          uint32
+	completedAt time.Time
+}
+
 type FECReceiveBuffer struct {
-	codec            FECCodec
-	groups           map[uint32]*FECGroupState
-	completedGroups  map[uint32]time.Time
-	maxGroups        int
-	maxBufferedBytes int
-	bufferedBytes    int
+	codec                   FECCodec
+	groups                  map[uint32]*FECGroupState
+	completedGroups         map[uint32]time.Time
+	completedOrder          []completedFECGroup
+	completedHead           int
+	completedMaintenanceOps uint64
+	maxGroups               int
+	maxBufferedBytes        int
+	bufferedBytes           int
 }
 
 func NewFECReceiveBuffer(codec FECCodec, maxGroups int) *FECReceiveBuffer {
@@ -330,28 +338,49 @@ func (b *FECReceiveBuffer) purgeExpiredGroups(now time.Time) {
 			delete(b.groups, id)
 		}
 	}
-	for id, completedAt := range b.completedGroups {
-		if now.Sub(completedAt) >= fecReceiveGroupLifetime {
-			delete(b.completedGroups, id)
+	for b.completedHead < len(b.completedOrder) {
+		b.completedMaintenanceOps++
+		entry := b.completedOrder[b.completedHead]
+		if now.Sub(entry.completedAt) < fecReceiveGroupLifetime {
+			break
 		}
+		b.popCompletedGroup()
 	}
 }
 
 func (b *FECReceiveBuffer) rememberCompletedGroup(id uint32, completedAt time.Time) {
+	if _, exists := b.completedGroups[id]; exists {
+		return
+	}
 	if len(b.completedGroups) >= MaxFECCompletedGroups {
-		var oldestID uint32
-		var oldestAt time.Time
-		first := true
-		for candidateID, candidateAt := range b.completedGroups {
-			if first || candidateAt.Before(oldestAt) {
-				oldestID = candidateID
-				oldestAt = candidateAt
-				first = false
-			}
-		}
-		delete(b.completedGroups, oldestID)
+		b.popCompletedGroup()
 	}
 	b.completedGroups[id] = completedAt
+	b.completedOrder = append(b.completedOrder, completedFECGroup{id: id, completedAt: completedAt})
+}
+
+func (b *FECReceiveBuffer) popCompletedGroup() {
+	if b.completedHead >= len(b.completedOrder) {
+		return
+	}
+	entry := b.completedOrder[b.completedHead]
+	b.completedHead++
+	if completedAt, exists := b.completedGroups[entry.id]; exists && completedAt.Equal(entry.completedAt) {
+		delete(b.completedGroups, entry.id)
+	}
+	if b.completedHead == len(b.completedOrder) {
+		b.completedOrder = b.completedOrder[:0]
+		b.completedHead = 0
+		return
+	}
+	if b.completedHead >= MaxFECCompletedGroups && b.completedHead*2 >= len(b.completedOrder) {
+		remaining := len(b.completedOrder) - b.completedHead
+		copy(b.completedOrder[:remaining], b.completedOrder[b.completedHead:])
+		clear(b.completedOrder[remaining:])
+		b.completedOrder = b.completedOrder[:remaining]
+		b.completedHead = 0
+		b.completedMaintenanceOps += uint64(remaining)
+	}
 }
 
 func (b *FECReceiveBuffer) releaseGroupShards(group *FECGroupState) {

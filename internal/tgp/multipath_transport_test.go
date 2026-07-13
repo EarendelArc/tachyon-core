@@ -2,11 +2,38 @@ package tgp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestMultipathTransportUsesRelayClockOffsetForPathRequests(t *testing.T) {
+	for _, offset := range []time.Duration{-2 * time.Second, 2 * time.Second} {
+		t.Run(offset.String(), func(t *testing.T) {
+			path := newFakeMultipathPath("127.0.0.1:10001")
+			transport, err := NewMultipathTransport(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer transport.Close()
+			remote := mustMultipathUDPAddr(t, "127.0.0.1:443")
+			var sessionID SessionID
+			var key [trafficKeySize]byte
+			before := time.Now().Add(offset)
+			if err := transport.EnablePathAuthentication(sessionID, key, remote, offset); err != nil {
+				t.Fatal(err)
+			}
+			request := mustParsePathControl(t, path.nextWrite(t).packet)
+			after := time.Now().Add(offset)
+			issuedUnix := int64(binary.BigEndian.Uint64(request.clientNonce[:8]))
+			if issuedUnix < before.Unix() || issuedUnix > after.Unix() {
+				t.Fatalf("path request timestamp = %d, want relay-aligned range [%d,%d]", issuedUnix, before.Unix(), after.Unix())
+			}
+		})
+	}
+}
 
 func TestMultipathTransportFansOutWrites(t *testing.T) {
 	left := newFakeMultipathPath("127.0.0.1:10001")
@@ -118,7 +145,7 @@ func TestMultipathTransportRejectsForwardedChallengeFromUnknownSource(t *testing
 	copy(sessionID[:], []byte("client-source-id"))
 	var key [trafficKeySize]byte
 	key[0] = 17
-	if err := transport.EnablePathAuthentication(sessionID, key, configured); err != nil {
+	if err := transport.EnablePathAuthentication(sessionID, key, configured, 0); err != nil {
 		t.Fatal(err)
 	}
 	request := mustParsePathControl(t, path.nextWrite(t).packet)

@@ -70,7 +70,7 @@ func TestHandshakeAuthenticatesDatagramBudget(t *testing.T) {
 	var sessionID SessionID
 	var publicKey PublicKey
 	authKey := []byte("authenticated-budget-test-key")
-	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, authKey, PublicKey{})
+	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, 0, authKey, PublicKey{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,18 +84,61 @@ func TestHandshakeAuthenticatesDatagramBudget(t *testing.T) {
 	}
 }
 
-func TestHandshakeRejectsVersionOnePeer(t *testing.T) {
-	const versionOneBodySize = 4 + 1 + 16 + publicKeySize
-	body := make([]byte, versionOneBodySize)
-	copy(body[:4], []byte{'T', 'G', 'H', 0x01})
-	body[4] = byte(handshakeHello)
-	outer, err := NewOuterHeader(handshakeSequence, len(body))
+func TestHandshakeAuthenticatesRelayClock(t *testing.T) {
+	var sessionID SessionID
+	var publicKey PublicKey
+	authKey := []byte("authenticated-relay-clock-key")
+	wire, err := marshalHandshake(handshakeHelloAck, sessionID, publicKey, DefaultTGPDatagramSize, time.Now().UnixMilli(), authKey, PublicKey{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire := append(marshalOuterHeader(outer), body...)
-	if _, err := parseHandshake(wire); !errors.Is(err, ErrInvalidHandshake) {
-		t.Fatalf("version-one handshake error = %v, want %v", err, ErrInvalidHandshake)
+	wire[outerHeaderSize+55] ^= 0x01
+	msg, err := parseHandshake(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyHandshakeAuth(msg, authKey, PublicKey{}); !errors.Is(err, ErrInvalidHandshake) {
+		t.Fatalf("tampered relay clock auth error = %v, want %v", err, ErrInvalidHandshake)
+	}
+}
+
+func TestEstimateRelayClockOffsetCorrectsClientSkew(t *testing.T) {
+	relayMidpoint := time.UnixMilli(1_700_000_000_000)
+	for _, skew := range []time.Duration{-2 * time.Second, 2 * time.Second} {
+		t.Run(skew.String(), func(t *testing.T) {
+			helloSentAt := relayMidpoint.Add(-50 * time.Millisecond).Add(skew)
+			ackReceivedAt := relayMidpoint.Add(50 * time.Millisecond).Add(skew)
+			offset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, relayMidpoint.UnixMilli())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantOffset := -skew - 50*time.Millisecond
+			if offset != wantOffset {
+				t.Fatalf("clock offset = %s, want %s", offset, wantOffset)
+			}
+			if aligned := ackReceivedAt.Add(offset); !aligned.Equal(relayMidpoint) {
+				t.Fatalf("aligned client time = %s", aligned)
+			}
+		})
+	}
+}
+
+func TestHandshakeRejectsOlderPeers(t *testing.T) {
+	for _, version := range []struct {
+		value    byte
+		bodySize int
+	}{{value: 1, bodySize: 4 + 1 + 16 + publicKeySize}, {value: 2, bodySize: 4 + 1 + 16 + publicKeySize + 2}} {
+		body := make([]byte, version.bodySize)
+		copy(body[:4], []byte{'T', 'G', 'H', version.value})
+		body[4] = byte(handshakeHello)
+		outer, err := NewOuterHeader(handshakeSequence, len(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := append(marshalOuterHeader(outer), body...)
+		if _, err := parseHandshake(wire); !errors.Is(err, ErrInvalidHandshake) {
+			t.Fatalf("version-%d handshake error = %v, want %v", version.value, err, ErrInvalidHandshake)
+		}
 	}
 }
 
@@ -127,7 +170,7 @@ func TestHandshakeRejectsAuthenticatedAckForwardedFromUnknownSource(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := marshalHandshake(handshakeHelloAck, hello.sessionID, serverKeys.PublicKey(), hello.maxDatagramSize, authKey, hello.publicKey)
+	ack, err := marshalHandshake(handshakeHelloAck, hello.sessionID, serverKeys.PublicKey(), hello.maxDatagramSize, time.Now().UnixMilli(), authKey, hello.publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}

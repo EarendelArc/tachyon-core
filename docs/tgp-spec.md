@@ -172,14 +172,18 @@ HKDF-SHA256(
 ```text
 Client                                      Server
   | ---- HELLO (session id, client key) ----> |
-  | <--- HELLO_ACK (same id, server key) ---- |
+  | < HELLO_ACK (id, server key, relay time)  |
   | ==== encrypted data packets ============> |
   | <==== encrypted relay packets =========== |
   | ---- CLOSE -----------------------------> |
 ```
 
 The implemented handshake uses X25519 ephemeral keys. Both sides derive
-directional traffic keys from the shared secret and SessionID.
+directional traffic keys from the shared secret and SessionID. The authenticated
+`TGH\x03` acknowledgement carries the relay's send time in milliseconds. The
+client aligns path-request timestamps to that time, conservatively biased into
+the past by ACK downstream latency; the 10-second replay window and 1-second
+future allowance are unchanged.
 
 ---
 
@@ -298,10 +302,10 @@ minimum configurable value is 1232, matching an outer IPv6/UDP budget on a
 known 1280-byte path. Client validation requires
 `client.tun.mtu + 68 <= tgp.max_datagram_size`; oversized sends and receives
 fail closed. Sends return an explicit protocol error and receive drops increment
-`OversizedDatagrams` telemetry. The authenticated `TGH\x02` handshake carries
+`OversizedDatagrams` telemetry. The authenticated `TGH\x03` handshake carries
 the offered limit in its authenticated fields, and both peers store the lower
-client/relay value. Version 1 peers are rejected because they cannot prove a
-datagram budget.
+client/relay value. Version 1 and 2 peers are rejected because they cannot prove
+the complete current handshake fields.
 
 TGP does not currently fragment protocol datagrams or discover PMTU. Operators
 must configure a known lower budget and matching TUN MTU. A 1280-byte outer

@@ -329,7 +329,7 @@ func TestDatagramSessionRejectsValidCiphertextFromUnknownMultipathSource(t *test
 	unknown := mustUDPAddr(t, "127.0.0.1:32101")
 	var pathKey [trafficKeySize]byte
 	pathKey[0] = 23
-	if err := transport.EnablePathAuthentication(sessionID, pathKey, known); err != nil {
+	if err := transport.EnablePathAuthentication(sessionID, pathKey, known, 0); err != nil {
 		t.Fatal(err)
 	}
 	request := mustParsePathControl(t, path.nextWritePacket(ctx))

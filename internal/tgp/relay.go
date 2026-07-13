@@ -173,7 +173,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			return nil, err
 		}
 		msg, err := parseHandshake(envelope.packet)
-		if err != nil || msg.msgType != handshakeHello {
+		if err != nil || msg.msgType != handshakeHello || msg.relayUnixMilli != 0 {
 			continue
 		}
 		if err := verifyHandshakeAuth(msg, r.authKey, PublicKey{}); err != nil {
@@ -198,7 +198,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 		if err != nil {
 			return nil, err
 		}
-		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, r.authKey, msg.publicKey)
+		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), r.authKey, msg.publicKey)
 		if err != nil {
 			_ = sessionTransport.Close()
 			return nil, err

@@ -5,9 +5,9 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
-- TGP v2 authenticates and negotiates the 1232-1452 byte encrypted datagram
-  budget, stores the lower peer value, rejects v1 peers, and records oversized
-  receive drops.
+- TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
+  budget, carries relay time for path-request clock alignment, rejects v1/v2
+  peers, and records oversized receive drops.
 - Relay return-path selection is now controlled only by fresh path challenge
   completion; authorized business data from old paths cannot switch it.
 - Relay paths now expire and safely replace the least-recently-used inactive

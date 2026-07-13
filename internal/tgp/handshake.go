@@ -8,16 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 const (
-	handshakeBaseBodySize = 4 + 1 + 16 + publicKeySize + 2
+	handshakeBaseBodySize = 4 + 1 + 16 + publicKeySize + 2 + 8
 	handshakeAuthTagSize  = sha256.Size
 	handshakeSequence     = 0
 )
 
 var (
-	handshakeMagic       = [4]byte{0x54, 0x47, 0x48, 0x02} // "TGH\x02"
+	handshakeMagic       = [4]byte{0x54, 0x47, 0x48, 0x03} // "TGH\x03"
 	ErrInvalidHandshake  = errors.New("invalid tgp handshake")
 	ErrUnexpectedMessage = errors.New("unexpected tgp handshake message")
 	ErrHandshakeTimeout  = errors.New("tgp handshake timeout")
@@ -43,6 +44,7 @@ type handshakeMessage struct {
 	sessionID       SessionID
 	publicKey       PublicKey
 	maxDatagramSize int
+	relayUnixMilli  int64
 	authTag         []byte
 }
 
@@ -111,11 +113,12 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		return nil, err
 	}
 	clientPublic := keyPair.PublicKey()
-	hello, err := marshalHandshake(handshakeHello, sessionID, clientPublic, localMaxDatagramSize, opts.AuthKey, PublicKey{})
+	hello, err := marshalHandshake(handshakeHello, sessionID, clientPublic, localMaxDatagramSize, 0, opts.AuthKey, PublicKey{})
 	if err != nil {
 		_ = transport.Close()
 		return nil, err
 	}
+	helloSentAt := time.Now()
 	if err := transport.WritePacket(ctx, hello, remoteAddr); err != nil {
 		_ = transport.Close()
 		return nil, err
@@ -123,6 +126,7 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 
 	for {
 		wire, from, err := transport.ReadPacket(ctx)
+		ackReceivedAt := time.Now()
 		if err != nil {
 			_ = transport.Close()
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -146,6 +150,10 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > localMaxDatagramSize {
 			continue
 		}
+		clockOffset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, msg.relayUnixMilli)
+		if err != nil {
+			continue
+		}
 		keys, err := keyPair.DeriveTrafficKeysWithAuth(msg.publicKey, sessionID, RoleClient, opts.AuthKey)
 		if err != nil {
 			_ = transport.Close()
@@ -153,10 +161,10 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		}
 		if !opts.DisableMigration {
 			if pathTransport, ok := transport.(interface {
-				EnablePathAuthentication(SessionID, [trafficKeySize]byte, net.Addr) error
+				EnablePathAuthentication(SessionID, [trafficKeySize]byte, net.Addr, time.Duration) error
 			}); ok {
 				pathKey := derivePathAuthKey(keys.SendKey, sessionID)
-				if err := pathTransport.EnablePathAuthentication(sessionID, pathKey, from); err != nil {
+				if err := pathTransport.EnablePathAuthentication(sessionID, pathKey, from, clockOffset); err != nil {
 					_ = transport.Close()
 					return nil, fmt.Errorf("enable tgp path authentication: %w", err)
 				}
@@ -202,7 +210,7 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 		if err != nil {
 			continue
 		}
-		if msg.msgType != handshakeHello {
+		if msg.msgType != handshakeHello || msg.relayUnixMilli != 0 {
 			continue
 		}
 		if err := verifyHandshakeAuth(msg, opts.AuthKey, PublicKey{}); err != nil {
@@ -217,7 +225,7 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 		if err != nil {
 			return nil, err
 		}
-		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, opts.AuthKey, msg.publicKey)
+		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), opts.AuthKey, msg.publicKey)
 		if err != nil {
 			return nil, err
 		}
@@ -238,10 +246,13 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 	}
 }
 
-func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, authKey []byte, peerPublic PublicKey) ([]byte, error) {
+func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, relayUnixMilli int64, authKey []byte, peerPublic PublicKey) ([]byte, error) {
 	maxDatagramSize, err := normalizeMaxDatagramSize(maxDatagramSize)
 	if err != nil {
 		return nil, err
+	}
+	if (msgType == handshakeHello && relayUnixMilli != 0) || (msgType == handshakeHelloAck && relayUnixMilli <= 0) {
+		return nil, ErrInvalidHandshake
 	}
 	bodySize := handshakeBaseBodySize
 	if len(authKey) > 0 {
@@ -253,8 +264,9 @@ func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey Publ
 	copy(body[5:21], sessionID[:])
 	copy(body[21:53], publicKey[:])
 	binary.BigEndian.PutUint16(body[53:55], uint16(maxDatagramSize))
+	binary.BigEndian.PutUint64(body[55:63], uint64(relayUnixMilli))
 	if len(authKey) > 0 {
-		tag := handshakeAuthTag(authKey, msgType, sessionID, publicKey, maxDatagramSize, peerPublic)
+		tag := handshakeAuthTag(authKey, msgType, sessionID, publicKey, maxDatagramSize, relayUnixMilli, peerPublic)
 		copy(body[handshakeBaseBodySize:], tag)
 	}
 
@@ -292,11 +304,13 @@ func parseHandshake(wire []byte) (handshakeMessage, error) {
 	copy(sessionID[:], body[5:21])
 	copy(publicKey[:], body[21:53])
 	maxDatagramSize := int(binary.BigEndian.Uint16(body[53:55]))
+	relayUnixMilli := int64(binary.BigEndian.Uint64(body[55:63]))
 	msg := handshakeMessage{
 		msgType:         msgType,
 		sessionID:       sessionID,
 		publicKey:       publicKey,
 		maxDatagramSize: maxDatagramSize,
+		relayUnixMilli:  relayUnixMilli,
 	}
 	if len(body) == handshakeBaseBodySize+handshakeAuthTagSize {
 		msg.authTag = append([]byte(nil), body[handshakeBaseBodySize:]...)
@@ -314,14 +328,14 @@ func verifyHandshakeAuth(msg handshakeMessage, authKey []byte, peerPublic Public
 	if len(msg.authTag) != handshakeAuthTagSize {
 		return ErrInvalidHandshake
 	}
-	want := handshakeAuthTag(authKey, msg.msgType, msg.sessionID, msg.publicKey, msg.maxDatagramSize, peerPublic)
+	want := handshakeAuthTag(authKey, msg.msgType, msg.sessionID, msg.publicKey, msg.maxDatagramSize, msg.relayUnixMilli, peerPublic)
 	if !hmac.Equal(msg.authTag, want) {
 		return ErrInvalidHandshake
 	}
 	return nil
 }
 
-func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, peerPublic PublicKey) []byte {
+func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, relayUnixMilli int64, peerPublic PublicKey) []byte {
 	mac := hmac.New(sha256.New, authKey)
 	_, _ = mac.Write(handshakeMagic[:])
 	_, _ = mac.Write([]byte{byte(msgType)})
@@ -330,6 +344,18 @@ func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID
 	var encodedMax [2]byte
 	binary.BigEndian.PutUint16(encodedMax[:], uint16(maxDatagramSize))
 	_, _ = mac.Write(encodedMax[:])
+	var encodedRelayTime [8]byte
+	binary.BigEndian.PutUint64(encodedRelayTime[:], uint64(relayUnixMilli))
+	_, _ = mac.Write(encodedRelayTime[:])
 	_, _ = mac.Write(peerPublic[:])
 	return mac.Sum(nil)
+}
+
+func estimateRelayClockOffset(helloSentAt, ackReceivedAt time.Time, relayUnixMilli int64) (time.Duration, error) {
+	if relayUnixMilli <= 0 || ackReceivedAt.Before(helloSentAt) {
+		return 0, ErrInvalidHandshake
+	}
+	// Bias the estimate into the past by the ACK's downstream latency. This
+	// avoids creating future-dated requests on asymmetric paths.
+	return time.UnixMilli(relayUnixMilli).Sub(ackReceivedAt), nil
 }

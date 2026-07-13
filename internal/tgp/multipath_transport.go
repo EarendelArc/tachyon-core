@@ -29,6 +29,7 @@ type clientPathAuthentication struct {
 	sessionID        SessionID
 	key              [trafficKeySize]byte
 	remote           net.Addr
+	clockOffset      time.Duration
 	nonces           [][pathControlNonceSize]byte
 	authorizedSource map[sourceAddrKey]struct{}
 }
@@ -62,7 +63,7 @@ func NewMultipathTransport(paths ...Transport) (*MultipathTransport, error) {
 	return t, nil
 }
 
-func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [trafficKeySize]byte, remote net.Addr) error {
+func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [trafficKeySize]byte, remote net.Addr, clockOffset time.Duration) error {
 	if t == nil || remote == nil {
 		return errors.New("path authentication requires a transport and remote address")
 	}
@@ -75,6 +76,7 @@ func (t *MultipathTransport) EnablePathAuthentication(sessionID SessionID, key [
 		sessionID:        sessionID,
 		key:              key,
 		remote:           remote,
+		clockOffset:      clockOffset,
 		nonces:           make([][pathControlNonceSize]byte, len(t.paths)),
 		authorizedSource: map[sourceAddrKey]struct{}{remoteKey: {}},
 	}
@@ -253,6 +255,7 @@ func (t *MultipathTransport) refreshPathAuthentication() error {
 	sessionID := auth.sessionID
 	key := auth.key
 	remote := auth.remote
+	clockOffset := auth.clockOffset
 	t.pathAuthMu.RUnlock()
 
 	type request struct {
@@ -261,7 +264,7 @@ func (t *MultipathTransport) refreshPathAuthentication() error {
 	}
 	requests := make([]request, 0, len(t.paths))
 	for index := range t.paths {
-		nonce, err := newPathRequestNonce(time.Now())
+		nonce, err := newPathRequestNonce(time.Now().Add(clockOffset))
 		if err != nil {
 			return err
 		}

@@ -86,13 +86,13 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 ```text
 Client                                      Server
   | ---- HELLO (session id, client key) ----> |
-  | <--- HELLO_ACK (same id, server key) ---- |
+  | < HELLO_ACK (id, server key, relay time)  |
   | ==== encrypted data packets ============> |
   | <==== encrypted relay packets =========== |
   | ---- CLOSE -----------------------------> |
 ```
 
-当前握手使用临时 X25519 密钥。双方基于 shared secret 和 SessionID 派生双向流量密钥。
+当前握手使用临时 X25519 密钥。双方基于 shared secret 和 SessionID 派生双向流量密钥。认证的 `TGH\x03` ACK 携带毫秒级 Relay 发送时间；客户端据此对齐 PathRequest 时间戳，并保守地把 ACK 下行时延计为过去偏差。10 秒 replay 时间窗和 1 秒未来容差均未扩大。
 
 ---
 
@@ -163,8 +163,8 @@ PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可
 1452；配合默认 1280 TUN MTU，审计后的最坏外层 IPv6/UDP 包为 1396 字节。最低可配置
 值是 1232，对应已知 1280 字节路径的外层 IPv6/UDP 预算。客户端配置必须满足
 `client.tun.mtu + 68 <= tgp.max_datagram_size`，发送超限返回明确协议错误，接收超限
-fail-closed 并增加 `OversizedDatagrams` 遥测。认证的 `TGH\x02` 握手把上限纳入认证
-字段，双方存储客户端与 Relay 的较小值；无法证明预算的 v1 peer 会被拒绝。
+fail-closed 并增加 `OversizedDatagrams` 遥测。认证的 `TGH\x03` 握手把上限纳入认证
+字段，双方存储客户端与 Relay 的较小值；无法证明完整当前字段的 v1/v2 peer 会被拒绝。
 
 TGP 当前不做协议分片或自动 PMTU 探测。运维方必须按已知路径配置较低预算和匹配
 的 TUN MTU。1280 字节外层路径无法在不做协议分片时承载最小 1280 字节内层 IPv6

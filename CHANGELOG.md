@@ -9,6 +9,10 @@ All notable changes to Tachyon Core will be documented in this file.
 ### Added
 
 ### Fixed
+- Linux IPv4/IPv6 and Windows IPv4 UDP process tracking now falls back to
+  wildcard socket bindings after checking exact local-address matches, so
+  process-based game profiles can identify games that bind `0.0.0.0` or `::`
+  before sending.
 
 ## [v0.1.0-alpha.14] - 2026-07-04
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -62,6 +63,14 @@ func findInodeInProcNet(path, localIP string, localPort uint16) (uint64, error) 
 		return 0, err
 	}
 	wantPort := uint32(localPort)
+	wildcardHex := ""
+	if strings.HasPrefix(filepath.Base(path), "udp") {
+		wildcardHex = "00000000"
+		if strings.HasSuffix(path, "6") {
+			wildcardHex = strings.Repeat("0", 32)
+		}
+	}
+	var wildcardInode uint64
 
 	scanner := bufio.NewScanner(f)
 	scanner.Scan()
@@ -74,9 +83,6 @@ func findInodeInProcNet(path, localIP string, localPort uint16) (uint64, error) 
 		if len(parts) != 2 {
 			continue
 		}
-		if !strings.EqualFold(parts[0], wantHex) {
-			continue
-		}
 		port, err := strconv.ParseUint(parts[1], 16, 16)
 		if err != nil || uint32(port) != wantPort {
 			continue
@@ -85,7 +91,15 @@ func findInodeInProcNet(path, localIP string, localPort uint16) (uint64, error) 
 		if err != nil {
 			continue
 		}
-		return inode, nil
+		if strings.EqualFold(parts[0], wantHex) {
+			return inode, nil
+		}
+		if wildcardInode == 0 && wildcardHex != "" && strings.EqualFold(parts[0], wildcardHex) {
+			wildcardInode = inode
+		}
+	}
+	if wildcardInode != 0 {
+		return wildcardInode, nil
 	}
 	return 0, fmt.Errorf("socket %s:%d not found in %s", localIP, localPort, path)
 }

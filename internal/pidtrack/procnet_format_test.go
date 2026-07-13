@@ -87,3 +87,72 @@ func TestFindInodeInProcNetIPv6Sample(t *testing.T) {
 		t.Fatalf("inode = %d, want 515151", inode)
 	}
 }
+
+func TestFindInodeInProcNetUDPWildcardFallback(t *testing.T) {
+	tests := []struct {
+		name      string
+		file      string
+		localIP   string
+		wildcard  string
+		exact     string
+		wantInode uint64
+	}{
+		{
+			name:      "ipv4 wildcard",
+			file:      "udp",
+			localIP:   "192.168.1.10",
+			wildcard:  "00000000",
+			wantInode: 616161,
+		},
+		{
+			name:      "ipv6 wildcard",
+			file:      "udp6",
+			localIP:   "2001:db8::10",
+			wildcard:  "00000000000000000000000000000000",
+			wantInode: 616161,
+		},
+		{
+			name:      "exact preferred over earlier wildcard",
+			file:      "udp",
+			localIP:   "192.168.1.10",
+			wildcard:  "00000000",
+			exact:     "0A01A8C0",
+			wantInode: 717171,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tt.file)
+			content := "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n" +
+				"   0: " + tt.wildcard + ":C001 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 616161\n"
+			if tt.exact != "" {
+				content += "   1: " + tt.exact + ":C001 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 717171\n"
+			}
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("write sample: %v", err)
+			}
+
+			inode, err := findInodeInProcNet(path, tt.localIP, 49153)
+			if err != nil {
+				t.Fatalf("findInodeInProcNet() error = %v", err)
+			}
+			if inode != tt.wantInode {
+				t.Fatalf("inode = %d, want %d", inode, tt.wantInode)
+			}
+		})
+	}
+}
+
+func TestFindInodeInProcNetTCPDoesNotUseWildcardFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tcp")
+	content := "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n" +
+		"   0: 00000000:C001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 818181\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
+
+	if _, err := findInodeInProcNet(path, "192.168.1.10", 49153); err == nil {
+		t.Fatal("TCP lookup must not assign a wildcard listener to an outbound flow")
+	}
+}

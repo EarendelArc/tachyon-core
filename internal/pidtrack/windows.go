@@ -141,14 +141,27 @@ func (p *windowsProvider) lookupUDP(flow FlowKey) (ProcessInfo, error) {
 		}
 		count := *(*uint32)(unsafe.Pointer(&buf[0]))
 		rows := (*[1 << 16]mibUDPRowOwnerPID)(unsafe.Pointer(&buf[4]))[:count]
-		for _, row := range rows {
-			rowPort := swapPort(row.LocalPort)
-			if row.LocalAddr == wantIP && rowPort == wantPort {
-				return p.pidToProcessInfo(int(row.OwningPID))
-			}
+		if pid, ok := findUDPOwnerPID(rows, wantIP, wantPort); ok {
+			return p.pidToProcessInfo(int(pid))
 		}
 		return ProcessInfo{}, fmt.Errorf("UDP socket %s:%d not found", flow.LocalIP, flow.LocalPort)
 	}
+}
+
+func findUDPOwnerPID(rows []mibUDPRowOwnerPID, wantIP, wantPort uint32) (uint32, bool) {
+	var wildcardPID uint32
+	for _, row := range rows {
+		if swapPort(row.LocalPort) != wantPort {
+			continue
+		}
+		if row.LocalAddr == wantIP {
+			return row.OwningPID, true
+		}
+		if row.LocalAddr == 0 && wildcardPID == 0 {
+			wildcardPID = row.OwningPID
+		}
+	}
+	return wildcardPID, wildcardPID != 0
 }
 
 func (p *windowsProvider) pidToProcessInfo(pid int) (ProcessInfo, error) {

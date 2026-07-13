@@ -153,17 +153,18 @@ PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可
 
 ## 6. 多路径
 
-接收路径已经基于认证后的 PacketNumber 去重。`MultipathTransport` 可以组合多个 `Transport` 实现：每次写入会尝试发送到所有路径，读取则合并任意路径先到达的数据包。每条本地路径都会完成上述来源认证，并周期刷新注册；NAT 映射变化后会保持 fail-closed，直到重新认证成功。
+接收路径已经基于认证后的 PacketNumber 去重。`MultipathTransport` 可以组合多个 `Transport` 实现：每次写入会尝试发送到所有路径，读取则合并任意路径先到达的数据包。每条本地路径都会完成上述来源认证，并周期刷新注册；NAT 映射变化后会保持 fail-closed，直到重新认证成功。客户端只接受当前握手所配置 Relay endpoint 发来的 `PathChallenge`；从未知来源转发的有效 challenge 不会授权来源，也不会消耗数据 anti-replay 状态。Relay 服务端地址迁移必须重新握手。
 
 剩余集成工作是系统网络接口发现和策略选择，例如在移动端选择 Wi-Fi + 蜂窝链路。当前 adapter 依靠 PacketNumber 去重；显式 `FlagMultipath` 标记仍预留给未来控制面集成。
 
 ### 6.1 数据报大小与 PMTU
 
-`tgp.max_datagram_size` 限制完整加密 TGP UDP payload。默认值和协议最大值是
-1452，因此外层 IPv6/UDP 包最多 1500 字节；最低可配置值是 1232，对应已知
-1280 字节路径的外层 IPv6/UDP 预算。客户端配置必须满足
-`client.tun.mtu + 68 <= tgp.max_datagram_size`，发送或接收超限会返回明确协议错误。
-客户端与 Relay 必须配置相同的较低值，因为当前 alpha 握手不会协商数据报预算。
+`tgp.max_datagram_size` 限制完整加密 TGP UDP payload。默认值为 1352，协议最大值为
+1452；配合默认 1280 TUN MTU，审计后的最坏外层 IPv6/UDP 包为 1396 字节。最低可配置
+值是 1232，对应已知 1280 字节路径的外层 IPv6/UDP 预算。客户端配置必须满足
+`client.tun.mtu + 68 <= tgp.max_datagram_size`，发送超限返回明确协议错误，接收超限
+fail-closed 并增加 `OversizedDatagrams` 遥测。认证的 `TGH\x02` 握手把上限纳入认证
+字段，双方存储客户端与 Relay 的较小值；无法证明预算的 v1 peer 会被拒绝。
 
 TGP 当前不做协议分片或自动 PMTU 探测。运维方必须按已知路径配置较低预算和匹配
 的 TUN MTU。1280 字节外层路径无法在不做协议分片时承载最小 1280 字节内层 IPv6

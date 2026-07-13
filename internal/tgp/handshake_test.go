@@ -3,10 +3,164 @@ package tgp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
 )
+
+func TestHandshakeNegotiatesMinimumAuthenticatedDatagramBudget(t *testing.T) {
+	tests := []struct {
+		name      string
+		clientMax int
+		serverMax int
+		effective int
+	}{
+		{name: "client lower", clientMax: MinTGPDatagramSize, serverMax: MaxTGPDatagramSize, effective: MinTGPDatagramSize},
+		{name: "server lower", clientMax: MaxTGPDatagramSize, serverMax: DefaultTGPDatagramSize, effective: DefaultTGPDatagramSize},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			serverTransport, err := ListenUDP("127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			authKey := []byte("authenticated-budget-test-key")
+			serverCh := make(chan *DatagramSession, 1)
+			errCh := make(chan error, 1)
+			go func() {
+				session, acceptErr := AcceptSessionWithOptions(ctx, serverTransport, SessionRuntimeOptions{
+					PacerPPS: 100000, MaxDatagramSize: tt.serverMax, AuthKey: authKey,
+				})
+				if acceptErr != nil {
+					errCh <- acceptErr
+					return
+				}
+				serverCh <- session
+			}()
+
+			client, err := DialSessionWithOptions(ctx, "127.0.0.1:0", serverTransport.LocalAddr(), SessionRuntimeOptions{
+				PacerPPS: 100000, MaxDatagramSize: tt.clientMax, AuthKey: authKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			var server *DatagramSession
+			select {
+			case server = <-serverCh:
+			case err := <-errCh:
+				t.Fatal(err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			defer server.Close()
+			for name, session := range map[string]*DatagramSession{"client": client, "server": server} {
+				if session.sendCodec.maxDatagramSize != tt.effective || session.recvCodec.maxDatagramSize != tt.effective {
+					t.Fatalf("%s effective datagram budget = send %d recv %d, want %d", name, session.sendCodec.maxDatagramSize, session.recvCodec.maxDatagramSize, tt.effective)
+				}
+			}
+		})
+	}
+}
+
+func TestHandshakeAuthenticatesDatagramBudget(t *testing.T) {
+	var sessionID SessionID
+	var publicKey PublicKey
+	authKey := []byte("authenticated-budget-test-key")
+	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, authKey, PublicKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint16(wire[outerHeaderSize+53:outerHeaderSize+55], uint16(MinTGPDatagramSize))
+	msg, err := parseHandshake(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyHandshakeAuth(msg, authKey, PublicKey{}); !errors.Is(err, ErrInvalidHandshake) {
+		t.Fatalf("tampered datagram budget auth error = %v, want %v", err, ErrInvalidHandshake)
+	}
+}
+
+func TestHandshakeRejectsVersionOnePeer(t *testing.T) {
+	const versionOneBodySize = 4 + 1 + 16 + publicKeySize
+	body := make([]byte, versionOneBodySize)
+	copy(body[:4], []byte{'T', 'G', 'H', 0x01})
+	body[4] = byte(handshakeHello)
+	outer, err := NewOuterHeader(handshakeSequence, len(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := append(marshalOuterHeader(outer), body...)
+	if _, err := parseHandshake(wire); !errors.Is(err, ErrInvalidHandshake) {
+		t.Fatalf("version-one handshake error = %v, want %v", err, ErrInvalidHandshake)
+	}
+}
+
+func TestHandshakeRejectsAuthenticatedAckForwardedFromUnknownSource(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	transport := newMigrationTestTransport()
+	expected := mustUDPAddr(t, "127.0.0.1:32300")
+	unknown := mustUDPAddr(t, "127.0.0.1:32301")
+	authKey := []byte("authenticated-ack-source-key")
+	type dialResult struct {
+		session *DatagramSession
+		err     error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		session, err := dialSessionWithTransport(ctx, transport, expected, SessionRuntimeOptions{
+			PacerPPS: 100000, AuthKey: authKey,
+		})
+		resultCh <- dialResult{session: session, err: err}
+	}()
+
+	helloWire := transport.nextWritePacket(ctx)
+	if got := transport.nextWriteAddr(ctx); !sameAddr(got, expected) {
+		t.Fatalf("hello destination = %v, want %v", got, expected)
+	}
+	hello := mustParseHandshake(t, helloWire)
+	serverKeys, err := NewKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := marshalHandshake(handshakeHelloAck, hello.sessionID, serverKeys.PublicKey(), hello.maxDatagramSize, authKey, hello.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.inject(ack, unknown)
+	select {
+	case result := <-resultCh:
+		if result.session != nil {
+			_ = result.session.Close()
+		}
+		t.Fatalf("forwarded ack completed handshake: %v", result.err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	transport.inject(ack, expected)
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		defer result.session.Close()
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func mustParseHandshake(t *testing.T, wire []byte) handshakeMessage {
+	t.Helper()
+	msg, err := parseHandshake(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
 
 func TestHandshakeEstablishesEncryptedSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

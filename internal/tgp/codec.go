@@ -12,13 +12,14 @@ import (
 )
 
 const (
-	outerHeaderSize       = 13
-	innerHeaderSize       = 43
-	MinTGPDatagramSize    = 1232
-	MaxTGPDatagramSize    = 1452
-	WorstCaseTUNOverhead  = 68
-	maxTGPDataPayloadSize = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - chacha20poly1305.Overhead
-	maxDTLSSequence       = 1<<48 - 1
+	outerHeaderSize        = 13
+	innerHeaderSize        = 43
+	MinTGPDatagramSize     = 1232
+	DefaultTGPDatagramSize = 1352
+	MaxTGPDatagramSize     = 1452
+	WorstCaseTUNOverhead   = 68
+	maxTGPDataPayloadSize  = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - chacha20poly1305.Overhead
+	maxDTLSSequence        = 1<<48 - 1
 )
 
 var (
@@ -53,7 +54,7 @@ func NewCodecWithMaxDatagramSize(key [trafficKeySize]byte, maxDatagramSize int) 
 
 func normalizeMaxDatagramSize(maxDatagramSize int) (int, error) {
 	if maxDatagramSize == 0 {
-		maxDatagramSize = MaxTGPDatagramSize
+		maxDatagramSize = DefaultTGPDatagramSize
 	}
 	if maxDatagramSize < MinTGPDatagramSize || maxDatagramSize > MaxTGPDatagramSize {
 		return 0, fmt.Errorf("tgp max datagram size %d must be between %d and %d", maxDatagramSize, MinTGPDatagramSize, MaxTGPDatagramSize)

@@ -81,7 +81,7 @@ func TestGenerateConfigUnknownMode(t *testing.T) {
 func TestValidateConfigValidClient(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "client.json")
-	writeFile(t, path, `{"mode":"client","client":{"tun":{"name":"","address":"198.18.0.1/16","mtu":1380,"auto_route":false,"dns_hijack":false,"tgp_only":true},"routing":{"default_action":"direct","game_profiles":[],"rules":[]},"proxy":{"server_addr":"example.com:443","tgp_server_addr":"example.com:443"}},"tgp":{"fec":{"data_shards":4,"parity_shards":2},"connection_migration":true},"ipc":{"websocket_addr":"127.0.0.1:55123"},"observability":{"log_level":"info"}}`)
+	writeFile(t, path, `{"mode":"client","client":{"tun":{"name":"","address":"198.18.0.1/16","mtu":1280,"auto_route":false,"dns_hijack":false,"tgp_only":true},"routing":{"default_action":"direct","game_profiles":[],"rules":[]},"proxy":{"server_addr":"example.com:443","tgp_server_addr":"example.com:443"}},"tgp":{"fec":{"data_shards":4,"parity_shards":2},"connection_migration":true},"ipc":{"websocket_addr":"127.0.0.1:55123"},"observability":{"log_level":"info"}}`)
 
 	mode, err := ValidateConfig(path)
 	if err != nil {
@@ -237,15 +237,15 @@ func TestClientConfigTemplateContainsRequiredFields(t *testing.T) {
 	if !ok {
 		t.Fatal("client template client.tun section is not an object")
 	}
-	if tunSection["mtu"] != float64(1380) {
-		t.Fatalf("client template MTU = %v, want public-path-safe default 1380", tunSection["mtu"])
+	if tunSection["mtu"] != float64(1280) {
+		t.Fatalf("client template MTU = %v, want conservative default 1280", tunSection["mtu"])
 	}
 	tgpSection, ok := parsed["tgp"].(map[string]any)
 	if !ok {
 		t.Fatal("client template tgp section is not an object")
 	}
-	if tgpSection["max_datagram_size"] != float64(1452) {
-		t.Fatalf("client template max datagram size = %v, want 1452", tgpSection["max_datagram_size"])
+	if tgpSection["max_datagram_size"] != float64(1352) {
+		t.Fatalf("client template max datagram size = %v, want 1352", tgpSection["max_datagram_size"])
 	}
 }
 

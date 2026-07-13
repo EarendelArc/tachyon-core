@@ -259,6 +259,11 @@ the per-session key. Requests allocate no global pending state. Replayed
 responses fail the bounded per-session consumed-cookie check. Unknown
 non-control data remains fail-closed and is not broadcast for trial decryption.
 
+On the client, a `PathChallenge` is accepted only from the configured relay
+endpoint established by the current handshake. A valid challenge forwarded
+from any other source is discarded without authorizing that source or consuming
+data anti-replay state. Relay endpoint migration requires a new handshake.
+
 Packet numbers use a bounded sliding anti-replay window. Duplicates and packets
 older than the window are rejected before delivery. Authorized data from any
 path can be delivered, but it never changes the active return path; only a fresh
@@ -282,13 +287,16 @@ reserved for a future control-plane integration.
 ### 6.1 Datagram Size and PMTU
 
 `tgp.max_datagram_size` caps the complete encrypted TGP UDP payload. The
-default and protocol maximum is 1452 bytes, so an outer IPv6/UDP packet is at
-most 1500 bytes. The minimum configurable value is 1232, matching an outer
-IPv6/UDP budget on a known 1280-byte path. Client validation requires
+default is 1352 bytes and the protocol maximum is 1452. With the default 1280
+TUN MTU, the audited worst-case outer IPv6/UDP packet is 1396 bytes. The
+minimum configurable value is 1232, matching an outer IPv6/UDP budget on a
+known 1280-byte path. Client validation requires
 `client.tun.mtu + 68 <= tgp.max_datagram_size`; oversized sends and receives
-fail with an explicit protocol error.
-Client and relay must use the same lower value because this alpha protocol does
-not negotiate the datagram budget during the handshake.
+fail closed. Sends return an explicit protocol error and receive drops increment
+`OversizedDatagrams` telemetry. The authenticated `TGH\x02` handshake carries
+the offered limit in its authenticated fields, and both peers store the lower
+client/relay value. Version 1 peers are rejected because they cannot prove a
+datagram budget.
 
 TGP does not currently fragment protocol datagrams or discover PMTU. Operators
 must configure a known lower budget and matching TUN MTU. A 1280-byte outer

@@ -168,13 +168,14 @@ type Session interface {
 
 // SessionStats is a point-in-time snapshot of session telemetry.
 type SessionStats struct {
-	RTT           time.Duration
-	Jitter        time.Duration
-	PacketLoss    float64 // 0.0 – 1.0
-	BytesSent     uint64
-	BytesReceived uint64
-	FECRecovered  uint64 // packets recovered via Reed-Solomon
-	Migrations    uint32 // number of successful connection migrations
+	RTT                time.Duration
+	Jitter             time.Duration
+	PacketLoss         float64 // 0.0 – 1.0
+	BytesSent          uint64
+	BytesReceived      uint64
+	FECRecovered       uint64 // packets recovered via Reed-Solomon
+	OversizedDatagrams uint64 // received datagrams rejected by the negotiated budget
+	Migrations         uint32 // number of successful connection migrations
 }
 
 // Pacer defines the token-bucket interface used to control packet send rate.

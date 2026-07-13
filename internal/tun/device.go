@@ -53,7 +53,7 @@ type Options struct {
 	// Addresses is the list of IPv4/IPv6 CIDRs to assign to the interface.
 	Addresses []netip.Prefix
 
-	// MTU defaults to 1380 if zero.
+	// MTU defaults to 1280 if zero.
 	MTU int
 
 	// AutoRoute installs a default route (0.0.0.0/0) pointing at this interface.
@@ -63,9 +63,9 @@ type Options struct {
 	DNSHijack bool
 }
 
-// DefaultMTU keeps a worst-case IPv6 TGP datagram, including FEC and outer
-// IPv6/UDP headers, below the common 1500-byte public path MTU.
-const DefaultMTU = 1380
+// DefaultMTU is the IPv6 minimum link MTU. With the default TGP datagram
+// budget, its worst-case encapsulated outer IPv6 packet is 1396 bytes.
+const DefaultMTU = 1280
 
 func (o *Options) mtu() int {
 	if o.MTU == 0 {

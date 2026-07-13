@@ -7,7 +7,7 @@ const ClientConfigTemplate = `{
     "tun": {
       "name": "",
       "address": "198.18.0.1/16",
-      "mtu": 1380,
+      "mtu": 1280,
       "auto_route": false,
       "dns_hijack": false,
       "tgp_only": true
@@ -71,7 +71,7 @@ const ClientConfigTemplate = `{
     },
     "connection_migration": true,
     "multipath": false,
-    "max_datagram_size": 1452,
+    "max_datagram_size": 1352,
     "handshake_timeout": "5s",
     "session_idle_timeout": "60s"
   },
@@ -131,7 +131,7 @@ const ServerConfigTemplate = `{
     },
     "connection_migration": true,
     "multipath": false,
-    "max_datagram_size": 1452,
+    "max_datagram_size": 1352,
     "handshake_timeout": "5s",
     "session_idle_timeout": "300s"
   },

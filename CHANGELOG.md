@@ -5,17 +5,18 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
-- TGP now enforces a configurable 1232-1452 byte encrypted datagram budget and
-  validates the client TUN MTU against worst-case encapsulation overhead.
+- TGP v2 authenticates and negotiates the 1232-1452 byte encrypted datagram
+  budget, stores the lower peer value, rejects v1 peers, and records oversized
+  receive drops.
 - Relay return-path selection is now controlled only by fresh path challenge
   completion; authorized business data from old paths cannot switch it.
 - Relay paths now expire and safely replace the least-recently-used inactive
   entry instead of permanently exhausting the eight-path session bound.
 - Codec and FEC processing now enforce protocol limits for datagram size,
   shard counts and size, active/completed groups, and total buffered bytes.
-- The default client TUN MTU is now 1380 instead of 9000. This keeps the
-  worst-case IPv6 TGP packet with FEC and outer IPv6/UDP headers within a
-  common 1500-byte public path MTU while preserving explicit MTU overrides.
+- The default client TUN MTU is now 1280 with a 1352-byte TGP budget. The
+  audited worst-case packet with FEC and outer IPv6/UDP headers is 1396 bytes,
+  while explicit protocol limits and the 1232-byte low-PMTU preset remain.
 - TGP packet-number deduplication is now a sliding anti-replay window: packets
   older than the retained window remain rejected instead of becoming eligible
   again after insertion-order eviction.
@@ -23,8 +24,9 @@ All notable changes to Tachyon Core will be documented in this file.
 ### Added
 - Added stateless source-bound path cookies with a bounded per-session response
   replay set, eliminating PathRequest-controlled global pending state.
-- Added client multipath source authorization for configured and
-  challenge-authenticated server addresses.
+- Added client multipath source authorization for configured relay endpoints.
+  A forwarded valid challenge cannot bootstrap an unknown server address;
+  server endpoint migration requires a new handshake.
 - Added per-session path request/challenge/response authentication for relay
   migration and multipath sources. Additional UDP sources are registered only
   after proving possession of an ECDH-derived path key from the requesting

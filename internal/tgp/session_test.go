@@ -390,6 +390,66 @@ func TestDatagramSessionRejectsValidCiphertextFromUnknownMultipathSource(t *test
 	}
 }
 
+func TestDatagramSessionReportsOversizedReceiveWithoutConsumingReplay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	transport := newMigrationTestTransport()
+	remote := mustUDPAddr(t, "127.0.0.1:32200")
+	var sessionID SessionID
+	copy(sessionID[:], []byte("oversize-session"))
+	var recvKey [trafficKeySize]byte
+	recvKey[0] = 41
+	session, err := NewDatagramSession(SessionOptions{
+		ID: sessionID, Transport: transport, RemoteAddr: remote,
+		RecvKey: recvKey, Pacer: NewTokenBucketPacer(100000), MaxDatagramSize: MinTGPDatagramSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	largeCodec, err := NewCodecWithMaxDatagramSize(recvKey, MaxTGPDatagramSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const packetNumber = 77
+	oversizedPayload := make([]byte, MinTGPDatagramSize-outerHeaderSize-innerHeaderSize-16+1)
+	header, err := NewDataHeader(sessionID, 15, packetNumber, len(oversizedPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversizedWire, err := largeCodec.Seal(packetNumber, header, oversizedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.inject(oversizedWire, remote)
+
+	acceptedPayload := []byte("same packet number remains fresh")
+	header, err = NewDataHeader(sessionID, 15, packetNumber, len(acceptedPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallCodec, err := NewCodecWithMaxDatagramSize(recvKey, MinTGPDatagramSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedWire, err := smallCodec.Seal(packetNumber, header, acceptedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.inject(acceptedWire, remote)
+	got, err := session.RecvPacket(ctx, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, acceptedPayload) {
+		t.Fatalf("accepted payload = %q, want %q", got, acceptedPayload)
+	}
+	if stats := session.Stats(); stats.OversizedDatagrams != 1 {
+		t.Fatalf("oversized datagram telemetry = %d, want 1", stats.OversizedDatagrams)
+	}
+}
+
 func TestPacketDedupWindowRejectsReplayAfterEviction(t *testing.T) {
 	window := newPacketDedupWindow(4)
 	for packetNumber := uint64(10); packetNumber <= 14; packetNumber++ {

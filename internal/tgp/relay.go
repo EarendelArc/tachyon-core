@@ -84,7 +84,8 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 	if err := validateFECOptions(opts.FEC); err != nil {
 		return nil, err
 	}
-	if _, err := normalizeMaxDatagramSize(opts.MaxDatagramSize); err != nil {
+	maxDatagramSize, err := normalizeMaxDatagramSize(opts.MaxDatagramSize)
+	if err != nil {
 		return nil, err
 	}
 	handler := opts.Handler
@@ -111,7 +112,7 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 		listenAddr:         opts.ListenAddr,
 		pacerPPS:           opts.PacerPPS,
 		fec:                opts.FEC,
-		maxDatagramSize:    opts.MaxDatagramSize,
+		maxDatagramSize:    maxDatagramSize,
 		disableMigration:   opts.DisableMigration,
 		authKey:            append([]byte(nil), opts.AuthKey...),
 		sessionIdleTimeout: opts.SessionIdleTimeout,
@@ -174,6 +175,10 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 		if err := verifyHandshakeAuth(msg, r.authKey, PublicKey{}); err != nil {
 			continue
 		}
+		if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > MaxTGPDatagramSize {
+			continue
+		}
+		effectiveMaxDatagramSize := min(r.maxDatagramSize, msg.maxDatagramSize)
 		if r.hasSession(msg.sessionID) {
 			continue
 		}
@@ -189,7 +194,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 		if err != nil {
 			return nil, err
 		}
-		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), r.authKey, msg.publicKey)
+		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, r.authKey, msg.publicKey)
 		if err != nil {
 			_ = sessionTransport.Close()
 			return nil, err
@@ -206,7 +211,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			RecvKey:          keys.RecvKey,
 			Pacer:            NewTokenBucketPacer(r.pacerPPS),
 			FEC:              r.fec,
-			MaxDatagramSize:  r.maxDatagramSize,
+			MaxDatagramSize:  effectiveMaxDatagramSize,
 			DisableMigration: r.disableMigration,
 		})
 	}

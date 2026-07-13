@@ -110,11 +110,12 @@ type fecRepairShard struct {
 }
 
 type sessionCounters struct {
-	bytesSent     atomic.Uint64
-	bytesReceived atomic.Uint64
-	fecRecovered  atomic.Uint64
-	packetLossPPM atomic.Uint64
-	migrations    atomic.Uint32
+	bytesSent          atomic.Uint64
+	bytesReceived      atomic.Uint64
+	fecRecovered       atomic.Uint64
+	oversizedDatagrams atomic.Uint64
+	packetLossPPM      atomic.Uint64
+	migrations         atomic.Uint32
 }
 
 func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
@@ -455,11 +456,12 @@ func (s *DatagramSession) Close() error {
 
 func (s *DatagramSession) Stats() SessionStats {
 	return SessionStats{
-		PacketLoss:    float64(s.stats.packetLossPPM.Load()) / 1_000_000,
-		BytesSent:     s.stats.bytesSent.Load(),
-		BytesReceived: s.stats.bytesReceived.Load(),
-		FECRecovered:  s.stats.fecRecovered.Load(),
-		Migrations:    s.stats.migrations.Load(),
+		PacketLoss:         float64(s.stats.packetLossPPM.Load()) / 1_000_000,
+		BytesSent:          s.stats.bytesSent.Load(),
+		BytesReceived:      s.stats.bytesReceived.Load(),
+		FECRecovered:       s.stats.fecRecovered.Load(),
+		OversizedDatagrams: s.stats.oversizedDatagrams.Load(),
+		Migrations:         s.stats.migrations.Load(),
 	}
 }
 
@@ -472,6 +474,9 @@ func (s *DatagramSession) readLoop(queueSize int) {
 		}
 		packet, err := s.recvCodec.Open(wire)
 		if err != nil {
+			if errors.Is(err, ErrDatagramTooLarge) {
+				s.stats.oversizedDatagrams.Add(1)
+			}
 			continue
 		}
 		if packet.Inner.SessionID != s.id {

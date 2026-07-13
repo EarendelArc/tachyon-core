@@ -171,11 +171,14 @@ register a path. Challenges use stateless source-bound cookies, and only a
 fresh completed challenge changes the active relay return path; business data
 from an older authorized path cannot switch it.
 
-The generated client uses `client.tun.mtu=1380` and
-`tgp.max_datagram_size=1452`, bounding an outer IPv6/UDP packet to 1500 bytes.
+The generated client uses `client.tun.mtu=1280` and
+`tgp.max_datagram_size=1352`, bounding its worst-case outer IPv6/UDP packet to
+1396 bytes. The authenticated TGP v2 handshake negotiates the lower client and
+relay budget, and version 1 peers are rejected instead of guessing a limit.
 Known lower-PMTU paths can reduce the datagram limit to 1232 with a matching
-TUN MTU. Core rejects inconsistent budgets and oversized protocol datagrams;
-TGP does not yet provide fragmentation or automatic PMTU discovery.
+TUN MTU. Core rejects inconsistent budgets, reports oversized receive drops,
+and returns explicit errors for oversized sends. TGP does not yet provide
+fragmentation or automatic PMTU discovery.
 
 After deployment, collect read-only diagnostics with:
 

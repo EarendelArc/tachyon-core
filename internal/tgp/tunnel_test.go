@@ -56,7 +56,7 @@ func TestTunnelDatagramRoundTripIPv6(t *testing.T) {
 
 func TestDefaultTUNMTUFitsWorstCaseTGPDatagramInPublicPathMTU(t *testing.T) {
 	const (
-		publicPathMTU = 1500
+		publicPathMTU = 1400
 		ipv6Header    = 40
 		udpHeader     = 8
 	)
@@ -93,8 +93,8 @@ func TestDefaultTUNMTUFitsWorstCaseTGPDatagramInPublicPathMTU(t *testing.T) {
 	if outerPacketSize > publicPathMTU {
 		t.Fatalf("worst-case outer packet = %d bytes, exceeds public path MTU %d", outerPacketSize, publicPathMTU)
 	}
-	if outerPacketSize != 1496 {
-		t.Fatalf("worst-case outer packet = %d bytes, want audited size 1496", outerPacketSize)
+	if outerPacketSize != 1396 {
+		t.Fatalf("worst-case outer packet = %d bytes, want audited size 1396", outerPacketSize)
 	}
 }
 

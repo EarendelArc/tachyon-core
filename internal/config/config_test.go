@@ -73,8 +73,11 @@ func TestLoadJSONConfig(t *testing.T) {
 	if !cfg.Client.TUN.TGPOnly {
 		t.Fatal("client.tun.tgp_only should default to true")
 	}
-	if cfg.Client.TUN.MTU != 1380 {
-		t.Fatalf("client.tun.mtu = %d, want public-path-safe default 1380", cfg.Client.TUN.MTU)
+	if cfg.Client.TUN.MTU != 1280 {
+		t.Fatalf("client.tun.mtu = %d, want conservative default 1280", cfg.Client.TUN.MTU)
+	}
+	if cfg.TGP.MaxDatagramSize != tgp.DefaultTGPDatagramSize {
+		t.Fatalf("tgp.max_datagram_size = %d, want %d", cfg.TGP.MaxDatagramSize, tgp.DefaultTGPDatagramSize)
 	}
 }
 
@@ -689,10 +692,10 @@ func TestValidateClientDataPathAcceptsSupportedIPv4AndIPv6CIDRs(t *testing.T) {
 
 func TestValidateClientDatagramBudgetFailsClosed(t *testing.T) {
 	cfg := validClientDataPathConfig()
-	cfg.Client.TUN.MTU = 1380
+	cfg.Client.TUN.MTU = 1280
 	cfg.TGP.MaxDatagramSize = tgp.MinTGPDatagramSize
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "client.tun.mtu 1380 requires tgp.max_datagram_size") {
+	if err == nil || !strings.Contains(err.Error(), "client.tun.mtu 1280 requires tgp.max_datagram_size") {
 		t.Fatalf("datagram budget error = %v", err)
 	}
 

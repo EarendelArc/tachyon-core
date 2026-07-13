@@ -88,8 +88,8 @@ type TUNConfig struct {
 	// Address is the IPv4 CIDR assigned to the TUN interface, e.g. "198.18.0.1/16".
 	Address string `yaml:"address" json:"address"`
 
-	// MTU defaults to 1380 so encapsulated TGP traffic fits a common 1500-byte
-	// public path without outer IP fragmentation.
+	// MTU defaults to the IPv6 minimum of 1280. The matching default TGP budget
+	// leaves headroom below a 1400-byte outer path.
 	MTU int `yaml:"mtu" json:"mtu"`
 
 	// AutoRoute would add a default route pointing at the TUN interface. It must
@@ -370,7 +370,7 @@ func defaults() *Config {
 		Client: ClientConfig{
 			TUN: TUNConfig{
 				Address:   "198.18.0.1/16",
-				MTU:       1380,
+				MTU:       tun.DefaultMTU,
 				AutoRoute: false,
 				DNSHijack: false,
 				TGPOnly:   true,
@@ -405,7 +405,7 @@ func defaults() *Config {
 			},
 			ConnectionMigration: true,
 			Multipath:           false,
-			MaxDatagramSize:     tgp.MaxTGPDatagramSize,
+			MaxDatagramSize:     tgp.DefaultTGPDatagramSize,
 			HandshakeTimeout:    5 * time.Second,
 			SessionIdleTimeout:  60 * time.Second,
 		},
@@ -429,7 +429,7 @@ func (c *Config) Validate() error {
 	}
 	maxDatagramSize := c.TGP.MaxDatagramSize
 	if maxDatagramSize == 0 {
-		maxDatagramSize = tgp.MaxTGPDatagramSize
+		maxDatagramSize = tgp.DefaultTGPDatagramSize
 	}
 	if maxDatagramSize < tgp.MinTGPDatagramSize || maxDatagramSize > tgp.MaxTGPDatagramSize {
 		return fmt.Errorf("tgp.max_datagram_size %d must be between %d and %d", maxDatagramSize, tgp.MinTGPDatagramSize, tgp.MaxTGPDatagramSize)

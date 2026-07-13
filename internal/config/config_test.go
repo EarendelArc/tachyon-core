@@ -72,6 +72,9 @@ func TestLoadJSONConfig(t *testing.T) {
 	if !cfg.Client.TUN.TGPOnly {
 		t.Fatal("client.tun.tgp_only should default to true")
 	}
+	if cfg.Client.TUN.MTU != 1380 {
+		t.Fatalf("client.tun.mtu = %d, want public-path-safe default 1380", cfg.Client.TUN.MTU)
+	}
 }
 
 func TestLoadJSONRejectsYAML(t *testing.T) {

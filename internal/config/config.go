@@ -86,8 +86,8 @@ type TUNConfig struct {
 	// Address is the IPv4 CIDR assigned to the TUN interface, e.g. "198.18.0.1/16".
 	Address string `yaml:"address" json:"address"`
 
-	// MTU. Defaults to 9000 (jumbo frame) for performance; reduce to 1500 if
-	// the network path does not support jumbo frames.
+	// MTU defaults to 1380 so encapsulated TGP traffic fits a common 1500-byte
+	// public path without outer IP fragmentation.
 	MTU int `yaml:"mtu" json:"mtu"`
 
 	// AutoRoute would add a default route pointing at the TUN interface. It must
@@ -365,7 +365,7 @@ func defaults() *Config {
 		Client: ClientConfig{
 			TUN: TUNConfig{
 				Address:   "198.18.0.1/16",
-				MTU:       9000,
+				MTU:       1380,
 				AutoRoute: false,
 				DNSHijack: false,
 				TGPOnly:   true,

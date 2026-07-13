@@ -7,7 +7,7 @@ const ClientConfigTemplate = `{
     "tun": {
       "name": "",
       "address": "198.18.0.1/16",
-      "mtu": 9000,
+      "mtu": 1380,
       "auto_route": false,
       "dns_hijack": false,
       "tgp_only": true

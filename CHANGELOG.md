@@ -5,6 +5,9 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- The default client TUN MTU is now 1380 instead of 9000. This keeps the
+  worst-case IPv6 TGP packet with FEC and outer IPv6/UDP headers within a
+  common 1500-byte public path MTU while preserving explicit MTU overrides.
 - TGP packet-number deduplication is now a sliding anti-replay window: packets
   older than the retained window remain rejected instead of becoming eligible
   again after insertion-order eviction.

@@ -229,6 +229,17 @@ func TestClientConfigTemplateContainsRequiredFields(t *testing.T) {
 			t.Errorf("client template missing required key: %s", key)
 		}
 	}
+	clientSection, ok := parsed["client"].(map[string]any)
+	if !ok {
+		t.Fatal("client template client section is not an object")
+	}
+	tunSection, ok := clientSection["tun"].(map[string]any)
+	if !ok {
+		t.Fatal("client template client.tun section is not an object")
+	}
+	if tunSection["mtu"] != float64(1380) {
+		t.Fatalf("client template MTU = %v, want public-path-safe default 1380", tunSection["mtu"])
+	}
 }
 
 func TestServerConfigTemplateContainsRequiredFields(t *testing.T) {

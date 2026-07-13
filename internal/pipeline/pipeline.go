@@ -96,7 +96,7 @@ func New(opts Options) *Pipeline {
 func (p *Pipeline) Run(ctx context.Context) error {
 	buf := make([]byte, p.device.MTU())
 	if len(buf) == 0 {
-		buf = make([]byte, 9000)
+		buf = make([]byte, tun.DefaultMTU)
 	}
 
 	for {

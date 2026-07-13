@@ -53,7 +53,7 @@ type Options struct {
 	// Addresses is the list of IPv4/IPv6 CIDRs to assign to the interface.
 	Addresses []netip.Prefix
 
-	// MTU defaults to 9000 if zero.
+	// MTU defaults to 1380 if zero.
 	MTU int
 
 	// AutoRoute installs a default route (0.0.0.0/0) pointing at this interface.
@@ -63,8 +63,9 @@ type Options struct {
 	DNSHijack bool
 }
 
-// DefaultMTU is used when Options.MTU is zero.
-const DefaultMTU = 9000
+// DefaultMTU keeps a worst-case IPv6 TGP datagram, including FEC and outer
+// IPv6/UDP headers, below the common 1500-byte public path MTU.
+const DefaultMTU = 1380
 
 func (o *Options) mtu() int {
 	if o.MTU == 0 {

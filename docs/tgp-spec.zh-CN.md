@@ -126,6 +126,14 @@ Core 根据接收侧 FEC 恢复比例调整 parity。当前实现把该估计保
 | 3% 到 10% | 2/4 |
 | >10% | 4/4，无 ARQ 的最大保护 |
 
+### 4.4 协议资源上限
+
+接收端会在 Reed-Solomon 分配或保存 payload 前拒绝超限输入。TGP 最多允许
+32 个 data shard、16 个 parity shard、48 个总 shard、64 个活跃接收 group、
+4096 条紧凑的已完成 group 墓碑，以及每会话 4 MiB 的 shard payload 缓冲。
+单 shard 不得超过 TGP 数据报 payload 预算。group 完成后立即释放 shard 内存；
+未完成 group 和完成墓碑均在 30 秒后过期。
+
 ---
 
 ## 5. 连接迁移
@@ -135,11 +143,11 @@ Relay 首先把 session 绑定到完成认证握手的 UDP 来源地址。新增
 1. 客户端从每条路径发送带 `SessionID`、`ClientNonce` 和认证标签的 `PathRequest`。
 2. Relay 使用该 session 的 client-to-server 流量密钥派生路径密钥，验证请求后向观测到的 UDP 来源发送新的 `ServerNonce`。
 3. 客户端验证 challenge，并从收到 challenge 的同一本地 transport 返回同时覆盖两个 nonce 的 `PathResponse`。
-4. Relay 只在 challenge 仍待处理且未过期时登记该来源；challenge 只能消费一次，已有来源映射不能被其他 session 抢占，每个 session 的来源数量有上限。
+4. Relay 校验 `ServerNonce` 中无状态、绑定来源地址的 cookie；已消费 cookie 进入短时、每会话有界 replay set，已有来源映射不能被其他 session 抢占。
 
-仅重放 `PathRequest` 只能让攻击来源收到无法回答的 challenge；重复响应没有待处理 challenge，会被拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
+仅重放 `PathRequest` 只能让攻击来源收到无法回答的 challenge，并且不会分配全局 pending 状态；重复响应会被已消费 cookie 检查拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
 
-PacketNumber 使用有界滑动 anti-replay 窗口。重复包和早于窗口的历史包会在更新迁移状态前被拒绝，因此旧的合法密文不能改变 Relay 回程路径。
+PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可以交付，但业务数据永远不能改变 active 回程路径；只有完成新鲜 challenge 才能切换。非 active 路径 45 秒后老化，达到 8 条上限时安全替换最久未使用的非 active 条目。
 
 ---
 
@@ -148,6 +156,19 @@ PacketNumber 使用有界滑动 anti-replay 窗口。重复包和早于窗口的
 接收路径已经基于认证后的 PacketNumber 去重。`MultipathTransport` 可以组合多个 `Transport` 实现：每次写入会尝试发送到所有路径，读取则合并任意路径先到达的数据包。每条本地路径都会完成上述来源认证，并周期刷新注册；NAT 映射变化后会保持 fail-closed，直到重新认证成功。
 
 剩余集成工作是系统网络接口发现和策略选择，例如在移动端选择 Wi-Fi + 蜂窝链路。当前 adapter 依靠 PacketNumber 去重；显式 `FlagMultipath` 标记仍预留给未来控制面集成。
+
+### 6.1 数据报大小与 PMTU
+
+`tgp.max_datagram_size` 限制完整加密 TGP UDP payload。默认值和协议最大值是
+1452，因此外层 IPv6/UDP 包最多 1500 字节；最低可配置值是 1232，对应已知
+1280 字节路径的外层 IPv6/UDP 预算。客户端配置必须满足
+`client.tun.mtu + 68 <= tgp.max_datagram_size`，发送或接收超限会返回明确协议错误。
+客户端与 Relay 必须配置相同的较低值，因为当前 alpha 握手不会协商数据报预算。
+
+TGP 当前不做协议分片或自动 PMTU 探测。运维方必须按已知路径配置较低预算和匹配
+的 TUN MTU。1280 字节外层路径无法在不做协议分片时承载最小 1280 字节内层 IPv6
+包，因此该组合仍不支持并保持 fail-closed；1232 设置只适用于内层 MTU 也能安全
+降低的受控场景，例如仅 IPv4 的路径。
 
 ---
 
@@ -168,4 +189,5 @@ PacketNumber 使用有界滑动 anti-replay 窗口。重复包和早于窗口的
 - Relay 路径迁移/重绑定在观测来源完成 authenticated rebind 交换前保持 fail-closed。
 - 多路径接口发现和策略选择尚未接入；底层 transport adapter 与接收侧去重已实现。
 - `FlagMultipath` 仍是预留标记；当前 fan-out 不会重写已加密内层头来设置它。
+- 尚无协议分片或自动 PMTU 探测；配置的数据报与 TUN 上限必须匹配真实路径。
 - TGP 设计上不实现 ARQ 重传，依靠 pacing 和 FEC 避免引入物理 RTT 延迟。

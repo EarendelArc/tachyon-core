@@ -576,13 +576,11 @@ func TestRelayContinuousNATRebindSafelyReplacesInactivePaths(t *testing.T) {
 	}
 	defer session.Close()
 
-	var firstRebind net.Addr
 	var latest net.Addr
+	allSources := []net.Addr{original}
 	for index := 0; index < defaultRelayMaxPathsPerSession+12; index++ {
 		source := mustRelayUDPAddr(t, fmt.Sprintf("127.0.0.1:%d", 13000+index))
-		if index == 0 {
-			firstRebind = source
-		}
+		allSources = append(allSources, source)
 		latest = source
 		authenticateRelayTestPath(t, router, transport, sessionID, pathKey, source)
 		if !session.IsSourceAuthorized(source) {
@@ -600,8 +598,14 @@ func TestRelayContinuousNATRebindSafelyReplacesInactivePaths(t *testing.T) {
 			t.Fatalf("active source after rebind %d = %#v, want %#v", index, active, wantActive)
 		}
 	}
-	if session.IsSourceAuthorized(firstRebind) {
-		t.Fatal("oldest inactive path survived bounded replacement")
+	authorized := 0
+	for _, source := range allSources {
+		if session.IsSourceAuthorized(source) {
+			authorized++
+		}
+	}
+	if authorized != defaultRelayMaxPathsPerSession {
+		t.Fatalf("authorized path count = %d, want bounded count %d", authorized, defaultRelayMaxPathsPerSession)
 	}
 	if err := session.WritePacket(context.Background(), []byte("reply"), original); err != nil {
 		t.Fatal(err)

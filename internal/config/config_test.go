@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/routing"
+	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
 
 func TestLoadJSONConfig(t *testing.T) {
@@ -683,6 +684,26 @@ func TestValidateClientDataPathAcceptsSupportedIPv4AndIPv6CIDRs(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected supported dual-stack rules to validate: %v", err)
+	}
+}
+
+func TestValidateClientDatagramBudgetFailsClosed(t *testing.T) {
+	cfg := validClientDataPathConfig()
+	cfg.Client.TUN.MTU = 1380
+	cfg.TGP.MaxDatagramSize = tgp.MinTGPDatagramSize
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "client.tun.mtu 1380 requires tgp.max_datagram_size") {
+		t.Fatalf("datagram budget error = %v", err)
+	}
+
+	cfg.Client.TUN.MTU = tgp.MinTGPDatagramSize - tgp.WorstCaseTUNOverhead
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("low-PMTU-safe configuration was rejected: %v", err)
+	}
+
+	cfg.TGP.MaxDatagramSize = tgp.MinTGPDatagramSize - 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "tgp.max_datagram_size") {
+		t.Fatalf("unsupported datagram limit error = %v", err)
 	}
 }
 

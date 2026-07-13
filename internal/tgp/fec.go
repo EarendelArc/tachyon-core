@@ -128,8 +128,16 @@ func validateFECOptions(options FECOptions) error {
 	if options.DataShards == 0 && options.ParityShards == 0 {
 		return nil
 	}
-	if err := validateFECParams(options.DataShards, options.ParityShards); err != nil {
-		return err
+	if options.DataShards < 1 || options.DataShards > MaxFECDataShards {
+		return fmt.Errorf("%w: data shards %d must be between 1 and %d", ErrInvalidFECParams, options.DataShards, MaxFECDataShards)
+	}
+	if options.ParityShards < 0 || options.ParityShards > MaxFECParityShards {
+		return fmt.Errorf("%w: parity shards %d must be between 0 and %d", ErrInvalidFECParams, options.ParityShards, MaxFECParityShards)
+	}
+	if options.ParityShards > 0 {
+		if err := validateFECParams(options.DataShards, options.ParityShards); err != nil {
+			return err
+		}
 	}
 	if options.MaxReceiveGroups < 0 || options.MaxReceiveGroups > MaxFECReceiveGroups {
 		return fmt.Errorf("%w: receive groups %d must be between 0 and %d", ErrInvalidFECParams, options.MaxReceiveGroups, MaxFECReceiveGroups)

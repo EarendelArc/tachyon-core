@@ -44,6 +44,7 @@ type RelayOptions struct {
 	Transport          Transport
 	PacerPPS           float64
 	FEC                FECOptions
+	MaxDatagramSize    int
 	DisableMigration   bool
 	AuthKey            []byte
 	SessionIdleTimeout time.Duration
@@ -58,6 +59,7 @@ type Relay struct {
 	listenAddr         string
 	pacerPPS           float64
 	fec                FECOptions
+	maxDatagramSize    int
 	disableMigration   bool
 	authKey            []byte
 	sessionIdleTimeout time.Duration
@@ -80,6 +82,9 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 		return nil, errors.New("relay listen address or transport is required")
 	}
 	if err := validateFECOptions(opts.FEC); err != nil {
+		return nil, err
+	}
+	if _, err := normalizeMaxDatagramSize(opts.MaxDatagramSize); err != nil {
 		return nil, err
 	}
 	handler := opts.Handler
@@ -106,6 +111,7 @@ func NewRelay(opts RelayOptions) (*Relay, error) {
 		listenAddr:         opts.ListenAddr,
 		pacerPPS:           opts.PacerPPS,
 		fec:                opts.FEC,
+		maxDatagramSize:    opts.MaxDatagramSize,
 		disableMigration:   opts.DisableMigration,
 		authKey:            append([]byte(nil), opts.AuthKey...),
 		sessionIdleTimeout: opts.SessionIdleTimeout,
@@ -200,6 +206,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			RecvKey:          keys.RecvKey,
 			Pacer:            NewTokenBucketPacer(r.pacerPPS),
 			FEC:              r.fec,
+			MaxDatagramSize:  r.maxDatagramSize,
 			DisableMigration: r.disableMigration,
 		})
 	}

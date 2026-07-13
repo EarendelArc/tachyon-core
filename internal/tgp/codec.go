@@ -14,7 +14,9 @@ import (
 const (
 	outerHeaderSize       = 13
 	innerHeaderSize       = 43
+	MinTGPDatagramSize    = 1232
 	MaxTGPDatagramSize    = 1452
+	WorstCaseTUNOverhead  = 68
 	maxTGPDataPayloadSize = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - chacha20poly1305.Overhead
 	maxDTLSSequence       = 1<<48 - 1
 )
@@ -28,15 +30,35 @@ var (
 )
 
 type Codec struct {
-	aead cipher.AEAD
+	aead            cipher.AEAD
+	maxDatagramSize int
 }
 
 func NewCodec(key [trafficKeySize]byte) (*Codec, error) {
+	return NewCodecWithMaxDatagramSize(key, 0)
+}
+
+func NewCodecWithMaxDatagramSize(key [trafficKeySize]byte, maxDatagramSize int) (*Codec, error) {
+	var err error
+	maxDatagramSize, err = normalizeMaxDatagramSize(maxDatagramSize)
+	if err != nil {
+		return nil, err
+	}
 	aead, err := chacha20poly1305.New(key[:])
 	if err != nil {
 		return nil, fmt.Errorf("create chacha20-poly1305 aead: %w", err)
 	}
-	return &Codec{aead: aead}, nil
+	return &Codec{aead: aead, maxDatagramSize: maxDatagramSize}, nil
+}
+
+func normalizeMaxDatagramSize(maxDatagramSize int) (int, error) {
+	if maxDatagramSize == 0 {
+		maxDatagramSize = MaxTGPDatagramSize
+	}
+	if maxDatagramSize < MinTGPDatagramSize || maxDatagramSize > MaxTGPDatagramSize {
+		return 0, fmt.Errorf("tgp max datagram size %d must be between %d and %d", maxDatagramSize, MinTGPDatagramSize, MaxTGPDatagramSize)
+	}
+	return maxDatagramSize, nil
 }
 
 func NewOuterHeader(sequence uint64, encryptedLength int) (OuterHeader, error) {
@@ -85,8 +107,8 @@ func (c *Codec) Seal(sequence uint64, inner InnerHeader, payload []byte) ([]byte
 		return nil, ErrInvalidLength
 	}
 	wireSize := outerHeaderSize + innerHeaderSize + len(payload) + c.aead.Overhead()
-	if wireSize > MaxTGPDatagramSize {
-		return nil, fmt.Errorf("%w: %d > %d", ErrDatagramTooLarge, wireSize, MaxTGPDatagramSize)
+	if wireSize > c.maxDatagramSize {
+		return nil, fmt.Errorf("%w: %d > configured maximum %d", ErrDatagramTooLarge, wireSize, c.maxDatagramSize)
 	}
 	inner.PayloadLength = uint16(len(payload))
 	inner.Flags |= FlagEncrypted
@@ -113,8 +135,8 @@ func (c *Codec) Open(wire []byte) (Packet, error) {
 	if c == nil || c.aead == nil {
 		return Packet{}, errors.New("nil tgp codec")
 	}
-	if len(wire) > MaxTGPDatagramSize {
-		return Packet{}, fmt.Errorf("%w: %d > %d", ErrDatagramTooLarge, len(wire), MaxTGPDatagramSize)
+	if len(wire) > c.maxDatagramSize {
+		return Packet{}, fmt.Errorf("%w: %d > configured maximum %d", ErrDatagramTooLarge, len(wire), c.maxDatagramSize)
 	}
 	if len(wire) < outerHeaderSize+c.aead.Overhead()+innerHeaderSize {
 		return Packet{}, ErrPacketTooShort

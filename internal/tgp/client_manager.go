@@ -21,6 +21,7 @@ type ClientManagerOptions struct {
 	LocalAddrs       []string
 	PacerPPS         float64
 	FEC              FECOptions
+	MaxDatagramSize  int
 	DisableMigration bool
 	AuthKey          []byte
 	HandshakeTimeout time.Duration
@@ -50,6 +51,9 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	if err := validateFECOptions(opts.FEC); err != nil {
 		return nil, err
 	}
+	if _, err := normalizeMaxDatagramSize(opts.MaxDatagramSize); err != nil {
+		return nil, err
+	}
 	remote := strings.TrimSpace(opts.RemoteAddr)
 	if remote == "" {
 		return nil, errors.New("tgp remote address is required")
@@ -72,6 +76,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 			return DialSessionWithOptions(ctx, localAddr, remoteAddr, SessionRuntimeOptions{
 				PacerPPS:         pacerPPS,
 				FEC:              fec,
+				MaxDatagramSize:  opts.MaxDatagramSize,
 				DisableMigration: disableMigration,
 				AuthKey:          authKey,
 			})
@@ -86,6 +91,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 			return DialSessionMultipathWithOptions(ctx, localAddrs, remoteAddr, SessionRuntimeOptions{
 				PacerPPS:         pacerPPS,
 				FEC:              fec,
+				MaxDatagramSize:  opts.MaxDatagramSize,
 				DisableMigration: disableMigration,
 				AuthKey:          authKey,
 			})

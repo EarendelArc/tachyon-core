@@ -71,6 +71,7 @@ const ClientConfigTemplate = `{
     },
     "connection_migration": true,
     "multipath": false,
+    "max_datagram_size": 1452,
     "handshake_timeout": "5s",
     "session_idle_timeout": "60s"
   },
@@ -130,6 +131,7 @@ const ServerConfigTemplate = `{
     },
     "connection_migration": true,
     "multipath": false,
+    "max_datagram_size": 1452,
     "handshake_timeout": "5s",
     "session_idle_timeout": "300s"
   },

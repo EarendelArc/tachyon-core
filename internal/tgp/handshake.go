@@ -32,6 +32,7 @@ const (
 type SessionRuntimeOptions struct {
 	PacerPPS         float64
 	FEC              FECOptions
+	MaxDatagramSize  int
 	DisableMigration bool
 	AuthKey          []byte
 }
@@ -156,6 +157,7 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 			RecvKey:          keys.RecvKey,
 			Pacer:            NewTokenBucketPacer(opts.PacerPPS),
 			FEC:              opts.FEC,
+			MaxDatagramSize:  opts.MaxDatagramSize,
 			DisableMigration: opts.DisableMigration,
 		})
 	}
@@ -209,6 +211,7 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 			RecvKey:          keys.RecvKey,
 			Pacer:            NewTokenBucketPacer(opts.PacerPPS),
 			FEC:              opts.FEC,
+			MaxDatagramSize:  opts.MaxDatagramSize,
 			DisableMigration: opts.DisableMigration,
 		})
 	}

@@ -224,6 +224,15 @@ future control-plane upgrade.
 | 3% to 10% | 2/4 |
 | >10% | 4/4, ARQ-free maximum protection |
 
+### 4.4 Protocol Resource Limits
+
+Receivers reject oversized input before Reed-Solomon allocation or retained
+buffer growth. TGP permits at most 32 data shards, 16 parity shards, 48 total
+shards, 64 active receive groups, 4096 compact completed-group tombstones, and
+4 MiB of retained shard payload per session. A shard cannot exceed the payload
+budget of the maximum TGP datagram. Completed groups release shard storage
+immediately; partial groups and tombstones expire after 30 seconds.
+
 ---
 
 ## 5. Connection Migration
@@ -240,20 +249,21 @@ session queue:
 3. The client verifies the challenge and returns
    `PathResponse(SessionID, ClientNonce, ServerNonce, Tag)` through the same
    local transport that received it.
-4. The relay registers that observed source only while the matching challenge
-   is pending and unexpired. The challenge is consumed once, source mappings
-   owned by another session cannot be stolen, and each session has a bounded
-   source count.
+4. The relay verifies a stateless, source-bound cookie carried in
+   `ServerNonce`. Consumed cookies enter a short-lived per-session replay set;
+   source mappings owned by another session cannot be stolen.
 
 The request tag alone never registers a source, so replaying a captured request
 from another address only produces a challenge that cannot be answered without
-the per-session key. Replayed responses have no pending challenge and fail.
-Unknown non-control data remains fail-closed and is not broadcast for trial
-decryption.
+the per-session key. Requests allocate no global pending state. Replayed
+responses fail the bounded per-session consumed-cookie check. Unknown
+non-control data remains fail-closed and is not broadcast for trial decryption.
 
 Packet numbers use a bounded sliding anti-replay window. Duplicates and packets
-older than the window are rejected before they can update migration state, so a
-valid historical ciphertext cannot move the relay's return path.
+older than the window are rejected before delivery. Authorized data from any
+path can be delivered, but it never changes the active return path; only a fresh
+challenge completion does. Non-active paths expire after 45 seconds and the
+oldest inactive entry is safely replaced when the eight-path bound is reached.
 
 ---
 
@@ -268,6 +278,24 @@ fail-closed until reauthenticated. The remaining integration work is
 system-interface discovery and policy selection, for example choosing Wi-Fi
 plus cellular paths on mobile. Explicit `FlagMultipath` marking remains
 reserved for a future control-plane integration.
+
+### 6.1 Datagram Size and PMTU
+
+`tgp.max_datagram_size` caps the complete encrypted TGP UDP payload. The
+default and protocol maximum is 1452 bytes, so an outer IPv6/UDP packet is at
+most 1500 bytes. The minimum configurable value is 1232, matching an outer
+IPv6/UDP budget on a known 1280-byte path. Client validation requires
+`client.tun.mtu + 68 <= tgp.max_datagram_size`; oversized sends and receives
+fail with an explicit protocol error.
+Client and relay must use the same lower value because this alpha protocol does
+not negotiate the datagram budget during the handshake.
+
+TGP does not currently fragment protocol datagrams or discover PMTU. Operators
+must configure a known lower budget and matching TUN MTU. A 1280-byte outer
+path cannot carry a minimum-size 1280-byte inner IPv6 packet without protocol
+fragmentation, so that combination remains unsupported and fails closed; the
+1232 setting is usable only when the captured traffic's inner MTU can also be
+reduced safely, such as a controlled IPv4-only path.
 
 ---
 
@@ -292,5 +320,7 @@ reserved for a future control-plane integration.
   transport adapter and receive-side deduplication are implemented.
 - `FlagMultipath` is reserved; current fan-out does not rewrite encrypted inner
   headers to set it.
+- There is no protocol fragmentation or automatic PMTU discovery; configured
+  datagram and TUN limits must match the real path.
 - TGP does not implement ARQ retransmission by design; it relies on pacing and
   FEC to avoid adding physical RTT latency.

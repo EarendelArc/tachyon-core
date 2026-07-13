@@ -97,3 +97,44 @@ func TestDefaultTUNMTUFitsWorstCaseTGPDatagramInPublicPathMTU(t *testing.T) {
 		t.Fatalf("worst-case outer packet = %d bytes, want audited size 1496", outerPacketSize)
 	}
 }
+
+func TestLowPMTUBudgetProducesBoundedOuterPacket(t *testing.T) {
+	const (
+		lowPathMTU = 1280
+		ipv6Header = 40
+		udpHeader  = 8
+	)
+	tunMTU := MinTGPDatagramSize - WorstCaseTUNOverhead
+	innerUDPPayload := make([]byte, tunMTU-ipv6Header-udpHeader)
+	tunnelWire, err := MarshalTunnelDatagram(TunnelDatagram{
+		LocalIP:    netip.MustParseAddr("2001:db8::2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("2001:db8::1"),
+		RemotePort: 27015,
+		Payload:    innerUDPPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fecWire, err := frameFECData(tunnelWire, len(tunnelWire)+fecLengthPrefixSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key [trafficKeySize]byte
+	codec, err := NewCodecWithMaxDatagramSize(key, MinTGPDatagramSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := NewDataHeader(SessionID{}, capturedPacketStreamID, 1, len(fecWire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgpWire, err := codec.Seal(1, header, fecWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerPacketSize := ipv6Header + udpHeader + len(tgpWire)
+	if outerPacketSize != lowPathMTU {
+		t.Fatalf("low-PMTU outer packet = %d, want %d", outerPacketSize, lowPathMTU)
+	}
+}

@@ -22,15 +22,16 @@ var (
 )
 
 type SessionOptions struct {
-	ID          SessionID
-	Transport   Transport
-	RemoteAddr  net.Addr
-	SendKey     [trafficKeySize]byte
-	RecvKey     [trafficKeySize]byte
-	Pacer       Pacer
-	StreamQueue int
-	FECBuffer   *FECReceiveBuffer
-	FEC         FECOptions
+	ID              SessionID
+	Transport       Transport
+	RemoteAddr      net.Addr
+	SendKey         [trafficKeySize]byte
+	RecvKey         [trafficKeySize]byte
+	Pacer           Pacer
+	StreamQueue     int
+	FECBuffer       *FECReceiveBuffer
+	FEC             FECOptions
+	MaxDatagramSize int
 	// DisableMigration rejects authenticated packets that arrive from a source
 	// address different from the established remote address.
 	DisableMigration bool
@@ -126,11 +127,11 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	if err := validateFECOptions(opts.FEC); err != nil {
 		return nil, err
 	}
-	sendCodec, err := NewCodec(opts.SendKey)
+	sendCodec, err := NewCodecWithMaxDatagramSize(opts.SendKey, opts.MaxDatagramSize)
 	if err != nil {
 		return nil, fmt.Errorf("send codec: %w", err)
 	}
-	recvCodec, err := NewCodec(opts.RecvKey)
+	recvCodec, err := NewCodecWithMaxDatagramSize(opts.RecvKey, opts.MaxDatagramSize)
 	if err != nil {
 		return nil, fmt.Errorf("recv codec: %w", err)
 	}
@@ -148,7 +149,11 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	}
 	var fecAdapt *FECAdaptiveController
 	if opts.FEC.enabled() && opts.FEC.Dynamic {
-		fecAdapt = NewFECAdaptiveController(opts.FEC.DataShards, opts.FEC.DataShards, opts.FEC.AdaptWindow)
+		maxParity := opts.FEC.DataShards
+		if maxParity > MaxFECParityShards {
+			maxParity = MaxFECParityShards
+		}
+		fecAdapt = NewFECAdaptiveController(opts.FEC.DataShards, maxParity, opts.FEC.AdaptWindow)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

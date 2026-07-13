@@ -167,7 +167,15 @@ as `0.0.0.0/0` and `::/0` are rejected, and each allow rule must include an
 explicit `ports` list or range. Additional migration and multipath source
 addresses are fail-closed until they complete a per-session, ECDH-derived
 request/challenge/response exchange; replayed responses and data packets cannot
-register a path.
+register a path. Challenges use stateless source-bound cookies, and only a
+fresh completed challenge changes the active relay return path; business data
+from an older authorized path cannot switch it.
+
+The generated client uses `client.tun.mtu=1380` and
+`tgp.max_datagram_size=1452`, bounding an outer IPv6/UDP packet to 1500 bytes.
+Known lower-PMTU paths can reduce the datagram limit to 1232 with a matching
+TUN MTU. Core rejects inconsistent budgets and oversized protocol datagrams;
+TGP does not yet provide fragmentation or automatic PMTU discovery.
 
 After deployment, collect read-only diagnostics with:
 

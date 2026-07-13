@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/routing"
+	"github.com/tachyon-space/tachyon-core/internal/tgp"
+	"github.com/tachyon-space/tachyon-core/internal/tun"
 	"gopkg.in/yaml.v3"
 )
 
@@ -227,6 +229,9 @@ type TGPConfig struct {
 	// Multipath enables simultaneous send over all available network interfaces.
 	Multipath bool `yaml:"multipath" json:"multipath"`
 
+	// MaxDatagramSize caps the complete encrypted TGP UDP payload.
+	MaxDatagramSize int `yaml:"max_datagram_size" json:"max_datagram_size"`
+
 	// HandshakeTimeout is the maximum time to complete the TGP handshake.
 	HandshakeTimeout time.Duration `yaml:"handshake_timeout" json:"handshake_timeout"`
 
@@ -400,6 +405,7 @@ func defaults() *Config {
 			},
 			ConnectionMigration: true,
 			Multipath:           false,
+			MaxDatagramSize:     tgp.MaxTGPDatagramSize,
 			HandshakeTimeout:    5 * time.Second,
 			SessionIdleTimeout:  60 * time.Second,
 		},
@@ -421,6 +427,13 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("mode must be %q or %q, got %q", ModeClient, ModeServer, c.Mode)
 	}
+	maxDatagramSize := c.TGP.MaxDatagramSize
+	if maxDatagramSize == 0 {
+		maxDatagramSize = tgp.MaxTGPDatagramSize
+	}
+	if maxDatagramSize < tgp.MinTGPDatagramSize || maxDatagramSize > tgp.MaxTGPDatagramSize {
+		return fmt.Errorf("tgp.max_datagram_size %d must be between %d and %d", maxDatagramSize, tgp.MinTGPDatagramSize, tgp.MaxTGPDatagramSize)
+	}
 	if c.Mode == ModeClient {
 		if c.Client.Proxy.ServerAddr == "" {
 			return fmt.Errorf("client.proxy.server_addr is required in client mode")
@@ -440,6 +453,16 @@ func (c *Config) Validate() error {
 		if err := validateClientDataPath(c.Client); err != nil {
 			return err
 		}
+		tunMTU := c.Client.TUN.MTU
+		if tunMTU == 0 {
+			tunMTU = tun.DefaultMTU
+		}
+		if tunMTU < 576 {
+			return fmt.Errorf("client.tun.mtu must be at least 576")
+		}
+		if required := tunMTU + tgp.WorstCaseTUNOverhead; required > maxDatagramSize {
+			return fmt.Errorf("client.tun.mtu %d requires tgp.max_datagram_size >= %d, configured %d; lower the TUN MTU or raise the path budget", tunMTU, required, maxDatagramSize)
+		}
 	}
 	if c.Mode == ModeServer {
 		if c.Server.Listen == "" {
@@ -454,6 +477,15 @@ func (c *Config) Validate() error {
 	}
 	if c.TGP.FEC.DataShards < 1 {
 		return fmt.Errorf("tgp.fec.data_shards must be >= 1")
+	}
+	if c.TGP.FEC.DataShards > tgp.MaxFECDataShards {
+		return fmt.Errorf("tgp.fec.data_shards must be <= %d", tgp.MaxFECDataShards)
+	}
+	if c.TGP.FEC.ParityShards < 0 || c.TGP.FEC.ParityShards > tgp.MaxFECParityShards {
+		return fmt.Errorf("tgp.fec.parity_shards must be between 0 and %d", tgp.MaxFECParityShards)
+	}
+	if c.TGP.FEC.DataShards+c.TGP.FEC.ParityShards > tgp.MaxFECTotalShards {
+		return fmt.Errorf("tgp.fec total shards must be <= %d", tgp.MaxFECTotalShards)
 	}
 	if c.TGP.Pacing.InitialRatePPS <= 0 {
 		return fmt.Errorf("tgp.pacing.initial_rate_pps must be > 0")

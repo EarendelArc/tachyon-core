@@ -129,6 +129,13 @@ NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-n
 这类全网目标，并要求每条 allow 规则显式填写 `ports` 列表或范围。迁移和多路径
 新增源地址默认 fail-closed；只有完成基于会话 ECDH 派生密钥的
 request/challenge/response 校验后才会接入，重复响应和数据包不能注册路径。
+Challenge 使用无状态、绑定来源地址的 cookie；只有完成新鲜 challenge 才能切换
+Relay active 回程路径，旧的已授权路径上的业务数据不能切换回程。
+
+生成的客户端默认使用 `client.tun.mtu=1380` 和
+`tgp.max_datagram_size=1452`，使外层 IPv6/UDP 包不超过 1500 字节。已知低 PMTU
+路径可把数据报上限降到 1232，并同步降低 TUN MTU。Core 会拒绝不一致的预算和
+超限协议包；TGP 当前尚无协议分片或自动 PMTU 探测。
 
 部署完成后，可以用只读验收脚本收集诊断信息：
 

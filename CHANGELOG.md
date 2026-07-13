@@ -5,6 +5,14 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- TGP now enforces a configurable 1232-1452 byte encrypted datagram budget and
+  validates the client TUN MTU against worst-case encapsulation overhead.
+- Relay return-path selection is now controlled only by fresh path challenge
+  completion; authorized business data from old paths cannot switch it.
+- Relay paths now expire and safely replace the least-recently-used inactive
+  entry instead of permanently exhausting the eight-path session bound.
+- Codec and FEC processing now enforce protocol limits for datagram size,
+  shard counts and size, active/completed groups, and total buffered bytes.
 - The default client TUN MTU is now 1380 instead of 9000. This keeps the
   worst-case IPv6 TGP packet with FEC and outer IPv6/UDP headers within a
   common 1500-byte public path MTU while preserving explicit MTU overrides.
@@ -13,12 +21,18 @@ All notable changes to Tachyon Core will be documented in this file.
   again after insertion-order eviction.
 
 ### Added
+- Added stateless source-bound path cookies with a bounded per-session response
+  replay set, eliminating PathRequest-controlled global pending state.
+- Added client multipath source authorization for configured and
+  challenge-authenticated server addresses.
 - Added per-session path request/challenge/response authentication for relay
   migration and multipath sources. Additional UDP sources are registered only
   after proving possession of an ECDH-derived path key from the requesting
   source with a short-lived, one-time server challenge.
 
 ### Fixed
+- Valid ciphertext from an unknown client-side multipath source is rejected
+  before it can consume anti-replay state or update the session remote.
 - Replayed authenticated packets can no longer update a session's return path;
   source authorization and anti-replay checks complete before migration state
   changes.

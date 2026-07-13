@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 func TestCodecSealOpenRoundTrip(t *testing.T) {
@@ -82,5 +84,31 @@ func TestCodecRejectsDatagramsAboveProtocolLimit(t *testing.T) {
 	}
 	if _, err := codec.Open(make([]byte, MaxTGPDatagramSize+1)); !errors.Is(err, ErrDatagramTooLarge) {
 		t.Fatalf("oversized open error = %v, want %v", err, ErrDatagramTooLarge)
+	}
+}
+
+func TestCodecHonorsLowPathDatagramLimit(t *testing.T) {
+	var key [trafficKeySize]byte
+	codec, err := NewCodecWithMaxDatagramSize(key, MinTGPDatagramSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, MinTGPDatagramSize-outerHeaderSize-innerHeaderSize-chacha20poly1305.Overhead)
+	header, err := NewDataHeader(SessionID{}, 1, 1, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := codec.Seal(1, header, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != MinTGPDatagramSize {
+		t.Fatalf("low-PMTU wire size = %d, want %d", len(wire), MinTGPDatagramSize)
+	}
+	if _, err := codec.Seal(2, header, append(payload, 0)); !errors.Is(err, ErrDatagramTooLarge) {
+		t.Fatalf("low-PMTU oversized error = %v, want %v", err, ErrDatagramTooLarge)
+	}
+	if _, err := NewCodecWithMaxDatagramSize(key, MinTGPDatagramSize-1); err == nil {
+		t.Fatal("codec accepted datagram limit below supported minimum")
 	}
 }

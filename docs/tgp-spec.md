@@ -257,13 +257,22 @@ session queue:
    `ServerNonce`. Consumed cookies enter a short-lived per-session replay set;
    source mappings owned by another session cannot be stolen.
 
-The request tag alone never registers a source. `ClientNonce` carries an
-authenticated timestamp and requests outside the 10-second window are rejected.
-Fresh requests allocate no global pending state. A fixed-state global bucket
-(burst 64, refill 32/second) bounds pre-authentication lookup and HMAC work.
-Only requests with a valid HMAC then consume the session's per-CID bucket
-(burst 8, refill 2/second) before response generation, so random tags cannot
-drain a legitimate migration quota. Thus a captured request can produce only
+The request tag alone never registers a source. The relay performs the cheap
+session map lookup first, so an unknown `SessionID` is dropped without consuming
+migration quota. `ClientNonce` carries an authenticated timestamp and requests
+outside the 10-second window are rejected. Fresh requests allocate no global
+pending state. Requests for known sessions pass through a process-random-keyed,
+fixed-capacity source-IP limiter before HMAC verification. It has 1024 entries,
+burst 8 and refill 2/second per source; 16 shards of 16 four-way sets bound each
+operation to four entries. A full set rejects new sources until its oldest entry
+has been idle for 30 seconds. UDP source ports are intentionally excluded to
+prevent port rotation bypasses. Consequently, clients sharing one public NAT IP
+also share this pre-authentication quota; this fail-closed tradeoff protects CPU
+and memory under source churn. Only requests with a valid HMAC then consume the
+session's independent per-CID bucket (burst 8, refill 2/second) before response
+generation, so random tags cannot drain a legitimate migration quota. The relay
+rechecks session identity, migration policy, and source ownership under the
+session lock after HMAC verification. Thus a captured request can produce only
 bounded reflection and CPU cost. Replayed
 responses fail the bounded per-session consumed-cookie check. Unknown
 non-control data remains fail-closed and is not broadcast for trial decryption.

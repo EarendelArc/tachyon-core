@@ -12,9 +12,11 @@ All notable changes to Tachyon Core will be documented in this file.
   completion; authorized business data from old paths cannot switch it.
 - Relay paths now expire and safely replace the least-recently-used inactive
   entry instead of permanently exhausting the eight-path session bound.
-- Path requests now carry an authenticated 10-second timestamp. A fixed-state
-  global bucket bounds unauthenticated HMAC work, while only valid HMACs consume
-  the strict per-CID response quota.
+- Path requests now carry an authenticated 10-second timestamp. Unknown CIDs
+  are dropped before accounting, while a process-keyed, fixed-capacity
+  source-IP limiter bounds unauthenticated HMAC work without allowing one
+  source to consume another source's quota. Only valid HMACs consume the strict
+  per-CID response quota.
 - Codec and FEC processing now enforce protocol limits for datagram size,
   shard counts and size, active/completed groups, and total buffered bytes.
 - The default client TUN MTU is now 1280 with a 1352-byte TGP budget. The

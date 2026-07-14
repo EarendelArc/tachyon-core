@@ -170,9 +170,12 @@ request/challenge/response exchange; replayed responses and data packets cannot
 register a path. Challenges use stateless source-bound cookies, and only a
 fresh completed challenge changes the active relay return path; business data
 from an older authorized path cannot switch it.
-Path requests carry an authenticated 10-second timestamp. A fixed global
-burst-64, 32-per-second bucket bounds unauthenticated HMAC work; only valid
-HMACs consume the per-session burst-8, 2-per-second response quota.
+Path requests carry an authenticated 10-second timestamp. Unknown session IDs
+are dropped before pre-auth accounting. Known sessions use a process-keyed,
+fixed-capacity source-IP limiter (1024 entries, burst 8, 2 per second); only
+valid HMACs consume the separate per-session burst-8, 2-per-second response
+quota. UDP ports do not create new source buckets, so clients behind one NAT
+share the pre-auth quota.
 
 The generated client uses `client.tun.mtu=1280` and
 `tgp.max_datagram_size=1352`, bounding its worst-case outer IPv6/UDP packet to

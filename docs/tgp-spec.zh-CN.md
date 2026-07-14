@@ -145,7 +145,7 @@ Relay 首先把 session 绑定到完成认证握手的 UDP 来源地址。新增
 3. 客户端验证 challenge，并从收到 challenge 的同一本地 transport 返回同时覆盖两个 nonce 的 `PathResponse`。
 4. Relay 校验 `ServerNonce` 中无状态、绑定来源地址的 cookie；已消费 cookie 进入短时、每会话有界 replay set，已有来源映射不能被其他 session 抢占。
 
-`ClientNonce` 携带认证时间戳，超过 10 秒时间窗的 `PathRequest` 会被拒绝。新鲜请求不分配全局 pending 状态；固定状态的全局 bucket（burst 64、每秒恢复 32）限制认证前 lookup/HMAC 工作。只有 HMAC 有效的请求才会扣除该 CID 的 session bucket（burst 8、每秒恢复 2）并生成响应，因此随机 tag 不能耗尽合法迁移配额，捕获请求造成的反射与 CPU 开销也有明确上界。重复响应会被已消费 cookie 检查拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
+Relay 先执行廉价 session map 查询，因此未知 `SessionID` 会直接丢弃且不消耗迁移配额。`ClientNonce` 携带认证时间戳，超过 10 秒时间窗的 `PathRequest` 会被拒绝。新鲜请求不分配全局 pending 状态；已知 session 的请求在 HMAC 前进入带进程随机哈希密钥、固定容量的来源 IP limiter。该结构固定 1024 条目，每来源 burst 8、每秒恢复 2，由 16 个分片、每分片 16 个四路组组成，每次最多维护 4 个条目；组满时，新来源必须等待最旧条目空闲 30 秒才能安全替换。来源身份刻意不含 UDP 端口，防止换端口绕过，因此同一公网 NAT IP 后的客户端共享认证前配额；这是来源洪泛下保护 CPU/内存的 fail-closed 权衡。只有 HMAC 有效的请求才会扣除独立的该 CID session bucket（burst 8、每秒恢复 2）并生成响应。HMAC 后仍会在 session 锁内重新核对 session 身份、迁移策略和来源 owner，从而保留 TOCTOU 防护。重复响应会被已消费 cookie 检查拒绝。未知非控制数据仍然 fail-closed，不会广播给所有活跃 session 尝试解密。
 
 PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可以交付，但业务数据永远不能改变 active 回程路径；只有完成新鲜 challenge 才能切换。非 active 路径 45 秒后老化，达到 8 条上限时安全替换最久未使用的非 active 条目。
 

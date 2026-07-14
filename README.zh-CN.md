@@ -131,10 +131,10 @@ NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-n
 request/challenge/response 校验后才会接入，重复响应和数据包不能注册路径。
 Challenge 使用无状态、绑定来源地址的 cookie；只有完成新鲜 challenge 才能切换
 Relay active 回程路径，旧的已授权路径上的业务数据不能切换回程。
-PathRequest 带认证的 10 秒时间窗。未知 SessionID 在认证前计费前直接丢弃；已知
-SessionID 使用带进程随机哈希密钥、固定 1024 条目的来源 IP limiter（burst 8、每秒
-恢复 2）。只有有效 HMAC 才扣除独立的每会话 burst 8、每秒恢复 2 响应配额。UDP
-端口变化不会创建新来源桶，因此同一 NAT 后的客户端共享认证前配额。
+PathRequest 使用严格报文长度并携带认证的 10 秒时间窗。未知 SessionID 在 HMAC
+前直接丢弃；已知 session 的新鲜请求在认证前不分配状态、不消耗 token，也不发送
+响应。无效 HMAC 只增加无状态 CPU 工作，只有有效 HMAC 才进入每会话 burst 8、
+每秒恢复 2 的迁移配额。
 
 生成的客户端默认使用 `client.tun.mtu=1280` 和
 `tgp.max_datagram_size=1352`，使最坏外层 IPv6/UDP 包为 1396 字节。认证的 TGP v3

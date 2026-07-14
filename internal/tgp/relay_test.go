@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -379,6 +378,9 @@ func TestRelayPathRequestTimeWindowAndTokenBucket(t *testing.T) {
 	if got := len(transport.writes); got != 0 {
 		t.Fatalf("expired request produced %d challenges, want 0", got)
 	}
+	if got := router.pathRequestAuthChecks.Load(); got != 0 {
+		t.Fatalf("expired request reached HMAC verification %d times", got)
+	}
 
 	nonce := mustNewPathRequestNonce(t, now)
 	request, err := marshalPathControl(pathControlRequest, sessionID, nonce, [pathControlNonceSize]byte{}, pathKey)
@@ -392,6 +394,9 @@ func TestRelayPathRequestTimeWindowAndTokenBucket(t *testing.T) {
 	if got := len(transport.writes); got != pathRequestTokenBurst {
 		t.Fatalf("burst challenges = %d, want strict cap %d", got, pathRequestTokenBurst)
 	}
+	if got := router.pathRequestAuthChecks.Load(); got != pathRequestTokenBurst+1 {
+		t.Fatalf("authenticated burst HMAC checks = %d, want %d", got, pathRequestTokenBurst+1)
+	}
 
 	now = now.Add(time.Second / pathRequestTokensPerSecond)
 	recoveredSource := mustRelayUDPAddr(t, "127.0.0.1:12020")
@@ -403,6 +408,9 @@ func TestRelayPathRequestTimeWindowAndTokenBucket(t *testing.T) {
 	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: excessSource}, mustParsePathControl(t, request))
 	if got := len(transport.writes); got != pathRequestTokenBurst+1 {
 		t.Fatalf("recovered token allowed excess challenge: got %d", got)
+	}
+	if got := router.pathRequestAuthChecks.Load(); got != pathRequestTokenBurst+3 {
+		t.Fatalf("post-refill HMAC checks = %d, want %d", got, pathRequestTokenBurst+3)
 	}
 	firstSource := mustRelayUDPAddr(t, "127.0.0.1:12000")
 	challenge := mustParsePathControl(t, transport.nextWrite(t).packet)
@@ -416,7 +424,7 @@ func TestRelayPathRequestTimeWindowAndTokenBucket(t *testing.T) {
 	}
 }
 
-func TestRelaySourcePreauthExhaustionDoesNotAffectAnotherSource(t *testing.T) {
+func TestRelayInvalidPathRequestsAreStatelessAndDoNotConsumeSessionTokens(t *testing.T) {
 	transport := newPathControlCaptureTransport()
 	router := newRelayTransportRouter(transport, 2, 1)
 	now := time.Unix(1_700_010_000, 0)
@@ -426,7 +434,6 @@ func TestRelaySourcePreauthExhaustionDoesNotAffectAnotherSource(t *testing.T) {
 	var pathKey [trafficKeySize]byte
 	pathKey[0] = 37
 	original := mustRelayUDPAddr(t, "127.0.0.1:12100")
-	abusive := mustRelayUDPAddr(t, "127.0.0.2:12101")
 	legitimate := mustRelayUDPAddr(t, "127.0.0.3:12102")
 	session, err := router.registerWithPathAuth(sessionID, original, pathKey, true)
 	if err != nil {
@@ -439,13 +446,33 @@ func TestRelaySourcePreauthExhaustionDoesNotAffectAnotherSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < pathRequestSourceTokenBurst+4; index++ {
+
+	const invalidRequests = 512
+	invalidMessages := make([]pathControlMessage, invalidRequests)
+	invalidSources := make([]net.Addr, invalidRequests)
+	for index := range invalidMessages {
 		invalid := append([]byte(nil), request...)
-		invalid[len(invalid)-1] ^= byte(index + 1)
-		router.handlePathControl(context.Background(), relayPacketEnvelope{packet: invalid, from: abusive}, mustParsePathControl(t, invalid))
+		invalid[len(invalid)-1] ^= byte(index%255 + 1)
+		invalidMessages[index] = mustParsePathControl(t, invalid)
+		invalidSources[index] = mustRelayUDPAddr(t, fmt.Sprintf("198.51.100.%d:%d", index%64+1, 20000+index))
 	}
-	if got := router.pathRequestAuthChecks.Load(); got != pathRequestSourceTokenBurst {
-		t.Fatalf("abusive source HMAC checks = %d, want source cap %d", got, pathRequestSourceTokenBurst)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for index := range invalidMessages {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			router.handlePathControl(context.Background(), relayPacketEnvelope{from: invalidSources[index]}, invalidMessages[index])
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := router.pathRequestAuthChecks.Load(); got != invalidRequests {
+		t.Fatalf("invalid multi-source HMAC checks = %d, want %d", got, invalidRequests)
+	}
+	if got := len(transport.writes); got != 0 {
+		t.Fatalf("invalid HMAC flood produced %d challenges", got)
 	}
 
 	router.mu.Lock()
@@ -456,10 +483,10 @@ func TestRelaySourcePreauthExhaustionDoesNotAffectAnotherSource(t *testing.T) {
 	}
 	router.handlePathControl(context.Background(), relayPacketEnvelope{packet: request, from: legitimate}, mustParsePathControl(t, request))
 	if got := len(transport.writes); got != 1 {
-		t.Fatalf("valid request from an independent source produced %d challenges, want 1", got)
+		t.Fatalf("valid request after invalid flood produced %d challenges, want 1", got)
 	}
-	if got := router.pathRequestAuthChecks.Load(); got != pathRequestSourceTokenBurst+1 {
-		t.Fatalf("HMAC checks after legitimate source = %d, want %d", got, pathRequestSourceTokenBurst+1)
+	if got := router.pathRequestAuthChecks.Load(); got != invalidRequests+1 {
+		t.Fatalf("HMAC checks after legitimate request = %d, want %d", got, invalidRequests+1)
 	}
 	router.mu.Lock()
 	tokensAfterValid := session.pathRequestTokens
@@ -469,7 +496,7 @@ func TestRelaySourcePreauthExhaustionDoesNotAffectAnotherSource(t *testing.T) {
 	}
 }
 
-func TestRelayUnknownSessionDoesNotConsumeSourcePreauthQuota(t *testing.T) {
+func TestRelayUnknownSessionDoesNotReachHMAC(t *testing.T) {
 	transport := newPathControlCaptureTransport()
 	router := newRelayTransportRouter(transport, 2, 1)
 	now := time.Unix(1_700_020_000, 0)
@@ -491,7 +518,7 @@ func TestRelayUnknownSessionDoesNotConsumeSourcePreauthQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := mustRelayUDPAddr(t, "127.0.0.2:12201")
-	for index := 0; index < pathRequestSourceTokenBurst*4; index++ {
+	for index := 0; index < 512; index++ {
 		router.handlePathControl(context.Background(), relayPacketEnvelope{packet: unknownRequest, from: source}, mustParsePathControl(t, unknownRequest))
 	}
 	if got := router.pathRequestAuthChecks.Load(); got != 0 {
@@ -509,98 +536,11 @@ func TestRelayUnknownSessionDoesNotConsumeSourcePreauthQuota(t *testing.T) {
 	if got := router.pathRequestAuthChecks.Load(); got != 1 {
 		t.Fatalf("known session HMAC checks = %d, want 1", got)
 	}
-}
-
-func TestPathRequestSourceLimiterCapacityIsStrictlyBounded(t *testing.T) {
-	limiter := newPathRequestSourceLimiter()
-	now := time.Unix(1_700_030_000, 0)
-	allowed := 0
-	var denied net.Addr
-	for index := 0; index < pathRequestSourceCapacity*4; index++ {
-		source := mustRelayUDPAddr(t, fmt.Sprintf("[2001:db8::%x]:12345", index+1))
-		if limiter.allow(source, now) {
-			allowed++
-		} else if denied == nil {
-			denied = source
-		}
-	}
-	if allowed > pathRequestSourceCapacity {
-		t.Fatalf("unique-source flood admitted %d entries, capacity %d", allowed, pathRequestSourceCapacity)
-	}
-
-	occupied := 0
-	for shardIndex := range limiter.shards {
-		shard := &limiter.shards[shardIndex]
-		shard.mu.Lock()
-		for setIndex := range shard.sets {
-			for entryIndex := range shard.sets[setIndex] {
-				if shard.sets[setIndex][entryIndex].occupied {
-					occupied++
-				}
-			}
-		}
-		shard.mu.Unlock()
-	}
-	if occupied > pathRequestSourceCapacity {
-		t.Fatalf("source limiter retained %d entries, capacity %d", occupied, pathRequestSourceCapacity)
-	}
-	if occupied == 0 {
-		t.Fatal("source limiter retained no entries during capacity test")
-	}
-	if denied == nil {
-		t.Fatal("source flood did not encounter a full fixed-capacity set")
-	}
-	if !limiter.allow(denied, now.Add(pathRequestSourceIdleLifetime)) {
-		t.Fatal("idle source entry was not safely replaceable")
-	}
-}
-
-func TestPathRequestSourceLimiterConcurrentIsolation(t *testing.T) {
-	limiter := newPathRequestSourceLimiter()
-	now := time.Unix(1_700_040_000, 0)
-	sources := []net.Addr{
-		mustRelayUDPAddr(t, "192.0.2.10:12345"),
-		mustRelayUDPAddr(t, "192.0.2.11:12345"),
-	}
-	var allowed [2]atomic.Int64
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for sourceIndex := range sources {
-		for requestIndex := 0; requestIndex < pathRequestSourceTokenBurst*8; requestIndex++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
-				if limiter.allow(sources[sourceIndex], now) {
-					allowed[sourceIndex].Add(1)
-				}
-			}()
-		}
-	}
-	close(start)
-	wg.Wait()
-	for sourceIndex := range sources {
-		if got := allowed[sourceIndex].Load(); got != pathRequestSourceTokenBurst {
-			t.Fatalf("source %d concurrent allowance = %d, want %d", sourceIndex, got, pathRequestSourceTokenBurst)
-		}
-	}
-}
-
-func TestPathRequestSourceLimiterGroupsUDPPortsByIP(t *testing.T) {
-	limiter := newPathRequestSourceLimiter()
-	now := time.Unix(1_700_050_000, 0)
-	allowed := 0
-	for index := 0; index < pathRequestSourceTokenBurst*2; index++ {
-		source := mustRelayUDPAddr(t, fmt.Sprintf("198.51.100.10:%d", 20000+index))
-		if limiter.allow(source, now) {
-			allowed++
-		}
-	}
-	if allowed != pathRequestSourceTokenBurst {
-		t.Fatalf("same-IP port rotation allowance = %d, want %d", allowed, pathRequestSourceTokenBurst)
-	}
-	if !limiter.allow(mustRelayUDPAddr(t, "198.51.100.11:20000"), now) {
-		t.Fatal("one IP's port rotation exhausted another IP's quota")
+	router.mu.Lock()
+	tokens := session.pathRequestTokens
+	router.mu.Unlock()
+	if tokens != pathRequestTokenBurst-1 {
+		t.Fatalf("known request token balance = %v, want %d", tokens, pathRequestTokenBurst-1)
 	}
 }
 

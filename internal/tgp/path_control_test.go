@@ -1,6 +1,7 @@
 package tgp
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -59,6 +60,39 @@ func TestPathControlKeyIsSessionBound(t *testing.T) {
 	}
 	if verifyPathControl(msg, secondKey) {
 		t.Fatal("path control authenticated with a different session key")
+	}
+}
+
+func TestPathControlRejectsNonCanonicalFormatAndLength(t *testing.T) {
+	var key [trafficKeySize]byte
+	request, err := marshalPathControl(pathControlRequest, SessionID{}, [pathControlNonceSize]byte{}, [pathControlNonceSize]byte{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := marshalPathControl(pathControlChallenge, SessionID{}, [pathControlNonceSize]byte{}, [pathControlNonceSize]byte{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	badMagic := append([]byte(nil), request...)
+	badMagic[0] ^= 0xff
+	badType := append([]byte(nil), request...)
+	badType[4] = 0xff
+	requestWithChallengeLength := append([]byte(nil), challenge...)
+	requestWithChallengeLength[4] = byte(pathControlRequest)
+	tests := map[string][]byte{
+		"truncated":                     request[:len(request)-1],
+		"extended":                      append(append([]byte(nil), request...), 0),
+		"bad magic":                     badMagic,
+		"bad type":                      badType,
+		"request with challenge length": requestWithChallengeLength,
+	}
+	for name, wire := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parsePathControl(wire); !errors.Is(err, ErrInvalidPathControl) {
+				t.Fatalf("parse error = %v, want %v", err, ErrInvalidPathControl)
+			}
+		})
 	}
 }
 

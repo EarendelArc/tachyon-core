@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/maphash"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,13 +17,6 @@ const (
 	defaultRelayHandshakeQueueSize = 64
 	defaultRelayMaxPathsPerSession = 8
 	defaultRelayUsedPathCookies    = 64
-	pathRequestSourceTokenBurst    = 8
-	pathRequestSourceTokensPerSec  = 2
-	pathRequestSourceShardCount    = 16
-	pathRequestSourceSetsPerShard  = 16
-	pathRequestSourceWays          = 4
-	pathRequestSourceCapacity      = pathRequestSourceShardCount * pathRequestSourceSetsPerShard * pathRequestSourceWays
-	pathRequestSourceIdleLifetime  = 30 * time.Second
 	pathRequestTokenBurst          = 8
 	pathRequestTokensPerSecond     = 2
 	pathChallengeLifetime          = 5 * time.Second
@@ -368,130 +359,9 @@ func newSourceAddrKey(addr net.Addr) (sourceAddrKey, bool) {
 	return sourceAddrKey{network: network, address: address}, true
 }
 
-type pathRequestSourceEntry struct {
-	fingerprint uint64
-	tokens      float64
-	refillAt    time.Time
-	lastSeen    time.Time
-	occupied    bool
-}
-
-type pathRequestSourceSet [pathRequestSourceWays]pathRequestSourceEntry
-
-type pathRequestSourceShard struct {
-	mu   sync.Mutex
-	sets [pathRequestSourceSetsPerShard]pathRequestSourceSet
-}
-
-type pathRequestSourceLimiter struct {
-	seed   maphash.Seed
-	shards [pathRequestSourceShardCount]pathRequestSourceShard
-}
-
-func newPathRequestSourceLimiter() *pathRequestSourceLimiter {
-	return &pathRequestSourceLimiter{seed: maphash.MakeSeed()}
-}
-
-func pathRequestSourceIdentity(addr net.Addr) (string, bool) {
-	if addr == nil {
-		return "", false
-	}
-	var ip netip.Addr
-	var ok bool
-	switch addr := addr.(type) {
-	case *net.UDPAddr:
-		ip, ok = netip.AddrFromSlice(addr.IP)
-		if !ok {
-			return "", false
-		}
-		ip = ip.Unmap()
-		if addr.Zone != "" && ip.Is6() {
-			ip = ip.WithZone(addr.Zone)
-		}
-	default:
-		host, _, err := net.SplitHostPort(addr.String())
-		if err != nil {
-			return "", false
-		}
-		ip, err = netip.ParseAddr(host)
-		if err != nil {
-			return "", false
-		}
-		ip = ip.Unmap()
-	}
-	// Deliberately exclude the UDP port so port rotation cannot bypass the
-	// limiter. Clients behind one NAT therefore share this pre-auth quota.
-	return ip.String(), true
-}
-
-func (l *pathRequestSourceLimiter) allow(addr net.Addr, now time.Time) bool {
-	identity, ok := pathRequestSourceIdentity(addr)
-	if !ok {
-		return false
-	}
-	var hash maphash.Hash
-	hash.SetSeed(l.seed)
-	_, _ = hash.WriteString(identity)
-	fingerprint := hash.Sum64()
-	shardIndex := int(fingerprint % pathRequestSourceShardCount)
-	setIndex := int((fingerprint / pathRequestSourceShardCount) % pathRequestSourceSetsPerShard)
-	shard := &l.shards[shardIndex]
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	set := &shard.sets[setIndex]
-	entryIndex := -1
-	emptyIndex := -1
-	oldestIndex := 0
-	for index := range set {
-		entry := &set[index]
-		if entry.occupied && entry.fingerprint == fingerprint {
-			entryIndex = index
-			break
-		}
-		if !entry.occupied && emptyIndex < 0 {
-			emptyIndex = index
-		}
-		if set[index].lastSeen.Before(set[oldestIndex].lastSeen) {
-			oldestIndex = index
-		}
-	}
-	if entryIndex < 0 {
-		entryIndex = emptyIndex
-		if entryIndex < 0 {
-			if now.Before(set[oldestIndex].lastSeen.Add(pathRequestSourceIdleLifetime)) {
-				return false
-			}
-			entryIndex = oldestIndex
-		}
-		set[entryIndex] = pathRequestSourceEntry{
-			fingerprint: fingerprint,
-			tokens:      pathRequestSourceTokenBurst,
-			refillAt:    now,
-			lastSeen:    now,
-			occupied:    true,
-		}
-	}
-
-	entry := &set[entryIndex]
-	if now.After(entry.refillAt) {
-		elapsed := now.Sub(entry.refillAt).Seconds()
-		entry.tokens = min(float64(pathRequestSourceTokenBurst), entry.tokens+elapsed*pathRequestSourceTokensPerSec)
-		entry.refillAt = now
-	}
-	entry.lastSeen = now
-	if entry.tokens < 1 {
-		return false
-	}
-	entry.tokens--
-	return true
-}
-
 type relayTransportRouter struct {
 	transport Transport
 	now       func() time.Time
-
-	pathRequestSourceLimiter *pathRequestSourceLimiter
 
 	mu                    sync.Mutex
 	handshakes            chan relayPacketEnvelope
@@ -516,14 +386,13 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 		handshakeQueueSize = defaultRelayHandshakeQueueSize
 	}
 	return &relayTransportRouter{
-		transport:                transport,
-		now:                      time.Now,
-		pathRequestSourceLimiter: newPathRequestSourceLimiter(),
-		handshakes:               make(chan relayPacketEnvelope, handshakeQueueSize),
-		done:                     make(chan struct{}),
-		sessions:                 make(map[SessionID]*relaySessionTransport),
-		sources:                  make(map[sourceAddrKey]*relaySessionTransport),
-		sessionQueueSize:         sessionQueueSize,
+		transport:        transport,
+		now:              time.Now,
+		handshakes:       make(chan relayPacketEnvelope, handshakeQueueSize),
+		done:             make(chan struct{}),
+		sessions:         make(map[SessionID]*relaySessionTransport),
+		sources:          make(map[sourceAddrKey]*relaySessionTransport),
+		sessionQueueSize: sessionQueueSize,
 	}
 }
 
@@ -663,13 +532,8 @@ func (r *relayTransportRouter) handlePathControl(ctx context.Context, envelope r
 func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.Addr, source sourceAddrKey, msg pathControlMessage) {
 	r.mu.Lock()
 	session := r.sessions[msg.sessionID]
-	if session == nil || !session.allowAdditionalPaths || session.activeSource == source {
+	if session == nil {
 		r.mu.Unlock()
-		return
-	}
-	if owner := r.sources[source]; owner != nil && owner != session {
-		r.mu.Unlock()
-		r.droppedPathControl.Add(1)
 		return
 	}
 	pathKey := session.pathKey
@@ -677,10 +541,6 @@ func (r *relayTransportRouter) handlePathRequest(ctx context.Context, from net.A
 
 	now := r.now()
 	if !verifyPathRequestTime(msg.clientNonce, now, pathRequestLifetime) {
-		r.droppedPathControl.Add(1)
-		return
-	}
-	if !r.pathRequestSourceLimiter.allow(from, now) {
 		r.droppedPathControl.Add(1)
 		return
 	}

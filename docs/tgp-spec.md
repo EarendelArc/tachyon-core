@@ -257,23 +257,21 @@ session queue:
    `ServerNonce`. Consumed cookies enter a short-lived per-session replay set;
    source mappings owned by another session cannot be stolen.
 
-The request tag alone never registers a source. The relay performs the cheap
-session map lookup first, so an unknown `SessionID` is dropped without consuming
-migration quota. `ClientNonce` carries an authenticated timestamp and requests
-outside the 10-second window are rejected. Fresh requests allocate no global
-pending state. Requests for known sessions pass through a process-random-keyed,
-fixed-capacity source-IP limiter before HMAC verification. It has 1024 entries,
-burst 8 and refill 2/second per source; 16 shards of 16 four-way sets bound each
-operation to four entries. A full set rejects new sources until its oldest entry
-has been idle for 30 seconds. UDP source ports are intentionally excluded to
-prevent port rotation bypasses. Consequently, clients sharing one public NAT IP
-also share this pre-authentication quota; this fail-closed tradeoff protects CPU
-and memory under source churn. Only requests with a valid HMAC then consume the
-session's independent per-CID bucket (burst 8, refill 2/second) before response
-generation, so random tags cannot drain a legitimate migration quota. The relay
-rechecks session identity, migration policy, and source ownership under the
-session lock after HMAC verification. Thus a captured request can produce only
-bounded reflection and CPU cost. Replayed
+The request tag alone never registers a source. Processing order is strict wire
+size and type, a cheap session map lookup, timestamp validation, and then HMAC
+verification. An unknown `SessionID` is dropped before HMAC work. A malformed,
+expired, or invalid request allocates no state, consumes no migration token, and
+receives no response. After a valid HMAC, the relay reacquires the session lock
+and rechecks session identity, migration policy, the active endpoint, and source
+ownership. Only then does it consume the session's per-CID bucket (burst 8,
+refill 2/second) and create a challenge.
+
+This keeps memory constant for invalid requests and prevents invalid tags from
+denying legitimate migration quota. The deliberate DoS tradeoff is that an
+attacker who knows a live `SessionID` can force stateless HMAC CPU work; there is
+no unauthenticated shared limiter that can itself be exhausted. A captured valid
+request within its timestamp window can consume the authenticated per-session
+quota and produce bounded challenge responses. Replayed
 responses fail the bounded per-session consumed-cookie check. Unknown
 non-control data remains fail-closed and is not broadcast for trial decryption.
 

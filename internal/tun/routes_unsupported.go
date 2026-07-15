@@ -4,6 +4,6 @@ package tun
 
 func SelectiveRoutesSupported() bool { return false }
 
-func newPlatformRouteOperator(string) (routeOperator, error) {
+func newPlatformRouteOperator(string, uint64) (routeOperator, error) {
 	return nil, ErrSelectiveRoutesUnsupported
 }

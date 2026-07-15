@@ -37,6 +37,7 @@ type SessionRuntimeOptions struct {
 	MaxDatagramSize  int
 	DisableMigration bool
 	AuthKey          []byte
+	ValidateRemote   func(net.Addr) error
 }
 
 type handshakeMessage struct {
@@ -180,6 +181,7 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 			FEC:              opts.FEC,
 			MaxDatagramSize:  msg.maxDatagramSize,
 			DisableMigration: opts.DisableMigration,
+			ValidateRemote:   opts.ValidateRemote,
 		})
 	}
 }

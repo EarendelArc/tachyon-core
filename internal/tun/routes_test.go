@@ -11,10 +11,23 @@ import (
 
 type fakeRouteOperator struct {
 	mu          sync.Mutex
+	routes      map[netip.Prefix]routeState
 	addCalls    []netip.Prefix
 	deleteCalls []netip.Prefix
+	deleteCtxs  []context.Context
 	failAddAt   int
-	deleteErr   error
+	addErr      error
+	createOnErr bool
+	deleteFails map[netip.Prefix]int
+}
+
+func (f *fakeRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (routeState, error) {
+	if err := ctx.Err(); err != nil {
+		return routeState{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.routes[prefix], nil
 }
 
 func (f *fakeRouteOperator) Add(ctx context.Context, prefix netip.Prefix) error {
@@ -25,16 +38,36 @@ func (f *fakeRouteOperator) Add(ctx context.Context, prefix netip.Prefix) error 
 	defer f.mu.Unlock()
 	f.addCalls = append(f.addCalls, prefix)
 	if f.failAddAt > 0 && len(f.addCalls) == f.failAddAt {
+		if f.createOnErr {
+			f.setRoute(prefix, routeState{Exists: true, Matches: true})
+		}
+		if f.addErr != nil {
+			return f.addErr
+		}
 		return errors.New("injected add failure")
 	}
+	f.setRoute(prefix, routeState{Exists: true, Matches: true})
 	return nil
 }
 
-func (f *fakeRouteOperator) Delete(_ context.Context, prefix netip.Prefix) error {
+func (f *fakeRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, prefix)
-	return f.deleteErr
+	f.deleteCtxs = append(f.deleteCtxs, ctx)
+	if f.deleteFails[prefix] > 0 {
+		f.deleteFails[prefix]--
+		return errors.New("injected delete failure")
+	}
+	delete(f.routes, prefix)
+	return nil
+}
+
+func (f *fakeRouteOperator) setRoute(prefix netip.Prefix, state routeState) {
+	if f.routes == nil {
+		f.routes = make(map[netip.Prefix]routeState)
+	}
+	f.routes[prefix] = state
 }
 
 func TestPlanSelectiveRoutesNormalizesAndDeduplicates(t *testing.T) {
@@ -101,6 +134,55 @@ func TestInstallRouteTransactionDoesNotDeleteFailedFirstAdd(t *testing.T) {
 	}
 }
 
+func TestInstallRouteTransactionOwnsAndRollsBackAddThatTimedOutAfterCreation(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{
+		failAddAt:   1,
+		addErr:      context.DeadlineExceeded,
+		createOnErr: true,
+	}
+
+	_, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline exceeded", err)
+	}
+	if !reflect.DeepEqual(op.deleteCalls, []netip.Prefix{prefix}) {
+		t.Fatalf("created route was not rolled back: %v", op.deleteCalls)
+	}
+}
+
+func TestInstallRouteTransactionPreservesBaselineRoute(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{routes: map[netip.Prefix]routeState{
+		prefix: {Exists: true, Matches: true},
+	}}
+	txn, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(op.addCalls) != 0 || len(op.deleteCalls) != 0 {
+		t.Fatalf("baseline route was mutated: add=%v delete=%v", op.addCalls, op.deleteCalls)
+	}
+}
+
+func TestInstallRouteTransactionDoesNotOwnConcurrentExistingRoute(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{
+		failAddAt:   1,
+		addErr:      ErrRouteAlreadyExists,
+		createOnErr: true,
+	}
+	if _, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix}); !errors.Is(err, ErrRouteAlreadyExists) {
+		t.Fatalf("error = %v, want route already exists", err)
+	}
+	if len(op.deleteCalls) != 0 {
+		t.Fatalf("concurrently created route was deleted: %v", op.deleteCalls)
+	}
+}
+
 func TestInstallRouteTransactionCanceledContextRollsBack(t *testing.T) {
 	op := &fakeRouteOperator{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -114,21 +196,63 @@ func TestInstallRouteTransactionCanceledContextRollsBack(t *testing.T) {
 	}
 }
 
-func TestRouteTransactionCloseIsIdempotentAndReportsCleanup(t *testing.T) {
-	op := &fakeRouteOperator{deleteErr: errors.New("injected delete failure")}
-	txn := &routeTransaction{
-		op: op,
-		installed: []netip.Prefix{
-			netip.MustParsePrefix("192.0.2.0/24"),
-			netip.MustParsePrefix("198.51.100.0/24"),
+func TestRouteTransactionCloseRetriesFailedDeletes(t *testing.T) {
+	first := netip.MustParsePrefix("192.0.2.0/24")
+	second := netip.MustParsePrefix("198.51.100.0/24")
+	op := &fakeRouteOperator{
+		routes: map[netip.Prefix]routeState{
+			first:  {Exists: true, Matches: true},
+			second: {Exists: true, Matches: true},
 		},
+		deleteFails: map[netip.Prefix]int{first: 1, second: 1},
 	}
-	first := txn.Close()
-	second := txn.Close()
-	if first == nil || second == nil || first.Error() != second.Error() {
-		t.Fatalf("idempotent errors = %v / %v", first, second)
+	txn := &routeTransaction{
+		op:        op,
+		installed: []netip.Prefix{first, second},
 	}
-	if len(op.deleteCalls) != 2 {
-		t.Fatalf("delete calls = %d, want 2", len(op.deleteCalls))
+	if err := txn.Close(); err == nil {
+		t.Fatal("first close should report both delete failures")
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatalf("completed close should be idempotent: %v", err)
+	}
+	if len(op.deleteCalls) != 4 {
+		t.Fatalf("delete calls = %d, want each failed route retried once", len(op.deleteCalls))
+	}
+	if len(op.deleteCtxs) < 2 || op.deleteCtxs[0] == op.deleteCtxs[1] {
+		t.Fatal("route deletes did not receive independent timeout contexts")
+	}
+	for idx, ctx := range op.deleteCtxs {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatalf("delete context %d has no deadline", idx)
+		}
+	}
+}
+
+func TestRouteTransactionConcurrentCloseSerializesOwnership(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{routes: map[netip.Prefix]routeState{
+		prefix: {Exists: true, Matches: true},
+	}}
+	txn := &routeTransaction{op: op, installed: []netip.Prefix{prefix}}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- txn.Close()
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(op.deleteCalls) != 1 {
+		t.Fatalf("concurrent Close deleted route %d times", len(op.deleteCalls))
 	}
 }

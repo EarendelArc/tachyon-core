@@ -17,6 +17,7 @@ type MultipathDialFunc func(ctx context.Context, localAddrs []string, remoteAddr
 
 type ClientManagerOptions struct {
 	RemoteAddr       string
+	PinnedRemotes    []net.Addr
 	LocalAddr        string
 	LocalAddrs       []string
 	PacerPPS         float64
@@ -33,6 +34,7 @@ type ClientManagerOptions struct {
 
 type ClientManager struct {
 	remoteAddr       string
+	pinnedRemotes    []net.Addr
 	localAddr        string
 	localAddrs       []string
 	pacerPPS         float64
@@ -57,8 +59,19 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 		return nil, err
 	}
 	remote := strings.TrimSpace(opts.RemoteAddr)
-	if remote == "" {
+	if remote == "" && len(opts.PinnedRemotes) == 0 {
 		return nil, errors.New("tgp remote address is required")
+	}
+	pinnedRemotes := append([]net.Addr(nil), opts.PinnedRemotes...)
+	for idx, pinned := range pinnedRemotes {
+		if pinned == nil {
+			return nil, fmt.Errorf("pinned tgp remote %d is nil", idx)
+		}
+		if opts.ValidateRemote != nil {
+			if err := opts.ValidateRemote(pinned); err != nil {
+				return nil, fmt.Errorf("validate pinned tgp remote %s: %w", pinned, err)
+			}
+		}
 	}
 	local := strings.TrimSpace(opts.LocalAddr)
 	if local == "" {
@@ -81,6 +94,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 				MaxDatagramSize:  opts.MaxDatagramSize,
 				DisableMigration: disableMigration,
 				AuthKey:          authKey,
+				ValidateRemote:   opts.ValidateRemote,
 			})
 		}
 	}
@@ -96,12 +110,14 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 				MaxDatagramSize:  opts.MaxDatagramSize,
 				DisableMigration: disableMigration,
 				AuthKey:          authKey,
+				ValidateRemote:   opts.ValidateRemote,
 			})
 		}
 	}
 	managerCtx, cancel := context.WithCancel(context.Background())
 	return &ClientManager{
 		remoteAddr:       remote,
+		pinnedRemotes:    pinnedRemotes,
 		localAddr:        local,
 		localAddrs:       localAddrs,
 		pacerPPS:         opts.PacerPPS,
@@ -150,9 +166,15 @@ func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
 		return m.session, nil
 	}
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", m.remoteAddr)
-	if err != nil {
-		return nil, fmt.Errorf("resolve tgp remote %q: %w", m.remoteAddr, err)
+	var remoteAddr net.Addr
+	var err error
+	if len(m.pinnedRemotes) > 0 {
+		remoteAddr = m.pinnedRemotes[0]
+	} else {
+		remoteAddr, err = net.ResolveUDPAddr("udp", m.remoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("resolve tgp remote %q: %w", m.remoteAddr, err)
+		}
 	}
 	if m.validateRemote != nil {
 		if err := m.validateRemote(remoteAddr); err != nil {

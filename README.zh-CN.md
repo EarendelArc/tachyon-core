@@ -2,12 +2,16 @@
 
 [English](README.md)
 
+Windows 路由以 Wintun 的稳定 LUID/interface index 和精确目标属性作为身份；接口重命名不会改变 ownership。Add 前记录 baseline，Add 后无论成功、超时或取消都读回；删除失败会保留 ownership，后续 `Close` 可重试。崩溃恢复 journal 只处理同一 Wintun 身份上已确认由 Tachyon 创建且属性完全匹配的路由。
+
+Core 在创建 TUN 和安装路由前只解析一次 Relay，并 pin 获批的 `IP:port` 集合。拨号、重连和迁移复用同一 validator，安装路由后不再依赖系统 DNS。空 `game_routes` 表示“无额外游戏目标路由”，并不表示没有 OS 状态；Windows TUN 地址和 MTU 都显式使用 `store=active`。
+
 ## 选择性游戏路由语义
 
 - Windows 客户端只会把 `client.tun.game_routes` 中显式填写的目标 CIDR 事务性地指向 Tachyon TUN；初始化失败、正常停止或安装超时都会按逆序回滚。Core 永远不会退化为全局默认路由。
 - Linux 与 macOS 当前会在创建 TUN 之前拒绝非空 `game_routes`，直到对应平台具备同等安全的事务路由实现。
 - `game_routes` 是目标 CIDR 路由，不是进程路由。同一 CIDR 上的游戏与非游戏程序都会先进入 TUN；PID 和游戏规则只能在接管后决定 TGP 或 fail-closed，无法把非游戏包重新送回原生路径。因此 Prism 必须使用尽可能窄的游戏服务器 CIDR，界面也不得宣称真正的按进程隔离。
-- Core 会在修改路由前解析 Relay 当前全部 A/AAAA 地址；任何 Relay IP 落入游戏 CIDR 都会导致启动失败。每次 TGP 重连还会再次校验实际解析地址，防止 DNS 变化导致 Relay 流量递归进入 TUN。
+- Core 会在 TUN 和路由变更前一次解析 Relay；任何获批 endpoint 落入游戏 CIDR 都会导致启动失败。后续重连与迁移只使用启动时 pin 的 endpoint 集合，不再重新查询系统 DNS。
 
 Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：它是一个独立网络核心，使用显式 JSON 配置，但协议目标是低延迟、低丢包的游戏 UDP 流量，而不是通用 TCP 代理。
 

@@ -27,6 +27,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,12 +96,12 @@ func (a *App) runClient(ctx context.Context) error {
 	if len(gameRoutes) > 0 && !tun.SelectiveRoutesSupported() {
 		return fmt.Errorf("install client.tun.game_routes: %w", tun.ErrSelectiveRoutesUnsupported)
 	}
-	relayAddrs, err := relayExclusionsForGameRoutes(
-		ctx,
-		gameRoutes,
-		clientTGPRemoteAddr(a.cfg.Client.Proxy),
-		resolveTGPRelayAddresses,
-	)
+	remoteAddr := clientTGPRemoteAddr(a.cfg.Client.Proxy)
+	relayAddrs, err := resolveTGPRelayAddresses(ctx, remoteAddr)
+	if err != nil {
+		return err
+	}
+	relayPolicy, err := newTGPRelayPolicy(remoteAddr, relayAddrs, gameRoutes)
 	if err != nil {
 		return err
 	}
@@ -129,6 +130,7 @@ func (a *App) runClient(ctx context.Context) error {
 	)
 	routeTxn, err := tun.InstallSelectiveRoutes(ctx, tun.SelectiveRouteOptions{
 		InterfaceName: tunDevice.Name(),
+		InterfaceLUID: tun.StableInterfaceLUID(tunDevice),
 		Destinations:  gameRoutes,
 		Excluded:      relayAddrs,
 	})
@@ -160,7 +162,8 @@ func (a *App) runClient(ctx context.Context) error {
 	a.logger.Info("routing engine ready", "profiles", len(gameEngine.Profiles), "config_rules", len(a.cfg.Client.Routing.Rules))
 
 	tgpManager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
-		RemoteAddr:       clientTGPRemoteAddr(a.cfg.Client.Proxy),
+		RemoteAddr:       remoteAddr,
+		PinnedRemotes:    relayPolicy.Endpoints(),
 		LocalAddrs:       clientTGPLocalAddrs(a.cfg.Client.Proxy, a.cfg.TGP.Multipath),
 		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
 		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
@@ -168,9 +171,7 @@ func (a *App) runClient(ctx context.Context) error {
 		DisableMigration: !a.cfg.TGP.ConnectionMigration,
 		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
 		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
-		ValidateRemote: func(remote net.Addr) error {
-			return validateTGPRemoteRoute(remote, gameRoutes)
-		},
+		ValidateRemote:   relayPolicy.Validate,
 		OnDatagram: func(_ context.Context, datagram tgp.TunnelDatagram) error {
 			packet, err := buildUDPPacket(datagram.RemoteAddrPort(), datagram.LocalAddrPort(), datagram.Payload)
 			if err != nil {
@@ -356,18 +357,6 @@ func resolveTGPRelayAddresses(ctx context.Context, raw string) ([]netip.Addr, er
 	return result, nil
 }
 
-func relayExclusionsForGameRoutes(
-	ctx context.Context,
-	gameRoutes []netip.Prefix,
-	remoteAddr string,
-	resolve func(context.Context, string) ([]netip.Addr, error),
-) ([]netip.Addr, error) {
-	if len(gameRoutes) == 0 {
-		return nil, nil
-	}
-	return resolve(ctx, remoteAddr)
-}
-
 func validateTGPRemoteRoute(remote net.Addr, gameRoutes []netip.Prefix) error {
 	udpAddr, ok := remote.(*net.UDPAddr)
 	if !ok || udpAddr == nil {
@@ -379,6 +368,71 @@ func validateTGPRemoteRoute(remote net.Addr, gameRoutes []netip.Prefix) error {
 	}
 	_, err := tun.PlanSelectiveRoutes(gameRoutes, []netip.Addr{addr.Unmap()})
 	return err
+}
+
+type tgpRelayPolicy struct {
+	approved   map[netip.AddrPort]struct{}
+	endpoints  []net.Addr
+	gameRoutes []netip.Prefix
+}
+
+func newTGPRelayPolicy(raw string, addrs []netip.Addr, gameRoutes []netip.Prefix) (*tgpRelayPolicy, error) {
+	_, portRaw, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse TGP relay address %q: %w", raw, err)
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("parse TGP relay port %q", portRaw)
+	}
+	policy := &tgpRelayPolicy{
+		approved:   make(map[netip.AddrPort]struct{}, len(addrs)),
+		endpoints:  make([]net.Addr, 0, len(addrs)),
+		gameRoutes: append([]netip.Prefix(nil), gameRoutes...),
+	}
+	for _, addr := range addrs {
+		addr = addr.Unmap()
+		if !addr.IsValid() {
+			continue
+		}
+		endpoint := netip.AddrPortFrom(addr, uint16(port))
+		if _, exists := policy.approved[endpoint]; exists {
+			continue
+		}
+		udpAddr := net.UDPAddrFromAddrPort(endpoint)
+		if err := validateTGPRemoteRoute(udpAddr, gameRoutes); err != nil {
+			return nil, fmt.Errorf("approve TGP relay endpoint %s: %w", endpoint, err)
+		}
+		policy.approved[endpoint] = struct{}{}
+		policy.endpoints = append(policy.endpoints, udpAddr)
+	}
+	if len(policy.endpoints) == 0 {
+		return nil, fmt.Errorf("TGP relay %q has no approved endpoints", raw)
+	}
+	return policy, nil
+}
+
+func (p *tgpRelayPolicy) Endpoints() []net.Addr {
+	return append([]net.Addr(nil), p.endpoints...)
+}
+
+func (p *tgpRelayPolicy) Validate(remote net.Addr) error {
+	if err := validateTGPRemoteRoute(remote, p.gameRoutes); err != nil {
+		return err
+	}
+	udpAddr, ok := remote.(*net.UDPAddr)
+	if !ok || udpAddr == nil {
+		return fmt.Errorf("unsupported TGP relay address type %T", remote)
+	}
+	addr, ok := netip.AddrFromSlice(udpAddr.IP)
+	if !ok || udpAddr.Port < 1 || udpAddr.Port > 65535 {
+		return fmt.Errorf("invalid TGP relay endpoint %v", remote)
+	}
+	endpoint := netip.AddrPortFrom(addr.Unmap(), uint16(udpAddr.Port))
+	if _, ok := p.approved[endpoint]; !ok {
+		return fmt.Errorf("TGP relay endpoint %s is outside the startup-pinned approved set", endpoint)
+	}
+	return nil
 }
 
 func clientHTTPAddr(cfg config.IPCConfig) string {

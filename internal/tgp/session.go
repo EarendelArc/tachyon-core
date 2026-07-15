@@ -35,6 +35,9 @@ type SessionOptions struct {
 	// DisableMigration rejects authenticated packets that arrive from a source
 	// address different from the established remote address.
 	DisableMigration bool
+	// ValidateRemote is called before the established or migrated remote
+	// endpoint is committed to session state.
+	ValidateRemote func(net.Addr) error
 }
 
 type sourceAuthorizer interface {
@@ -82,6 +85,7 @@ type DatagramSession struct {
 	fec              FECOptions
 	fecAdapt         *FECAdaptiveController
 	disableMigration bool
+	validateRemote   func(net.Addr) error
 	fecMu            sync.Mutex
 	fecTx            map[StreamID]*fecSendGroup
 	fecGroup         uint32
@@ -124,6 +128,11 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 	}
 	if opts.RemoteAddr == nil {
 		return nil, errors.New("tgp session remote address is required")
+	}
+	if opts.ValidateRemote != nil {
+		if err := opts.ValidateRemote(opts.RemoteAddr); err != nil {
+			return nil, fmt.Errorf("validate initial tgp remote %s: %w", opts.RemoteAddr, err)
+		}
 	}
 	if err := validateFECOptions(opts.FEC); err != nil {
 		return nil, err
@@ -175,6 +184,7 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		fec:              opts.FEC,
 		fecAdapt:         fecAdapt,
 		disableMigration: opts.DisableMigration,
+		validateRemote:   opts.ValidateRemote,
 		fecTx:            make(map[StreamID]*fecSendGroup),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
@@ -424,6 +434,11 @@ func (s *DatagramSession) Migrate(ctx context.Context, newAddr net.Addr) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if s.validateRemote != nil {
+		if err := s.validateRemote(newAddr); err != nil {
+			return fmt.Errorf("validate tgp migration remote %s: %w", newAddr, err)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

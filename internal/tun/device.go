@@ -76,3 +76,12 @@ func (o *Options) mtu() int {
 func New(opts Options) (Device, error) {
 	return newDevice(opts)
 }
+
+// StableInterfaceLUID returns the Windows NET_LUID captured from the Wintun
+// adapter handle. Other platforms return zero.
+func StableInterfaceLUID(device Device) uint64 {
+	if identified, ok := device.(interface{ stableInterfaceLUID() uint64 }); ok {
+		return identified.stableInterfaceLUID()
+	}
+	return 0
+}

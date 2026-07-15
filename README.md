@@ -44,11 +44,11 @@ tachyonctl health --addr 127.0.0.1:55123
   contacts one of those CIDRs enters the TUN. PID/game-profile decisions still
   decide whether a captured UDP packet may use TGP, but they cannot make the OS
   route distinguish two processes contacting the same destination CIDR.
-- With non-empty `game_routes`, every currently resolved TGP Relay A/AAAA
-  address is excluded by validation. If a Relay address overlaps a game route,
-  startup fails before TUN creation; a later DNS change into a game route is
-  rejected before a TGP reconnect. Empty `game_routes` performs no Relay DNS
-  pre-resolution and no OS route mutation.
+- Before TUN or route setup, Core resolves the TGP Relay once and pins the
+  approved `IP:port` set. Every dial, reconnect, and migration validates against
+  that set and the game CIDRs, so installed game routes never make reconnects
+  depend on system DNS. Empty `game_routes` means no additional destination
+  routes; Windows still configures the TUN address and MTU with `store=active`.
 - Client route rules support process name, CIDR, and protocol matching.
   `domain` and `geoip` rules fail validation until Core has implementations
   that can make deterministic packet-path decisions.

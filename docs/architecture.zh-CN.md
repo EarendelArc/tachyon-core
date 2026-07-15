@@ -2,13 +2,17 @@
 
 [English](architecture.md)
 
+Windows 选择性路由以 Wintun adapter LUID、interface index、目标、next hop、metric 和 protocol 作为精确身份，因此接口重命名不影响 ownership。每次 Add 前记录 baseline，Add 后无论成功、超时或取消都读回；每条删除使用独立超时，失败项保留给后续 `Close` 重试。进程崩溃后的 journal 只 reconcile 同一稳定 Wintun 身份上曾确认由 Tachyon 创建且属性完全匹配的路由。
+
+Core 在 TUN 创建和路由修改前一次解析 Relay 并 pin 获批的 `IP:port` 集合。拨号、重连和 remote 迁移均复用同一 validator，安装路由后不再依赖系统 DNS。空 `game_routes` 仅表示无额外游戏目标路由；Windows 仍以 `store=active` 配置 TUN 地址和 MTU。
+
 ## 选择性路由边界
 
 Windows 仅事务性安装 `client.tun.game_routes` 中显式列出的 IPv4/IPv6 目标路由，并在初始化失败、超时取消和正常停止时逆序删除。`0.0.0.0/0`、`::/0` 以及覆盖任一 Relay 解析地址的 CIDR 会被 fail-closed 拒绝。Linux 与 macOS 当前在创建 TUN 之前拒绝非空 `game_routes`，不会退化为全局 `auto_route`。
 
 操作系统目标路由无法区分进程。如果游戏与非游戏程序访问同一目标 CIDR，两者都会进入 Core；PID/规则引擎只能在接管后决定是否送入 TGP，不能把非游戏包重新注入原生路径。因此这不是严格的按进程隔离，Prism 必须生成尽可能窄的目标 CIDR。
 
-Core 在任何路由变更前解析 Relay 当前全部 A/AAAA 地址，并在每次 TGP 会话拨号前再次校验实际解析地址。Relay 地址一旦落入游戏 CIDR，启动或重连立即失败，避免传输递归进入自身 TUN。
+Core 在 TUN 和路由变更前一次解析 Relay 当前全部 A/AAAA 地址，并 pin 获批的 endpoint 集合。每次 TGP 会话拨号、重连和迁移都复用同一 validator；任何 endpoint 落入游戏 CIDR 或不在批准集合中都会失败，且不会在路由安装后重新查询系统 DNS。
 
 Core 有四个主要边界：
 

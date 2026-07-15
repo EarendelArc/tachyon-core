@@ -24,6 +24,7 @@ type windowsTUN struct {
 	session       uintptr
 	readWaitEvent syscall.Handle
 	name          string
+	luid          uint64
 	addrs         []netip.Prefix
 	mtu           int
 	writeMu       sync.Mutex
@@ -42,6 +43,7 @@ type wintunAPI struct {
 	releaseReceivePacket *syscall.LazyProc
 	allocateSendPacket   *syscall.LazyProc
 	sendPacket           *syscall.LazyProc
+	getAdapterLUID       *syscall.LazyProc
 }
 
 const (
@@ -66,11 +68,19 @@ func newDevice(opts Options) (Device, error) {
 		return nil, err
 	}
 
+	var luid uint64
+	api.getAdapterLUID.Call(adapter, uintptr(unsafe.Pointer(&luid)))
+	if luid == 0 {
+		api.closeAdapter.Call(adapter)
+		return nil, fmt.Errorf("WintunGetAdapterLUID returned zero")
+	}
+
 	mtu := opts.mtu()
 	tun := &windowsTUN{
 		api:     api,
 		adapter: adapter,
 		name:    name,
+		luid:    luid,
 		addrs:   append([]netip.Prefix(nil), opts.Addresses...),
 		mtu:     mtu,
 	}
@@ -85,9 +95,10 @@ func newDevice(opts Options) (Device, error) {
 	return tun, nil
 }
 
-func (t *windowsTUN) Name() string              { return t.name }
-func (t *windowsTUN) Addresses() []netip.Prefix { return append([]netip.Prefix(nil), t.addrs...) }
-func (t *windowsTUN) MTU() int                  { return t.mtu }
+func (t *windowsTUN) Name() string                { return t.name }
+func (t *windowsTUN) Addresses() []netip.Prefix   { return append([]netip.Prefix(nil), t.addrs...) }
+func (t *windowsTUN) MTU() int                    { return t.mtu }
+func (t *windowsTUN) stableInterfaceLUID() uint64 { return t.luid }
 
 func (t *windowsTUN) ReadPacket(buf []byte) (int, error) {
 	for {
@@ -179,6 +190,7 @@ func loadWintunAPI() (*wintunAPI, error) {
 		releaseReceivePacket: dll.NewProc("WintunReleaseReceivePacket"),
 		allocateSendPacket:   dll.NewProc("WintunAllocateSendPacket"),
 		sendPacket:           dll.NewProc("WintunSendPacket"),
+		getAdapterLUID:       dll.NewProc("WintunGetAdapterLUID"),
 	}
 	for name, proc := range map[string]*syscall.LazyProc{
 		"WintunCreateAdapter":        api.createAdapter,
@@ -191,6 +203,7 @@ func loadWintunAPI() (*wintunAPI, error) {
 		"WintunReleaseReceivePacket": api.releaseReceivePacket,
 		"WintunAllocateSendPacket":   api.allocateSendPacket,
 		"WintunSendPacket":           api.sendPacket,
+		"WintunGetAdapterLUID":       api.getAdapterLUID,
 	} {
 		if err := proc.Find(); err != nil {
 			return nil, fmt.Errorf("find %s in wintun.dll: %w", name, err)
@@ -246,23 +259,33 @@ func setWindowsMTU(name string, mtu int) error {
 }
 
 func addWindowsAddress(name string, prefix netip.Prefix) error {
+	args, err := windowsAddressArgs(name, prefix)
+	if err != nil {
+		return err
+	}
+	return runNetsh(args...)
+}
+
+func windowsAddressArgs(name string, prefix netip.Prefix) ([]string, error) {
 	if prefix.Addr().Is4() {
 		mask, err := ipv4Mask(prefix)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return runNetsh(
+		return []string{
 			"interface", "ipv4", "add", "address",
-			"name="+name,
-			"address="+prefix.Addr().String(),
-			"mask="+mask,
-		)
+			"name=" + name,
+			"address=" + prefix.Addr().String(),
+			"mask=" + mask,
+			"store=active",
+		}, nil
 	}
-	return runNetsh(
+	return []string{
 		"interface", "ipv6", "add", "address",
-		"interface="+name,
-		"address="+prefix.String(),
-	)
+		"interface=" + name,
+		"address=" + prefix.String(),
+		"store=active",
+	}, nil
 }
 
 func ipv4Mask(prefix netip.Prefix) (string, error) {

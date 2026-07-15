@@ -10,10 +10,14 @@ All notable changes to Tachyon Core will be documented in this file.
   back only after each route is confirmed as created by the current transaction;
   Linux and macOS fail closed before TUN creation until equivalent route
   transactions are available. Default routes remain forbidden.
-- With non-empty `game_routes`, client startup resolves every current Relay
-  A/AAAA address before changing routes, rejects any Relay/game-CIDR overlap,
-  and validates the actual Relay endpoint again before each TGP session dial.
-  An empty route list performs no Relay pre-resolution or OS route mutation.
+- Client startup resolves the Relay once before TUN setup and pins the approved
+  endpoints. Every dial, reconnect, and migration reuses the same validator;
+  no post-route DNS lookup can recurse through a game CIDR. Empty `game_routes`
+  means no additional destination routes, while Windows TUN addresses and MTU
+  remain explicit `store=active` OS state.
+- Windows selective routes now use Wintun LUID/IP Helper identity, exact
+  baseline/readback ownership, retryable per-route cleanup, and an auditable
+  crash journal that reconciles only matching routes on the same adapter.
 - TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
   budget, carries relay time for path-request clock alignment, rejects v1/v2
   peers, and records oversized receive drops.

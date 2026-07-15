@@ -130,6 +130,44 @@ func TestClientManagerValidatesResolvedRemoteBeforeDial(t *testing.T) {
 	}
 }
 
+func TestClientManagerUsesPinnedRemoteWithoutReconnectDNS(t *testing.T) {
+	pinned := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 443}
+	validated := 0
+	dials := 0
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr:    "must-not-resolve.invalid:443",
+		PinnedRemotes: []net.Addr{pinned},
+		ValidateRemote: func(remote net.Addr) error {
+			validated++
+			if remote.String() != pinned.String() {
+				t.Fatalf("validated remote = %s, want pinned %s", remote, pinned)
+			}
+			return nil
+		},
+		Dial: func(_ context.Context, _ string, _ net.Addr, _ float64) (Session, error) {
+			dials++
+			return &fakeSession{state: SessionEstablished}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.sessionFor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.(*fakeSession).state = SessionClosed
+	if _, err := manager.sessionFor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dials != 2 {
+		t.Fatalf("dials = %d, want reconnect dial", dials)
+	}
+	if validated != 3 {
+		t.Fatalf("validator calls = %d, want construction plus every dial", validated)
+	}
+}
+
 func TestClientManagerLoopbackHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

@@ -200,6 +200,40 @@ func TestDatagramSessionRejectsSourceChangeWhenMigrationDisabled(t *testing.T) {
 	}
 }
 
+func TestDatagramSessionValidatesMigrationBeforeRemoteUpdate(t *testing.T) {
+	initialAddr := mustUDPAddr(t, "127.0.0.1:30200")
+	approvedAddr := mustUDPAddr(t, "127.0.0.1:30201")
+	rejectedAddr := mustUDPAddr(t, "203.0.113.9:30201")
+	transport := newMigrationTestTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		Transport:  transport,
+		RemoteAddr: initialAddr,
+		Pacer:      NewTokenBucketPacer(100000),
+		ValidateRemote: func(remote net.Addr) error {
+			if sameAddr(remote, rejectedAddr) {
+				return errors.New("outside pinned relay set")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := session.Migrate(context.Background(), rejectedAddr); err == nil {
+		t.Fatal("unapproved migration succeeded")
+	}
+	session.mu.RLock()
+	remoteAfterReject := session.remote
+	session.mu.RUnlock()
+	if !sameAddr(remoteAfterReject, initialAddr) {
+		t.Fatalf("remote changed after rejected migration: %s", remoteAfterReject)
+	}
+	if err := session.Migrate(context.Background(), approvedAddr); err != nil {
+		t.Fatalf("approved migration: %v", err)
+	}
+}
+
 func TestDatagramSessionDropsDuplicatePacketNumbers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

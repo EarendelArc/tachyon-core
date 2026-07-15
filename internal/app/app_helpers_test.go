@@ -55,44 +55,6 @@ func TestResolveTGPRelayAddressesAcceptsIPLiteralWithoutDNS(t *testing.T) {
 	}
 }
 
-func TestRelayExclusionsSkipResolutionWithoutGameRoutes(t *testing.T) {
-	called := false
-	got, err := relayExclusionsForGameRoutes(
-		context.Background(),
-		nil,
-		"unresolvable.invalid:443",
-		func(context.Context, string) ([]netip.Addr, error) {
-			called = true
-			return nil, errors.New("injected DNS failure")
-		},
-	)
-	if err != nil {
-		t.Fatalf("empty game routes must not depend on Relay DNS: %v", err)
-	}
-	if called {
-		t.Fatal("Relay resolver called for empty game routes")
-	}
-	if len(got) != 0 {
-		t.Fatalf("exclusions = %v, want empty", got)
-	}
-}
-
-func TestRelayExclusionsFailClosedOnResolutionFailureWithGameRoutes(t *testing.T) {
-	routes := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
-	injected := errors.New("injected DNS failure")
-	_, err := relayExclusionsForGameRoutes(
-		context.Background(),
-		routes,
-		"relay.example.invalid:443",
-		func(context.Context, string) ([]netip.Addr, error) {
-			return nil, injected
-		},
-	)
-	if !errors.Is(err, injected) {
-		t.Fatalf("error = %v, want injected DNS failure", err)
-	}
-}
-
 func TestValidateTGPRemoteRouteRejectsRelayRecursion(t *testing.T) {
 	routes := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
 	err := validateTGPRemoteRoute(&net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 443}, routes)
@@ -101,6 +63,32 @@ func TestValidateTGPRemoteRouteRejectsRelayRecursion(t *testing.T) {
 	}
 	if err := validateTGPRemoteRoute(&net.UDPAddr{IP: net.ParseIP("198.51.100.9"), Port: 443}, routes); err != nil {
 		t.Fatalf("non-overlapping relay rejected: %v", err)
+	}
+}
+
+func TestTGPRelayPolicyPinsApprovedEndpoints(t *testing.T) {
+	policy, err := newTGPRelayPolicy(
+		"relay.example:443",
+		[]netip.Addr{netip.MustParseAddr("198.51.100.9"), netip.MustParseAddr("2001:db8::9")},
+		[]netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(policy.Endpoints()) != 2 {
+		t.Fatalf("pinned endpoints = %v", policy.Endpoints())
+	}
+	if err := policy.Validate(&net.UDPAddr{IP: net.ParseIP("198.51.100.9"), Port: 443}); err != nil {
+		t.Fatalf("approved endpoint rejected: %v", err)
+	}
+	if err := policy.Validate(&net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 443}); err == nil {
+		t.Fatal("unapproved relay IP accepted")
+	}
+	if err := policy.Validate(&net.UDPAddr{IP: net.ParseIP("198.51.100.9"), Port: 444}); err == nil {
+		t.Fatal("unapproved relay port accepted")
+	}
+	if err := policy.Validate(&net.UDPAddr{IP: net.ParseIP("203.0.113.8"), Port: 443}); !errors.Is(err, tun.ErrRelayRouteConflict) {
+		t.Fatalf("game route migration error = %v", err)
 	}
 }
 

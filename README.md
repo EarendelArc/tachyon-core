@@ -34,11 +34,21 @@ tachyonctl health --addr 127.0.0.1:55123
 - Xray has no runtime or build-time dependency inside Tachyon Core.
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.
-- Client TUN is currently TGP-only: `auto_route=true`, `dns_hijack=true`, and
+- Client TUN is TGP-only: `auto_route=true`, `dns_hijack=true`, and
   `tgp_only=false` fail config validation because Core has no native direct or
-  DNS forwarding path. The OS integration must install selective routes for
-  candidate game UDP destinations; Core still needs TUN/Wintun and the required
-  privileges to process those selected packets.
+  DNS forwarding path. On Windows, Core transactionally installs only the
+  explicit CIDRs in `client.tun.game_routes`; Linux and macOS currently reject
+  non-empty `game_routes` before creating a TUN. Core never falls back to a
+  default route.
+- `game_routes` are destination routes, not process routes. Every process that
+  contacts one of those CIDRs enters the TUN. PID/game-profile decisions still
+  decide whether a captured UDP packet may use TGP, but they cannot make the OS
+  route distinguish two processes contacting the same destination CIDR.
+- With non-empty `game_routes`, every currently resolved TGP Relay A/AAAA
+  address is excluded by validation. If a Relay address overlaps a game route,
+  startup fails before TUN creation; a later DNS change into a game route is
+  rejected before a TGP reconnect. Empty `game_routes` performs no Relay DNS
+  pre-resolution and no OS route mutation.
 - Client route rules support process name, CIDR, and protocol matching.
   `domain` and `geoip` rules fail validation until Core has implementations
   that can make deterministic packet-path decisions.
@@ -80,7 +90,8 @@ Windows hosts.
 | Linux TUN and PID tracking | Done |
 | Windows PID tracking | Done |
 | macOS TUN | Done |
-| Windows TUN | Alpha dynamic Wintun backend |
+| Windows TUN | Alpha dynamic Wintun backend with transactional destination routes |
+| Linux/macOS selective destination routes | Fail-closed; not enabled yet |
 | macOS PID tracking | Alpha lsof/ps backend |
 | TGP X25519 handshake and AEAD | Done |
 | Multipath transport adapter | Done; interface discovery not wired |
@@ -104,13 +115,14 @@ mise exec -- go run ./cmd/tachyon-core preflight --config client.json --json
 `tachyon-core doctor` is a read-only preflight command intended for Prism
 startup orchestration. `tachyon-core preflight` is an equivalent alias; use
 whichever command name is clearer for the caller. Both commands load and
-validate the config, report the current `auto_route` and `dns_hijack` values,
+validate the config, report `game_routes` and the current TUN safety flags,
 explain whether client mode requires TUN, and emit stable JSON checks such as
 `CONFIG_VALID`,
 `CLIENT_REQUIRES_TUN`, `WINTUN_DLL_PRESENT`, `TUN_DEVICE_PRESENT`,
-`TUN_PRIVILEGE`, and `AUTO_ROUTE_DISABLED`. They do not create a persistent TUN
-adapter, change routes, start services, launch the daemon, or alter firewall,
-system proxy, Docker, systemd, or packet filter state.
+`TUN_PRIVILEGE`, and `SELECTIVE_ROUTES_SUPPORTED`. Linux and macOS report a
+non-empty `game_routes` list as a fail-closed startup error. The checks do not
+create a persistent TUN adapter, change routes, start services, launch the
+daemon, or alter firewall, system proxy, Docker, systemd, or packet filter state.
 
 Before deploying a VPS, run the local TGP relay smoke test:
 

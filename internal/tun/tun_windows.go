@@ -78,7 +78,7 @@ func newDevice(opts Options) (Device, error) {
 		_ = tun.Close()
 		return nil, err
 	}
-	if err := configureWindowsInterface(name, opts.Addresses, mtu, opts.AutoRoute); err != nil {
+	if err := configureWindowsInterface(name, opts.Addresses, mtu); err != nil {
 		_ = tun.Close()
 		return nil, err
 	}
@@ -224,17 +224,12 @@ func (api *wintunAPI) createOrOpenAdapter(name string) (uintptr, error) {
 	return 0, fmt.Errorf("WintunCreateAdapter: %w; WintunOpenAdapter: %w", syscallErr(createErr), syscallErr(openErr))
 }
 
-func configureWindowsInterface(name string, addrs []netip.Prefix, mtu int, autoRoute bool) error {
+func configureWindowsInterface(name string, addrs []netip.Prefix, mtu int) error {
 	if err := setWindowsMTU(name, mtu); err != nil {
 		return err
 	}
 	for _, prefix := range addrs {
 		if err := addWindowsAddress(name, prefix); err != nil {
-			return err
-		}
-	}
-	if autoRoute {
-		if err := addWindowsDefaultRoute(name); err != nil {
 			return err
 		}
 	}
@@ -267,17 +262,6 @@ func addWindowsAddress(name string, prefix netip.Prefix) error {
 		"interface", "ipv6", "add", "address",
 		"interface="+name,
 		"address="+prefix.String(),
-	)
-}
-
-func addWindowsDefaultRoute(name string) error {
-	return runNetsh(
-		"interface", "ipv4", "add", "route",
-		"0.0.0.0/0",
-		"interface="+name,
-		"nexthop=0.0.0.0",
-		"metric=1",
-		"store=active",
 	)
 }
 

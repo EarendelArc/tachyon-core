@@ -27,6 +27,7 @@ type ClientManagerOptions struct {
 	HandshakeTimeout time.Duration
 	Dial             DialFunc
 	DialMultipath    MultipathDialFunc
+	ValidateRemote   func(net.Addr) error
 	OnDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 }
 
@@ -39,6 +40,7 @@ type ClientManager struct {
 	handshakeTimeout time.Duration
 	dial             DialFunc
 	dialMultipath    MultipathDialFunc
+	validateRemote   func(net.Addr) error
 	onDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 
 	mu      sync.Mutex
@@ -107,6 +109,7 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 		handshakeTimeout: timeout,
 		dial:             dial,
 		dialMultipath:    dialMultipath,
+		validateRemote:   opts.ValidateRemote,
 		onDatagram:       opts.OnDatagram,
 		ctx:              managerCtx,
 		cancel:           cancel,
@@ -150,6 +153,11 @@ func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
 	remoteAddr, err := net.ResolveUDPAddr("udp", m.remoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve tgp remote %q: %w", m.remoteAddr, err)
+	}
+	if m.validateRemote != nil {
+		if err := m.validateRemote(remoteAddr); err != nil {
+			return nil, fmt.Errorf("validate tgp remote %s: %w", remoteAddr, err)
+		}
 	}
 	dialCtx := ctx
 	cancel := func() {}

@@ -30,8 +30,6 @@ type PlatformFacts struct {
 
 	DarwinIfconfigFound bool
 	DarwinIfconfigPath  string
-	DarwinRouteFound    bool
-	DarwinRoutePath     string
 }
 
 func CurrentPlatformFacts() PlatformFacts {
@@ -84,13 +82,6 @@ func fillDarwinFacts(facts *PlatformFacts) {
 	} else if _, err := os.Stat("/sbin/ifconfig"); err == nil {
 		facts.DarwinIfconfigFound = true
 		facts.DarwinIfconfigPath = "/sbin/ifconfig"
-	}
-	if path, err := exec.LookPath("route"); err == nil {
-		facts.DarwinRouteFound = true
-		facts.DarwinRoutePath = path
-	} else if _, err := os.Stat("/sbin/route"); err == nil {
-		facts.DarwinRouteFound = true
-		facts.DarwinRoutePath = "/sbin/route"
 	}
 }
 
@@ -265,7 +256,7 @@ func darwinChecks(facts PlatformFacts) []Check {
 		{
 			ID:          CheckTUNPrivilege,
 			Status:      StatusWarn,
-			Message:     "macOS utun readiness is checked read-only; Core may still need permission to create utun and configure it with ifconfig/route at startup.",
+			Message:     "macOS utun readiness is checked read-only; Core may still need permission to create utun and configure it with ifconfig at startup.",
 			Remediation: "If startup fails, run through Prism's privileged helper, Network Extension path, or another approved elevation flow.",
 		},
 	}
@@ -282,21 +273,6 @@ func darwinChecks(facts PlatformFacts) []Check {
 			Status:      StatusWarn,
 			Message:     "ifconfig was not found in PATH or /sbin/ifconfig.",
 			Remediation: "Ensure Core can execute /sbin/ifconfig when client mode configures utun addresses and MTU.",
-		})
-	}
-	if facts.DarwinRouteFound {
-		checks = append(checks, Check{
-			ID:          CheckRoutePresent,
-			Status:      StatusOK,
-			Message:     fmt.Sprintf("route is available at %s.", facts.DarwinRoutePath),
-			Remediation: "",
-		})
-	} else {
-		checks = append(checks, Check{
-			ID:          CheckRoutePresent,
-			Status:      StatusWarn,
-			Message:     "route was not found in PATH or /sbin/route.",
-			Remediation: "Ensure Core can execute /sbin/route if auto_route is enabled.",
 		})
 	}
 	return checks

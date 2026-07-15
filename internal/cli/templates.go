@@ -10,7 +10,8 @@ const ClientConfigTemplate = `{
       "mtu": 1280,
       "auto_route": false,
       "dns_hijack": false,
-      "tgp_only": true
+      "tgp_only": true,
+      "game_routes": []
     },
     "routing": {
       "default_action": "direct",

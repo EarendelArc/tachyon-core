@@ -24,9 +24,8 @@ const (
 	CheckWintunDLLPresent  = "WINTUN_DLL_PRESENT"
 	CheckTUNDevicePresent  = "TUN_DEVICE_PRESENT"
 	CheckTUNPrivilege      = "TUN_PRIVILEGE"
-	CheckAutoRouteDisabled = "AUTO_ROUTE_DISABLED"
+	CheckSelectiveRoutes   = "SELECTIVE_ROUTES_SUPPORTED"
 	CheckIfconfigPresent   = "IFCONFIG_PRESENT"
-	CheckRoutePresent      = "ROUTE_PRESENT"
 )
 
 type Report struct {
@@ -38,6 +37,7 @@ type Report struct {
 	ClientRequiresTUN bool          `json:"client_requires_tun"`
 	AutoRoute         bool          `json:"auto_route"`
 	DNSHijack         bool          `json:"dns_hijack"`
+	GameRoutes        []string      `json:"game_routes,omitempty"`
 	Platform          Platform      `json:"platform"`
 	Checks            []Check       `json:"checks"`
 }
@@ -54,11 +54,12 @@ type ConfigSummary struct {
 }
 
 type ClientSummary struct {
-	Applicable  bool `json:"applicable"`
-	Valid       bool `json:"valid"`
-	RequiresTUN bool `json:"requires_tun"`
-	AutoRoute   bool `json:"auto_route"`
-	DNSHijack   bool `json:"dns_hijack"`
+	Applicable  bool     `json:"applicable"`
+	Valid       bool     `json:"valid"`
+	RequiresTUN bool     `json:"requires_tun"`
+	AutoRoute   bool     `json:"auto_route"`
+	DNSHijack   bool     `json:"dns_hijack"`
+	GameRoutes  []string `json:"game_routes,omitempty"`
 }
 
 type ServerSummary struct {
@@ -141,13 +142,15 @@ func RunWithFacts(configPath string, facts PlatformFacts) Report {
 		report.Client.RequiresTUN = true
 		report.Client.AutoRoute = cfg.Client.TUN.AutoRoute
 		report.Client.DNSHijack = cfg.Client.TUN.DNSHijack
+		report.GameRoutes = append([]string(nil), cfg.Client.TUN.GameRoutes...)
+		report.Client.GameRoutes = append([]string(nil), cfg.Client.TUN.GameRoutes...)
 		report.Checks = append(report.Checks, Check{
 			ID:          CheckClientRequiresTUN,
 			Status:      StatusOK,
 			Message:     "Client mode starts a TUN device before the packet pipeline.",
 			Remediation: "",
 		})
-		report.Checks = append(report.Checks, autoRouteCheck(cfg.Client.TUN.AutoRoute))
+		report.Checks = append(report.Checks, selectiveRoutesCheck(facts.OS, cfg.Client.TUN.GameRoutes))
 		report.Checks = append(report.Checks, platformChecks(facts, true)...)
 	} else {
 		report.Checks = append(report.Checks, Check{
@@ -157,9 +160,9 @@ func RunWithFacts(configPath string, facts PlatformFacts) Report {
 			Remediation: "",
 		})
 		report.Checks = append(report.Checks, Check{
-			ID:          CheckAutoRouteDisabled,
+			ID:          CheckSelectiveRoutes,
 			Status:      StatusSkipped,
-			Message:     "auto_route is only meaningful for client TUN mode.",
+			Message:     "Selective game routes are only applicable to client mode.",
 			Remediation: "",
 		})
 		report.Checks = append(report.Checks, platformChecks(facts, false)...)
@@ -169,20 +172,28 @@ func RunWithFacts(configPath string, facts PlatformFacts) Report {
 	return report
 }
 
-func autoRouteCheck(autoRoute bool) Check {
-	if autoRoute {
+func selectiveRoutesCheck(goos string, routes []string) Check {
+	if len(routes) == 0 {
 		return Check{
-			ID:          CheckAutoRouteDisabled,
-			Status:      StatusError,
-			Message:     "auto_route=true is unsafe because Core has no native direct forwarding path.",
-			Remediation: "Set auto_route=false and install OS-level selective routes only for intended game UDP destinations.",
+			ID:          CheckSelectiveRoutes,
+			Status:      StatusOK,
+			Message:     "client.tun.game_routes is empty; Core will not resolve the Relay or install OS destination routes during startup.",
+			Remediation: "",
+		}
+	}
+	if goos == "windows" {
+		return Check{
+			ID:          CheckSelectiveRoutes,
+			Status:      StatusOK,
+			Message:     fmt.Sprintf("Windows supports transactional installation of %d configured selective game route(s).", len(routes)),
+			Remediation: "",
 		}
 	}
 	return Check{
-		ID:          CheckAutoRouteDisabled,
-		Status:      StatusOK,
-		Message:     "auto_route=false keeps non-selected traffic on the native OS path; Core still requires TUN for selectively routed game UDP.",
-		Remediation: "Install and verify OS-level selective game routes before expecting traffic to enter Core.",
+		ID:          CheckSelectiveRoutes,
+		Status:      StatusError,
+		Message:     fmt.Sprintf("client.tun.game_routes is non-empty, but selective route transactions are unsupported on %s; client startup fails closed before TUN creation.", goos),
+		Remediation: "Leave client.tun.game_routes empty on this platform or run the client on Windows until equivalent transactional route support is implemented.",
 	}
 }
 

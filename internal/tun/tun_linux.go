@@ -75,13 +75,6 @@ func newDevice(opts Options) (Device, error) {
 		return nil, fmt.Errorf("link up: %w", err)
 	}
 
-	if opts.AutoRoute {
-		if err := addDefaultRoute(ifaceName); err != nil {
-			// Non-fatal: log and continue.
-			fmt.Fprintf(os.Stderr, "warn: add default route: %v\n", err)
-		}
-	}
-
 	return &linuxTUN{
 		file:  fd,
 		name:  ifaceName,
@@ -129,12 +122,6 @@ func setAddresses(iface string, addrs []netip.Prefix) error {
 
 func setLinkUp(iface string) error {
 	return runIP("link", "set", "dev", iface, "up")
-}
-
-func addDefaultRoute(iface string) error {
-	// Add routes for both IPv4 and IPv6 if needed.
-	_ = runIP("route", "add", "default", "dev", iface)
-	return nil
 }
 
 func runIP(args ...string) error {

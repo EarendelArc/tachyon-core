@@ -5,6 +5,15 @@ All notable changes to Tachyon Core will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- Client capture now uses explicit destination CIDRs from
+  `client.tun.game_routes`. Windows installs them transactionally and rolls
+  back only after each route is confirmed as created by the current transaction;
+  Linux and macOS fail closed before TUN creation until equivalent route
+  transactions are available. Default routes remain forbidden.
+- With non-empty `game_routes`, client startup resolves every current Relay
+  A/AAAA address before changing routes, rejects any Relay/game-CIDR overlap,
+  and validates the actual Relay endpoint again before each TGP session dial.
+  An empty route list performs no Relay pre-resolution or OS route mutation.
 - TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
   budget, carries relay time for path-request clock alignment, rejects v1/v2
   peers, and records oversized receive drops.
@@ -27,6 +36,8 @@ All notable changes to Tachyon Core will be documented in this file.
   again after insertion-order eviction.
 
 ### Added
+- Added a platform-neutral selective-route planner and fault-injectable route
+  transaction with reverse-order, idempotent cleanup.
 - Added stateless source-bound path cookies with a bounded per-session response
   replay set, eliminating PathRequest-controlled global pending state.
 - Added client multipath source authorization for configured relay endpoints.

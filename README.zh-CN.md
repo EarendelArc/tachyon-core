@@ -2,6 +2,13 @@
 
 [English](README.md)
 
+## 选择性游戏路由语义
+
+- Windows 客户端只会把 `client.tun.game_routes` 中显式填写的目标 CIDR 事务性地指向 Tachyon TUN；初始化失败、正常停止或安装超时都会按逆序回滚。Core 永远不会退化为全局默认路由。
+- Linux 与 macOS 当前会在创建 TUN 之前拒绝非空 `game_routes`，直到对应平台具备同等安全的事务路由实现。
+- `game_routes` 是目标 CIDR 路由，不是进程路由。同一 CIDR 上的游戏与非游戏程序都会先进入 TUN；PID 和游戏规则只能在接管后决定 TGP 或 fail-closed，无法把非游戏包重新送回原生路径。因此 Prism 必须使用尽可能窄的游戏服务器 CIDR，界面也不得宣称真正的按进程隔离。
+- Core 会在修改路由前解析 Relay 当前全部 A/AAAA 地址；任何 Relay IP 落入游戏 CIDR 都会导致启动失败。每次 TGP 重连还会再次校验实际解析地址，防止 DNS 变化导致 Relay 流量递归进入 TUN。
+
 Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：它是一个独立网络核心，使用显式 JSON 配置，但协议目标是低延迟、低丢包的游戏 UDP 流量，而不是通用 TCP 代理。
 
 ```bash

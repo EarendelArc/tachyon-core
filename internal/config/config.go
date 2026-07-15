@@ -103,6 +103,11 @@ type TUNConfig struct {
 	// TGPOnly rejects captured direct traffic instead of silently consuming it.
 	// It must remain enabled; OS integration owns selective route installation.
 	TGPOnly bool `yaml:"tgp_only" json:"tgp_only"`
+
+	// GameRoutes is the explicit destination-CIDR allow-list installed toward
+	// the TUN. OS routes are destination based and therefore also capture
+	// non-game processes that contact the same CIDR.
+	GameRoutes []string `yaml:"game_routes,omitempty" json:"game_routes,omitempty"`
 }
 
 // RoutingConfig defines how traffic is classified into routing decisions.
@@ -516,7 +521,27 @@ func validateClientDataPath(cfg ClientConfig) error {
 	if !cfg.TUN.TGPOnly {
 		return fmt.Errorf("client.tun.tgp_only must be true because captured direct traffic cannot be forwarded safely")
 	}
+	if err := validateGameRoutes(cfg.TUN.GameRoutes); err != nil {
+		return err
+	}
 	return validateRoutingConfig(cfg.Routing)
+}
+
+func validateGameRoutes(routes []string) error {
+	for idx, raw := range routes {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return fmt.Errorf("client.tun.game_routes[%d] must not be empty", idx)
+		}
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return fmt.Errorf("client.tun.game_routes[%d] %q is invalid: %w", idx, raw, err)
+		}
+		if prefix.Bits() == 0 {
+			return fmt.Errorf("client.tun.game_routes[%d] must not be a default route", idx)
+		}
+	}
+	return nil
 }
 
 func validateRoutingConfig(cfg RoutingConfig) error {

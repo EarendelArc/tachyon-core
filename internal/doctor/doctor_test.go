@@ -52,14 +52,14 @@ func TestRunWithFactsClientJSONSchemaAndStatus(t *testing.T) {
 	if parsed.OverallStatus != "ok" {
 		t.Fatalf("json overall_status = %q", parsed.OverallStatus)
 	}
-	for _, id := range []string{CheckConfigValid, CheckClientRequiresTUN, CheckAutoRouteDisabled, CheckTUNDevicePresent, CheckTUNPrivilege} {
+	for _, id := range []string{CheckConfigValid, CheckClientRequiresTUN, CheckSelectiveRoutes, CheckTUNDevicePresent, CheckTUNPrivilege} {
 		if !hasCheck(report.Checks, id) {
 			t.Fatalf("missing check id %s in %#v", id, report.Checks)
 		}
 	}
 }
 
-func TestRunWithFactsAutoRouteFalseRequiresSelectiveRoutes(t *testing.T) {
+func TestRunWithFactsEmptyGameRoutesNeedsNoRouteSupport(t *testing.T) {
 	path := writeClientConfig(t, false)
 	report := RunWithFacts(path, PlatformFacts{
 		OS:               "linux",
@@ -73,12 +73,66 @@ func TestRunWithFactsAutoRouteFalseRequiresSelectiveRoutes(t *testing.T) {
 	if report.OverallStatus != StatusOK {
 		t.Fatalf("overall_status = %q, want ok", report.OverallStatus)
 	}
-	check := findCheck(report.Checks, CheckAutoRouteDisabled)
+	check := findCheck(report.Checks, CheckSelectiveRoutes)
 	if check.Status != StatusOK {
-		t.Fatalf("AUTO_ROUTE_DISABLED status = %q, want ok", check.Status)
+		t.Fatalf("SELECTIVE_ROUTES_SUPPORTED status = %q, want ok", check.Status)
 	}
-	if !strings.Contains(check.Message, "selectively routed game UDP") || !strings.Contains(check.Remediation, "selective game routes") {
-		t.Fatalf("auto_route=false check does not explain selective routing: %#v", check)
+	if !strings.Contains(check.Message, "will not resolve the Relay") || check.Remediation != "" {
+		t.Fatalf("empty game_routes check does not explain no-op startup: %#v", check)
+	}
+}
+
+func TestRunWithFactsNonEmptyGameRoutesMatchPlatformSupport(t *testing.T) {
+	path := writeClientConfig(t, false, "203.0.113.0/24")
+	tests := []struct {
+		name       string
+		facts      PlatformFacts
+		wantStatus Status
+		wantText   string
+	}{
+		{
+			name: "Windows supported",
+			facts: PlatformFacts{
+				OS:                "windows",
+				Arch:              "amd64",
+				WintunDLLFound:    true,
+				WindowsAdminKnown: true,
+				WindowsAdmin:      true,
+			},
+			wantStatus: StatusOK,
+			wantText:   "supports transactional installation",
+		},
+		{
+			name: "Linux fails closed",
+			facts: PlatformFacts{
+				OS:               "linux",
+				Arch:             "amd64",
+				LinuxTunExists:   true,
+				LinuxTunOpenable: true,
+				LinuxCAPKnown:    true,
+				LinuxCAPNetAdmin: true,
+			},
+			wantStatus: StatusError,
+			wantText:   "unsupported on linux; client startup fails closed before TUN creation",
+		},
+		{
+			name:       "macOS fails closed",
+			facts:      PlatformFacts{OS: "darwin", Arch: "arm64", DarwinIfconfigFound: true, DarwinIfconfigPath: "/sbin/ifconfig"},
+			wantStatus: StatusError,
+			wantText:   "unsupported on darwin; client startup fails closed before TUN creation",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report := RunWithFacts(path, tt.facts)
+			check := findCheck(report.Checks, CheckSelectiveRoutes)
+			if check.Status != tt.wantStatus || !strings.Contains(check.Message, tt.wantText) {
+				t.Fatalf("selective route check = %#v", check)
+			}
+			if tt.wantStatus == StatusError && report.OverallStatus != StatusError {
+				t.Fatalf("overall_status = %q, want error", report.OverallStatus)
+			}
+		})
 	}
 }
 
@@ -188,8 +242,6 @@ func TestDarwinChecksArePureAndReadOnlyWarning(t *testing.T) {
 		OS:                  "darwin",
 		DarwinIfconfigFound: true,
 		DarwinIfconfigPath:  "/sbin/ifconfig",
-		DarwinRouteFound:    true,
-		DarwinRoutePath:     "/sbin/route",
 	})
 
 	priv := findCheck(checks, CheckTUNPrivilege)
@@ -199,8 +251,10 @@ func TestDarwinChecksArePureAndReadOnlyWarning(t *testing.T) {
 	if findCheck(checks, CheckIfconfigPresent).Status != StatusOK {
 		t.Fatalf("ifconfig should be ok: %#v", checks)
 	}
-	if findCheck(checks, CheckRoutePresent).Status != StatusOK {
-		t.Fatalf("route should be ok: %#v", checks)
+	for _, check := range checks {
+		if strings.Contains(check.Message, "/sbin/route") || strings.Contains(check.Message, "auto_route") {
+			t.Fatalf("Darwin check contains an obsolete route hint: %#v", check)
+		}
 	}
 }
 
@@ -218,19 +272,24 @@ func TestReadCapNetAdmin(t *testing.T) {
 	}
 }
 
-func writeClientConfig(t *testing.T, autoRoute bool) string {
+func writeClientConfig(t *testing.T, autoRoute bool, gameRoutes ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "client.json")
 	autoRouteValue := "false"
 	if autoRoute {
 		autoRouteValue = "true"
 	}
+	routesJSON, err := json.Marshal(gameRoutes)
+	if err != nil {
+		t.Fatalf("marshal game routes: %v", err)
+	}
 	data := `{
   "mode": "client",
   "client": {
     "tun": {
       "auto_route": ` + autoRouteValue + `,
-      "dns_hijack": false
+      "dns_hijack": false,
+      "game_routes": ` + string(routesJSON) + `
     },
     "proxy": {
       "server_addr": "game.example.com:443"

@@ -638,6 +638,27 @@ func TestValidateClientDataPathFailsClosed(t *testing.T) {
 			wantErr: "client.tun.tgp_only must be true",
 		},
 		{
+			name: "default IPv4 game route",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.GameRoutes = []string{"0.0.0.0/0"}
+			},
+			wantErr: "must not be a default route",
+		},
+		{
+			name: "default IPv6 game route",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.GameRoutes = []string{"::/0"}
+			},
+			wantErr: "must not be a default route",
+		},
+		{
+			name: "invalid game route",
+			mutate: func(cfg *Config) {
+				cfg.Client.TUN.GameRoutes = []string{"not-a-cidr"}
+			},
+			wantErr: "client.tun.game_routes[0]",
+		},
+		{
 			name: "domain rule",
 			mutate: func(cfg *Config) {
 				cfg.Client.Routing.Rules = []RouteRule{{Domain: "game.example.com", Action: "tgp"}}
@@ -681,6 +702,7 @@ func TestValidateClientDataPathFailsClosed(t *testing.T) {
 
 func TestValidateClientDataPathAcceptsSupportedIPv4AndIPv6CIDRs(t *testing.T) {
 	cfg := validClientDataPathConfig()
+	cfg.Client.TUN.GameRoutes = []string{"203.0.113.0/24", "2001:db8:1::/48"}
 	cfg.Client.Routing.Rules = []RouteRule{
 		{CIDR: "203.0.113.0/24", Action: "direct"},
 		{CIDR: "2001:db8::/32", Protocol: "udp", Action: "tgp"},

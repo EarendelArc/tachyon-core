@@ -56,9 +56,6 @@ type Options struct {
 	// MTU defaults to 1280 if zero.
 	MTU int
 
-	// AutoRoute installs a default route (0.0.0.0/0) pointing at this interface.
-	AutoRoute bool
-
 	// DNSHijack adds a rule that forwards UDP/53 through the TUN pipeline.
 	DNSHijack bool
 }

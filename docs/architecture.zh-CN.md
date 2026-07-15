@@ -2,6 +2,14 @@
 
 [English](architecture.md)
 
+## 选择性路由边界
+
+Windows 仅事务性安装 `client.tun.game_routes` 中显式列出的 IPv4/IPv6 目标路由，并在初始化失败、超时取消和正常停止时逆序删除。`0.0.0.0/0`、`::/0` 以及覆盖任一 Relay 解析地址的 CIDR 会被 fail-closed 拒绝。Linux 与 macOS 当前在创建 TUN 之前拒绝非空 `game_routes`，不会退化为全局 `auto_route`。
+
+操作系统目标路由无法区分进程。如果游戏与非游戏程序访问同一目标 CIDR，两者都会进入 Core；PID/规则引擎只能在接管后决定是否送入 TGP，不能把非游戏包重新注入原生路径。因此这不是严格的按进程隔离，Prism 必须生成尽可能窄的目标 CIDR。
+
+Core 在任何路由变更前解析 Relay 当前全部 A/AAAA 地址，并在每次 TGP 会话拨号前再次校验实际解析地址。Relay 地址一旦落入游戏 CIDR，启动或重连立即失败，避免传输递归进入自身 TUN。
+
 Core 有四个主要边界：
 
 1. TUN 栈：接管数据包并还原流元数据。

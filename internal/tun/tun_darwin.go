@@ -126,10 +126,6 @@ func newDevice(opts Options) (Device, error) {
 		return nil, fmt.Errorf("set mtu: %w", err)
 	}
 
-	if opts.AutoRoute {
-		_ = runRoute("add", "default", "-interface", name)
-	}
-
 	return &darwinTUN{
 		conn:  f,
 		name:  name,
@@ -197,10 +193,6 @@ func broadcastFor(prefix netip.Prefix) string {
 
 func runIfconfig(args ...string) error {
 	return execCommand("/sbin/ifconfig", args...)
-}
-
-func runRoute(args ...string) error {
-	return execCommand("/sbin/route", args...)
 }
 
 func setMTUDarwin(iface string, mtu int) error {

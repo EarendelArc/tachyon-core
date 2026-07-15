@@ -3,8 +3,10 @@ package tgp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -98,6 +100,33 @@ func TestClientManagerUsesSingleConfiguredLocalAddr(t *testing.T) {
 	}
 	if gotLocal != "127.0.0.1:0" {
 		t.Fatalf("local addr = %q, want configured addr", gotLocal)
+	}
+}
+
+func TestClientManagerValidatesResolvedRemoteBeforeDial(t *testing.T) {
+	dialed := false
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		ValidateRemote: func(remote net.Addr) error {
+			if remote.String() != "127.0.0.1:443" {
+				t.Fatalf("remote = %s", remote)
+			}
+			return errors.New("relay would recurse into TUN")
+		},
+		Dial: func(context.Context, string, net.Addr, float64) (Session, error) {
+			dialed = true
+			return &fakeSession{state: SessionEstablished}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	err = manager.SendPacket(context.Background(), 1, []byte("blocked"))
+	if err == nil || !strings.Contains(err.Error(), "relay would recurse") {
+		t.Fatalf("error = %v", err)
+	}
+	if dialed {
+		t.Fatal("dial ran after remote validation failed")
 	}
 }
 

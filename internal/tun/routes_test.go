@@ -10,22 +10,24 @@ import (
 )
 
 type fakeRouteOperator struct {
-	mu          sync.Mutex
-	routes      map[netip.Prefix]routeState
-	addCalls    []netip.Prefix
-	deleteCalls []netip.Prefix
-	deleteCtxs  []context.Context
-	failAddAt   int
-	addErr      error
-	createOnErr bool
-	commitOnErr bool
-	deleteFails map[netip.Prefix]int
-	recreate    map[netip.Prefix]routeState
+	mu                   sync.Mutex
+	routes               map[netip.Prefix]routeState
+	addCalls             []netip.Prefix
+	deleteCalls          []netip.Prefix
+	deleteCtxs           []context.Context
+	failAddAt            int
+	addErr               error
+	createOnErr          bool
+	commitOnErr          bool
+	deleteFails          map[netip.Prefix]int
+	readAfterDeleteFails map[netip.Prefix]int
+	recreate             map[netip.Prefix]routeState
 }
 
 type fakeOwnershipRouteOperator struct {
 	*fakeRouteOperator
 	reconcileCalls int
+	ownership      map[netip.Prefix]string
 }
 
 func (f *fakeOwnershipRouteOperator) Reconcile(context.Context) error {
@@ -33,10 +35,38 @@ func (f *fakeOwnershipRouteOperator) Reconcile(context.Context) error {
 	return nil
 }
 
-func (f *fakeOwnershipRouteOperator) PrepareOwnership(netip.Prefix) error { return nil }
-func (f *fakeOwnershipRouteOperator) RecordOwnership(netip.Prefix) error  { return nil }
-func (f *fakeOwnershipRouteOperator) PrepareDeletion(netip.Prefix) error  { return nil }
-func (f *fakeOwnershipRouteOperator) ReleaseOwnership(netip.Prefix) error { return nil }
+func (f *fakeOwnershipRouteOperator) setOwnership(prefix netip.Prefix, state string) {
+	if f.ownership == nil {
+		f.ownership = make(map[netip.Prefix]string)
+	}
+	f.ownership[prefix] = state
+}
+
+func (f *fakeOwnershipRouteOperator) PrepareOwnership(prefix netip.Prefix) error {
+	f.setOwnership(prefix, windowsRoutePendingForTest)
+	return nil
+}
+
+func (f *fakeOwnershipRouteOperator) RecordOwnership(prefix netip.Prefix) error {
+	f.setOwnership(prefix, windowsRouteActiveForTest)
+	return nil
+}
+
+func (f *fakeOwnershipRouteOperator) PrepareDeletion(prefix netip.Prefix) error {
+	f.setOwnership(prefix, windowsRouteDeletingForTest)
+	return nil
+}
+
+func (f *fakeOwnershipRouteOperator) ReleaseOwnership(prefix netip.Prefix) error {
+	delete(f.ownership, prefix)
+	return nil
+}
+
+const (
+	windowsRoutePendingForTest  = "pending"
+	windowsRouteActiveForTest   = "active"
+	windowsRouteDeletingForTest = "deleting"
+)
 
 func (f *fakeRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (routeState, error) {
 	if err := ctx.Err(); err != nil {
@@ -44,6 +74,14 @@ func (f *fakeRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (rout
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.readAfterDeleteFails[prefix] > 0 {
+		for _, deleted := range f.deleteCalls {
+			if deleted == prefix {
+				f.readAfterDeleteFails[prefix]--
+				return routeState{}, errors.New("injected read-after-delete failure")
+			}
+		}
+	}
 	return f.routes[prefix], nil
 }
 
@@ -280,6 +318,38 @@ func TestRouteTransactionCloseRetriesFailedDeletes(t *testing.T) {
 		if _, ok := ctx.Deadline(); !ok {
 			t.Fatalf("delete context %d has no deadline", idx)
 		}
+	}
+}
+
+func TestRouteTransactionPreservesDeletingOwnershipAfterDeleteAndReadFailures(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeOwnershipRouteOperator{
+		fakeRouteOperator: &fakeRouteOperator{
+			routes:               map[netip.Prefix]routeState{prefix: {Exists: true, Matches: true}},
+			deleteFails:          map[netip.Prefix]int{prefix: 1},
+			readAfterDeleteFails: map[netip.Prefix]int{prefix: 1},
+		},
+		ownership: map[netip.Prefix]string{prefix: windowsRouteActiveForTest},
+	}
+	txn := &routeTransaction{op: op, installed: []netip.Prefix{prefix}}
+
+	if err := txn.Close(); err == nil {
+		t.Fatal("first close should report delete and readback failures")
+	}
+	if !reflect.DeepEqual(txn.installed, []netip.Prefix{prefix}) {
+		t.Fatalf("remaining routes = %v, want owned route retained", txn.installed)
+	}
+	if state := op.ownership[prefix]; state != windowsRouteDeletingForTest {
+		t.Fatalf("journal ownership state = %q, want deleting", state)
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	if len(txn.installed) != 0 {
+		t.Fatalf("remaining routes after retry = %v", txn.installed)
+	}
+	if _, ok := op.ownership[prefix]; ok {
+		t.Fatal("committed retry did not release journal ownership")
 	}
 }
 

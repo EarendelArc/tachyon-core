@@ -246,7 +246,9 @@ func (t *routeTransaction) rollbackLocked() error {
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), routeReadbackTimeout)
 		result, verifyErr := t.op.Read(verifyCtx, prefix)
 		verifyCancel()
-		if verifyErr == nil && result.Matches {
+		if verifyErr != nil {
+			remaining = append(remaining, prefix)
+		} else if result.Matches {
 			remaining = append(remaining, prefix)
 			if hasStore {
 				rollbackErr = errors.Join(rollbackErr, store.RecordOwnership(prefix))

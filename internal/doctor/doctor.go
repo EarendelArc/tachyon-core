@@ -4,7 +4,10 @@ package doctor
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"runtime"
+	"strings"
 
 	"github.com/tachyon-space/tachyon-core/internal/config"
 )
@@ -150,7 +153,7 @@ func RunWithFacts(configPath string, facts PlatformFacts) Report {
 			Message:     "Client mode starts a TUN device before the packet pipeline.",
 			Remediation: "",
 		})
-		report.Checks = append(report.Checks, selectiveRoutesCheck(facts.OS, cfg.Client.TUN.GameRoutes))
+		report.Checks = append(report.Checks, selectiveRoutesCheck(facts.OS, cfg.Client.TUN.GameRoutes, relayPinMessage(cfg.Client.Proxy)))
 		report.Checks = append(report.Checks, platformChecks(facts, true)...)
 	} else {
 		report.Checks = append(report.Checks, Check{
@@ -172,12 +175,12 @@ func RunWithFacts(configPath string, facts PlatformFacts) Report {
 	return report
 }
 
-func selectiveRoutesCheck(goos string, routes []string) Check {
+func selectiveRoutesCheck(goos string, routes []string, relayPin string) Check {
 	if len(routes) == 0 {
 		return Check{
 			ID:          CheckSelectiveRoutes,
 			Status:      StatusOK,
-			Message:     "client.tun.game_routes is empty, so Core installs no OS destination routes; client startup still parses the Relay address, resolves its hostname once, and pins the approved IP:port set before TUN setup.",
+			Message:     "client.tun.game_routes is empty, so Core installs no OS destination routes. " + relayPin,
 			Remediation: "",
 		}
 	}
@@ -185,7 +188,7 @@ func selectiveRoutesCheck(goos string, routes []string) Check {
 		return Check{
 			ID:          CheckSelectiveRoutes,
 			Status:      StatusOK,
-			Message:     fmt.Sprintf("Windows supports transactional installation of %d configured selective game route(s).", len(routes)),
+			Message:     fmt.Sprintf("Windows supports transactional installation of %d configured selective game route(s). %s", len(routes), relayPin),
 			Remediation: "",
 		}
 	}
@@ -195,6 +198,20 @@ func selectiveRoutesCheck(goos string, routes []string) Check {
 		Message:     fmt.Sprintf("client.tun.game_routes is non-empty, but selective route transactions are unsupported on %s; client startup fails closed before TUN creation.", goos),
 		Remediation: "Leave client.tun.game_routes empty on this platform or run the client on Windows until equivalent transactional route support is implemented.",
 	}
+}
+
+func relayPinMessage(proxy config.ProxyConfig) string {
+	address := strings.TrimSpace(proxy.TGPServerAddr)
+	if address == "" {
+		address = strings.TrimSpace(proxy.ServerAddr)
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		if _, parseErr := netip.ParseAddr(host); parseErr == nil {
+			return "The Relay address is an IP literal, so client startup pins that IP:port directly before TUN setup."
+		}
+	}
+	return "The Relay address is a hostname, so client startup resolves it once and pins the approved IP:port set before TUN setup."
 }
 
 func (r *Report) finalize() {

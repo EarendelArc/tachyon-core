@@ -77,8 +77,32 @@ func TestRunWithFactsEmptyGameRoutesNeedsNoRouteSupport(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("SELECTIVE_ROUTES_SUPPORTED status = %q, want ok", check.Status)
 	}
-	if !strings.Contains(check.Message, "resolves its hostname once") || !strings.Contains(check.Message, "pins the approved IP:port set") || check.Remediation != "" {
+	if !strings.Contains(check.Message, "hostname") || !strings.Contains(check.Message, "resolves it once") || !strings.Contains(check.Message, "pins the approved IP:port set") || check.Remediation != "" {
 		t.Fatalf("empty game_routes check does not describe Relay pinning semantics: %#v", check)
+	}
+}
+
+func TestRunWithFactsIPLiteralRelayIsPinnedDirectly(t *testing.T) {
+	path := writeClientConfig(t, false)
+	wire, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = []byte(strings.ReplaceAll(string(wire), "game.example.com:443", "198.51.100.10:443"))
+	if err := os.WriteFile(path, wire, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := RunWithFacts(path, PlatformFacts{
+		OS:               "linux",
+		Arch:             "amd64",
+		LinuxTunExists:   true,
+		LinuxTunOpenable: true,
+		LinuxCAPKnown:    true,
+		LinuxCAPNetAdmin: true,
+	})
+	check := findCheck(report.Checks, CheckSelectiveRoutes)
+	if !strings.Contains(check.Message, "IP literal") || !strings.Contains(check.Message, "pins that IP:port directly") || strings.Contains(check.Message, "resolves") {
+		t.Fatalf("IP literal check does not describe direct pinning: %#v", check)
 	}
 }
 

@@ -54,10 +54,12 @@ tachyonctl health --addr 127.0.0.1:55123
   cancellation; readback after an ordinary create error never claims a
   concurrent route. A successful delete immediately releases ownership, so an
   identical route recreated later is not removed by a subsequent cleanup.
-- Crash recovery state is stored under the machine-wide protected
-  `ProgramData\\Tachyon` directory. Its non-inheriting ACL permits only SYSTEM
-  and Administrators, and Core rejects reparse points, paths outside that root,
-  untrusted owners or ACLs, and malformed journal data before route deletion.
+- Crash recovery state is stored as one atomic machine-wide registry value at
+  `HKLM\\SOFTWARE\\Tachyon\\RouteJournal`. The key is created with a protected
+  DACL that permits only SYSTEM and Administrators; Core rejects an untrusted
+  owner, ACL, value type, or malformed journal before route deletion. Failed
+  deletes whose readback also fails remain in the `deleting` state for `Close`
+  or the next startup to retry.
 - Client route rules support process name, CIDR, and protocol matching.
   `domain` and `geoip` rules fail validation until Core has implementations
   that can make deterministic packet-path decisions.
@@ -132,6 +134,8 @@ explain whether client mode requires TUN, and emit stable JSON checks such as
 non-empty `game_routes` list as a fail-closed startup error. The checks do not
 create a persistent TUN adapter, change routes, start services, launch the
 daemon, or alter firewall, system proxy, Docker, systemd, or packet filter state.
+Relay diagnostics distinguish an IP literal, which is pinned directly, from a
+hostname, which is resolved once before its approved `IP:port` set is pinned.
 
 Before deploying a VPS, run the local TGP relay smoke test:
 

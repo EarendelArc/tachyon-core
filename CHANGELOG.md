@@ -18,9 +18,10 @@ All notable changes to Tachyon Core will be documented in this file.
 - Windows selective routes now use Wintun LUID/IP Helper identity, exact
   baseline/readback validation, explicit committed create/delete results, and
   retryable per-route cleanup without claiming concurrent replacements. The
-  crash journal now lives under protected machine-wide ProgramData with a
-  SYSTEM/Administrators-only DACL and validates path, reparse, owner, ACL, and
-  content trust before reconciling matching routes on the same adapter.
+  crash journal now uses an atomically created, SYSTEM/Administrators-only HKLM
+  registry key and a single atomic state value. It validates owner, protected
+  ACL, value type, and content before reconciliation, and retains `deleting`
+  ownership when both an uncommitted delete and readback fail.
 - TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
   budget, carries relay time for path-request clock alignment, rejects v1/v2
   peers, and records oversized receive drops.

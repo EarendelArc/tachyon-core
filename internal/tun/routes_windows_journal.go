@@ -3,41 +3,48 @@
 package tun
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
-	"os"
-	"path/filepath"
-	"strings"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
-const windowsRouteJournalVersion = 2
-
 const (
+	windowsRouteJournalVersion = 2
+	windowsRouteJournalKey     = `SOFTWARE\Tachyon\RouteJournal`
+	windowsRouteJournalValue   = "StateV2"
+
 	windowsRoutePending  = "pending"
 	windowsRouteActive   = "active"
 	windowsRouteDeleting = "deleting"
 )
 
-var windowsRouteJournalMu sync.Mutex
+var (
+	windowsRouteJournalMu sync.Mutex
+	advapi32              = windows.NewLazySystemDLL("advapi32.dll")
+	procRegCreateKeyExW   = advapi32.NewProc("RegCreateKeyExW")
+	procRegFlushKey       = advapi32.NewProc("RegFlushKey")
+)
 
-type windowsRouteJournalSecurity interface {
-	Prepare(root, path string) error
-	Protect(path string) error
-	Validate(path string) error
+type windowsRouteJournalStorage interface {
+	Read() ([]byte, error)
+	Write([]byte) error
+	Clear() error
+	Location() string
 }
 
 type windowsRouteJournal struct {
-	root     string
-	path     string
-	security windowsRouteJournalSecurity
+	storage windowsRouteJournalStorage
 }
 
 type windowsRouteJournalData struct {
@@ -56,24 +63,15 @@ type windowsRouteJournalEntry struct {
 }
 
 func newDefaultWindowsRouteJournal() (*windowsRouteJournal, error) {
-	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, windows.KF_FLAG_DEFAULT)
-	if err != nil {
-		return nil, fmt.Errorf("resolve Windows ProgramData for route journal: %w", err)
-	}
-	root := filepath.Join(programData, "Tachyon")
-	return &windowsRouteJournal{
-		root:     root,
-		path:     filepath.Join(root, "route-journal-v2.json"),
-		security: systemWindowsRouteJournalSecurity{},
-	}, nil
+	return &windowsRouteJournal{storage: &registryWindowsRouteJournalStorage{
+		root:      registry.LOCAL_MACHINE,
+		keyPath:   windowsRouteJournalKey,
+		valueName: windowsRouteJournalValue,
+	}}, nil
 }
 
-func newWindowsRouteJournalForTest(path string) *windowsRouteJournal {
-	return &windowsRouteJournal{
-		root:     filepath.Dir(path),
-		path:     path,
-		security: testWindowsRouteJournalSecurity{},
-	}
+func newWindowsRouteJournalForTest() *windowsRouteJournal {
+	return &windowsRouteJournal{storage: &memoryWindowsRouteJournalStorage{}}
 }
 
 func (j *windowsRouteJournal) prepare(op *windowsRouteOperator, prefix netip.Prefix) error {
@@ -170,25 +168,28 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("unsafe route journal entry for Wintun LUID %d destination %q", entry.InterfaceLUID, entry.Destination))
 			continue
 		}
-		if entry.State != windowsRouteActive {
-			// Pending and deleting entries are deliberately non-authoritative.
-			// A crash can leak a route, but it cannot turn ambiguity into deletion.
+		if entry.State == windowsRoutePending {
+			// A pending create never established ownership.
 			continue
 		}
+		if entry.State != windowsRouteActive && entry.State != windowsRouteDeleting {
+			kept = append(kept, entry)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("unsafe route journal state %q for %s", entry.State, prefix))
+			continue
+		}
+
 		entry.State = windowsRouteDeleting
 		staged := append(append([]windowsRouteJournalEntry(nil), kept...), entry)
 		staged = append(staged, data.Entries[entryIdx+1:]...)
 		if err := j.save(windowsRouteJournalData{Version: data.Version, Entries: staged}); err != nil {
-			entry.State = windowsRouteActive
 			kept = append(kept, entry)
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("stage journaled route deletion %s: %w", prefix, err))
 			continue
 		}
 		state, readErr := op.Read(ctx, prefix)
 		if readErr != nil {
-			entry.State = windowsRouteActive
 			kept = append(kept, entry)
-			reconcileErr = errors.Join(reconcileErr, readErr)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("read journaled route %s: %w", prefix, readErr))
 			continue
 		}
 		if !state.Matches {
@@ -199,8 +200,7 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 			continue
 		}
 		state, readErr = op.Read(ctx, prefix)
-		if readErr == nil && state.Matches {
-			entry.State = windowsRouteActive
+		if readErr != nil || state.Matches {
 			kept = append(kept, entry)
 		}
 		reconcileErr = errors.Join(reconcileErr, fmt.Errorf("delete journaled route %s: %w", prefix, errors.Join(deleteErr, readErr)))
@@ -211,18 +211,15 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 
 func (j *windowsRouteJournal) load() (windowsRouteJournalData, error) {
 	data := windowsRouteJournalData{Version: windowsRouteJournalVersion}
-	if err := j.security.Prepare(j.root, j.path); err != nil {
-		return data, err
+	wire, err := j.storage.Read()
+	if err != nil {
+		return data, fmt.Errorf("read route journal %s: %w", j.storage.Location(), err)
 	}
-	wire, err := os.ReadFile(j.path)
-	if errors.Is(err, os.ErrNotExist) {
+	if len(wire) == 0 {
 		return data, nil
 	}
-	if err != nil {
-		return data, fmt.Errorf("read route journal %q: %w", j.path, err)
-	}
 	if err := json.Unmarshal(wire, &data); err != nil {
-		return data, fmt.Errorf("parse route journal %q: %w", j.path, err)
+		return data, fmt.Errorf("parse route journal %s: %w", j.storage.Location(), err)
 	}
 	if data.Version != windowsRouteJournalVersion {
 		return data, fmt.Errorf("unsupported route journal version %d", data.Version)
@@ -231,241 +228,163 @@ func (j *windowsRouteJournal) load() (windowsRouteJournalData, error) {
 }
 
 func (j *windowsRouteJournal) save(data windowsRouteJournalData) error {
-	if err := j.security.Prepare(j.root, j.path); err != nil {
-		return err
-	}
 	if len(data.Entries) == 0 {
-		if err := os.Remove(j.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove empty route journal %q: %w", j.path, err)
+		if err := j.storage.Clear(); err != nil {
+			return fmt.Errorf("clear empty route journal %s: %w", j.storage.Location(), err)
 		}
 		return nil
 	}
-	wire, err := json.MarshalIndent(data, "", "  ")
+	wire, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
-	tmpFile, err := os.CreateTemp(j.root, ".route-journal-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create route journal temporary file: %w", err)
-	}
-	tmp := tmpFile.Name()
-	committed := false
-	defer func() {
-		_ = tmpFile.Close()
-		if !committed {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if err := j.security.Protect(tmp); err != nil {
-		return fmt.Errorf("protect route journal temporary file: %w", err)
-	}
-	if _, err := tmpFile.Write(wire); err != nil {
-		return fmt.Errorf("write route journal: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		return fmt.Errorf("flush route journal: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close route journal: %w", err)
-	}
-	from, err := windows.UTF16PtrFromString(tmp)
-	if err != nil {
-		return err
-	}
-	to, err := windows.UTF16PtrFromString(j.path)
-	if err != nil {
-		return err
-	}
-	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
-		return fmt.Errorf("commit route journal: %w", err)
-	}
-	committed = true
-	if err := j.security.Protect(j.path); err != nil {
-		return fmt.Errorf("reprotect committed route journal: %w", err)
-	}
-	if err := j.security.Validate(j.path); err != nil {
-		return fmt.Errorf("verify committed route journal: %w", err)
+	if err := j.storage.Write(wire); err != nil {
+		return fmt.Errorf("commit route journal %s: %w", j.storage.Location(), err)
 	}
 	return nil
 }
 
-type systemWindowsRouteJournalSecurity struct{}
+type registryWindowsRouteJournalStorage struct {
+	root      registry.Key
+	keyPath   string
+	valueName string
+}
 
-func (systemWindowsRouteJournalSecurity) Prepare(root, path string) error {
-	if err := validateWindowsJournalPath(root, path); err != nil {
+func (s *registryWindowsRouteJournalStorage) Location() string {
+	return `HKLM\` + s.keyPath + `\` + s.valueName
+}
+
+func (s *registryWindowsRouteJournalStorage) Read() ([]byte, error) {
+	key, err := registry.OpenKey(s.root, s.keyPath, registry.READ|registry.WOW64_64KEY)
+	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer key.Close()
+	if err := validateWindowsRouteJournalRegistryKey(key); err != nil {
+		return nil, fmt.Errorf("untrusted route journal registry key: %w", err)
+	}
+	wire, valueType, err := key.GetBinaryValue(s.valueName)
+	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if valueType != registry.BINARY {
+		return nil, fmt.Errorf("registry value type is %d, want REG_BINARY", valueType)
+	}
+	return wire, nil
+}
+
+func (s *registryWindowsRouteJournalStorage) Write(wire []byte) error {
+	key, _, err := createWindowsRouteJournalRegistryKey(s.root, s.keyPath)
+	if err != nil {
 		return err
 	}
-	if err := rejectWindowsReparseComponents(filepath.Dir(root)); err != nil {
+	defer key.Close()
+	if err := validateWindowsRouteJournalRegistryKey(key); err != nil {
+		return fmt.Errorf("untrusted route journal registry key: %w", err)
+	}
+	if err := key.SetBinaryValue(s.valueName, wire); err != nil {
 		return err
 	}
-	info, err := os.Lstat(root)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(root, 0o700); err != nil {
-			return fmt.Errorf("create protected route journal directory: %w", err)
-		}
-		if err := protectWindowsJournalObject(root); err != nil {
-			return fmt.Errorf("protect route journal directory: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("inspect route journal directory: %w", err)
-	} else if !info.IsDir() {
-		return fmt.Errorf("route journal root %q is not a directory", root)
+	if err := flushWindowsRegistryKey(key); err != nil {
+		return fmt.Errorf("flush route journal registry key: %w", err)
 	}
-	if err := rejectWindowsReparseComponents(root); err != nil {
-		return err
+	committed, valueType, err := key.GetBinaryValue(s.valueName)
+	if err != nil {
+		return fmt.Errorf("verify route journal registry value: %w", err)
 	}
-	if err := validateWindowsJournalObject(root); err != nil {
-		return fmt.Errorf("untrusted route journal directory: %w", err)
-	}
-	if _, err := os.Lstat(path); err == nil {
-		if err := validateWindowsJournalObject(path); err != nil {
-			return fmt.Errorf("untrusted route journal file: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect route journal file: %w", err)
+	if valueType != registry.BINARY || !bytes.Equal(committed, wire) {
+		return errors.New("route journal registry value failed atomic readback verification")
 	}
 	return nil
 }
 
-func (systemWindowsRouteJournalSecurity) Protect(path string) error {
-	return protectWindowsJournalObject(path)
-}
-
-func (systemWindowsRouteJournalSecurity) Validate(path string) error {
-	return validateWindowsJournalObject(path)
-}
-
-// Tests use temporary user-owned directories and exercise security descriptor
-// validation separately, so their journal I/O does not lock out the test user.
-type testWindowsRouteJournalSecurity struct{}
-
-func (testWindowsRouteJournalSecurity) Prepare(root, path string) error {
-	if err := validateWindowsJournalPath(root, path); err != nil {
+func (s *registryWindowsRouteJournalStorage) Clear() error {
+	key, err := registry.OpenKey(s.root, s.keyPath, registry.ALL_ACCESS|registry.WOW64_64KEY)
+	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	return os.MkdirAll(root, 0o700)
-}
-func (testWindowsRouteJournalSecurity) Protect(string) error  { return nil }
-func (testWindowsRouteJournalSecurity) Validate(string) error { return nil }
-
-func validateWindowsJournalPath(root, path string) error {
-	rootAbs, err := filepath.Abs(filepath.Clean(root))
-	if err != nil {
-		return fmt.Errorf("resolve route journal root: %w", err)
+	if err := validateWindowsRouteJournalRegistryKey(key); err != nil {
+		key.Close()
+		return fmt.Errorf("untrusted route journal registry key: %w", err)
 	}
-	pathAbs, err := filepath.Abs(filepath.Clean(path))
-	if err != nil {
-		return fmt.Errorf("resolve route journal path: %w", err)
+	if err := key.DeleteValue(s.valueName); err != nil && !errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		key.Close()
+		return err
 	}
-	if !strings.EqualFold(filepath.Dir(pathAbs), rootAbs) {
-		return fmt.Errorf("route journal path %q escapes protected root %q", pathAbs, rootAbs)
+	if err := key.Close(); err != nil {
+		return err
+	}
+	if err := registry.DeleteKey(s.root, s.keyPath); err != nil && !errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		return err
 	}
 	return nil
 }
 
-func rejectWindowsReparseComponents(path string) error {
-	path = filepath.Clean(path)
-	volume := filepath.VolumeName(path)
-	current := volume + string(os.PathSeparator)
-	rest := strings.TrimPrefix(path, current)
-	for _, component := range strings.Split(rest, string(os.PathSeparator)) {
-		if component == "" {
-			continue
-		}
-		current = filepath.Join(current, component)
-		attrs, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(current))
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("inspect route journal path component %q: %w", current, err)
-		}
-		if err := validateWindowsJournalAttributes(current, attrs); err != nil {
-			return err
-		}
+func createWindowsRouteJournalRegistryKey(root registry.Key, keyPath string) (registry.Key, bool, error) {
+	descriptor, err := newWindowsRouteJournalSecurityDescriptor()
+	if err != nil {
+		return 0, false, err
+	}
+	path, err := windows.UTF16PtrFromString(keyPath)
+	if err != nil {
+		return 0, false, err
+	}
+	security := syscall.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
+		SecurityDescriptor: uintptr(unsafe.Pointer(descriptor)),
+	}
+	var handle syscall.Handle
+	var disposition uint32
+	status, _, _ := procRegCreateKeyExW.Call(
+		uintptr(root),
+		uintptr(unsafe.Pointer(path)),
+		0,
+		0,
+		0,
+		registry.ALL_ACCESS|registry.WOW64_64KEY,
+		uintptr(unsafe.Pointer(&security)),
+		uintptr(unsafe.Pointer(&handle)),
+		uintptr(unsafe.Pointer(&disposition)),
+	)
+	runtime.KeepAlive(descriptor)
+	runtime.KeepAlive(security)
+	if status != 0 {
+		return 0, false, syscall.Errno(status)
+	}
+	return registry.Key(handle), disposition == 2, nil
+}
+
+func newWindowsRouteJournalSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
+	return windows.SecurityDescriptorFromString("O:BAG:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)")
+}
+
+func flushWindowsRegistryKey(key registry.Key) error {
+	status, _, _ := procRegFlushKey.Call(uintptr(key))
+	if status != 0 {
+		return syscall.Errno(status)
 	}
 	return nil
 }
 
-func protectWindowsJournalObject(path string) error {
-	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	if err != nil {
-		return err
-	}
-	adminSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-	if err != nil {
-		return err
-	}
-	inheritance := uint32(windows.NO_INHERITANCE)
-	attrs, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil {
-		return err
-	}
-	if err := validateWindowsJournalAttributes(path, attrs); err != nil {
-		return err
-	}
-	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
-	}
-	entries := []windows.EXPLICIT_ACCESS{
-		windowsJournalAccessEntry(systemSID, windows.TRUSTEE_IS_USER, inheritance),
-		windowsJournalAccessEntry(adminSID, windows.TRUSTEE_IS_GROUP, inheritance),
-	}
-	dacl, err := windows.ACLFromEntries(entries, nil)
-	if err != nil {
-		return err
-	}
-	if err := windows.SetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		adminSID,
-		nil,
-		dacl,
-		nil,
-	); err != nil {
-		return err
-	}
-	return validateWindowsJournalObject(path)
-}
-
-func windowsJournalAccessEntry(sid *windows.SID, trusteeType windows.TRUSTEE_TYPE, inheritance uint32) windows.EXPLICIT_ACCESS {
-	return windows.EXPLICIT_ACCESS{
-		AccessPermissions: windows.GENERIC_ALL,
-		AccessMode:        windows.SET_ACCESS,
-		Inheritance:       inheritance,
-		Trustee: windows.TRUSTEE{
-			TrusteeForm:  windows.TRUSTEE_IS_SID,
-			TrusteeType:  trusteeType,
-			TrusteeValue: windows.TrusteeValueFromSID(sid),
-		},
-	}
-}
-
-func validateWindowsJournalObject(path string) error {
-	attrs, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil {
-		return err
-	}
-	if err := validateWindowsJournalAttributes(path, attrs); err != nil {
-		return err
-	}
-	descriptor, err := windows.GetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
+func validateWindowsRouteJournalRegistryKey(key registry.Key) error {
+	descriptor, err := windows.GetSecurityInfo(
+		windows.Handle(key),
+		windows.SE_REGISTRY_KEY,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
 	)
 	if err != nil {
 		return err
 	}
 	return validateWindowsJournalSecurityDescriptor(descriptor)
-}
-
-func validateWindowsJournalAttributes(path string, attrs uint32) error {
-	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return fmt.Errorf("route journal path %q is a reparse point", path)
-	}
-	return nil
 }
 
 func validateWindowsJournalSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR) error {
@@ -500,8 +419,8 @@ func validateWindowsJournalSecurityDescriptor(descriptor *windows.SECURITY_DESCR
 		if err := windows.GetAce(dacl, uint32(idx), &ace); err != nil {
 			return err
 		}
-		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask != windows.GENERIC_ALL || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
-			return fmt.Errorf("DACL ACE %d is not an explicit full-control allow entry", idx)
+		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask != registry.ALL_ACCESS || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
+			return fmt.Errorf("DACL ACE %d is not an explicit registry full-control allow entry", idx)
 		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		switch {
@@ -524,4 +443,38 @@ func aclEntryCount(acl *windows.ACL) uint16 {
 		return 0
 	}
 	return acl.AceCount
+}
+
+type memoryWindowsRouteJournalStorage struct {
+	value      []byte
+	writes     [][]byte
+	clearCalls int
+	readErr    error
+	writeErr   error
+	clearErr   error
+}
+
+func (s *memoryWindowsRouteJournalStorage) Location() string { return "test memory" }
+
+func (s *memoryWindowsRouteJournalStorage) Read() ([]byte, error) {
+	return append([]byte(nil), s.value...), s.readErr
+}
+
+func (s *memoryWindowsRouteJournalStorage) Write(wire []byte) error {
+	if s.writeErr != nil {
+		return s.writeErr
+	}
+	committed := append([]byte(nil), wire...)
+	s.value = committed
+	s.writes = append(s.writes, committed)
+	return nil
+}
+
+func (s *memoryWindowsRouteJournalStorage) Clear() error {
+	if s.clearErr != nil {
+		return s.clearErr
+	}
+	s.value = nil
+	s.clearCalls++
+	return nil
 }

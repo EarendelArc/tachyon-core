@@ -4,33 +4,17 @@ package tun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
-	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
-
-type recordingWindowsJournalSecurity struct {
-	testWindowsRouteJournalSecurity
-	protected []string
-	validated []string
-}
-
-func (s *recordingWindowsJournalSecurity) Protect(path string) error {
-	s.protected = append(s.protected, path)
-	return nil
-}
-
-func (s *recordingWindowsJournalSecurity) Validate(path string) error {
-	s.validated = append(s.validated, path)
-	return nil
-}
 
 func TestWindowsRouteIdentitySurvivesInterfaceRename(t *testing.T) {
 	api := windowsRouteAPI{initEntry: func(*windows.MibIpForwardRow2) {}}
@@ -115,7 +99,7 @@ func TestWindowsRouteJournalReconcilesOnlyExactStableIdentity(t *testing.T) {
 	other.InterfaceLuid = 99
 	rows[windowsRouteRowKey(other)] = other
 
-	journal := newWindowsRouteJournalForTest(filepath.Join(t.TempDir(), "routes.json"))
+	journal := newWindowsRouteJournalForTest()
 	op.journal = journal
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
@@ -160,7 +144,7 @@ func TestWindowsRouteJournalAbandonsChangedReplacement(t *testing.T) {
 		t.Fatal("changed route must not be deleted")
 		return nil
 	}
-	journal := newWindowsRouteJournalForTest(filepath.Join(t.TempDir(), "routes.json"))
+	journal := newWindowsRouteJournalForTest()
 	op.journal = journal
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
@@ -200,7 +184,7 @@ func TestWindowsRouteJournalDropsAmbiguousPendingRoute(t *testing.T) {
 		t.Fatal("pending route must not be deleted automatically")
 		return nil
 	}
-	journal := newWindowsRouteJournalForTest(filepath.Join(t.TempDir(), "routes.json"))
+	journal := newWindowsRouteJournalForTest()
 	op.journal = journal
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
@@ -247,7 +231,7 @@ func TestWindowsRouteJournalDeleteSuccessAbandonsRecreatedRoute(t *testing.T) {
 	}
 	owned := op.routeRow(prefix)
 	rows[windowsRouteRowKey(owned)] = owned
-	journal := newWindowsRouteJournalForTest(filepath.Join(t.TempDir(), "routes.json"))
+	journal := newWindowsRouteJournalForTest()
 	op.journal = journal
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
@@ -268,15 +252,70 @@ func TestWindowsRouteJournalDeleteSuccessAbandonsRecreatedRoute(t *testing.T) {
 	}
 }
 
+func TestWindowsRouteJournalRetriesDeletingEntryAfterDeleteAndReadFailures(t *testing.T) {
+	prefix := netip.MustParsePrefix("203.0.113.0/24")
+	journal := newWindowsRouteJournalForTest()
+	getCalls := 0
+	deleteCalls := 0
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api:           windowsRouteAPI{initEntry: func(*windows.MibIpForwardRow2) {}},
+	}
+	row := op.routeRow(prefix)
+	op.api = windowsRouteAPI{
+		initEntry: func(*windows.MibIpForwardRow2) {},
+		get: func(got *windows.MibIpForwardRow2) error {
+			getCalls++
+			if getCalls == 3 {
+				return windows.ERROR_RETRY
+			}
+			*got = row
+			return nil
+		},
+		delete: func(*windows.MibIpForwardRow2) error {
+			deleteCalls++
+			if deleteCalls == 1 {
+				return windows.ERROR_RETRY
+			}
+			return nil
+		},
+	}
+	if err := journal.save(windowsRouteJournalData{
+		Version: windowsRouteJournalVersion,
+		Entries: []windowsRouteJournalEntry{{
+			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteDeleting,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := op.Reconcile(context.Background()); err == nil {
+		t.Fatal("first reconcile should report delete and readback failures")
+	}
+	data, err := journal.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Entries) != 1 || data.Entries[0].State != windowsRouteDeleting {
+		t.Fatalf("journal after double failure = %+v, want deleting entry retained", data.Entries)
+	}
+	if err := op.Reconcile(context.Background()); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	data, err = journal.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Entries) != 0 || deleteCalls != 2 {
+		t.Fatalf("retry left entries=%+v deleteCalls=%d", data.Entries, deleteCalls)
+	}
+}
+
 func TestWindowsRouteJournalCorruptionCannotDriveDelete(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "routes.json")
-	journal := newWindowsRouteJournalForTest(path)
-	if err := journal.security.Prepare(journal.root, journal.path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(`{"version":2,"entries":[`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	journal := newWindowsRouteJournalForTest()
+	journal.storage.(*memoryWindowsRouteJournalStorage).value = []byte(`{"version":2,"entries":[`)
 	op := &windowsRouteOperator{
 		interfaceLUID: 55,
 		interfaceIdx:  12,
@@ -294,75 +333,71 @@ func TestWindowsRouteJournalCorruptionCannotDriveDelete(t *testing.T) {
 	}
 }
 
-func TestWindowsRouteJournalPathRejectsEscape(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "protected")
-	if err := validateWindowsJournalPath(root, filepath.Join(root, "routes.json")); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateWindowsJournalPath(root, filepath.Join(root, "..", "forged.json")); err == nil {
-		t.Fatal("journal path outside protected root was accepted")
-	}
-}
-
-func TestDefaultWindowsRouteJournalUsesMachineProgramData(t *testing.T) {
+func TestDefaultWindowsRouteJournalUsesFixedMachineRegistryKey(t *testing.T) {
 	t.Setenv("TACHYON_ROUTE_JOURNAL", filepath.Join(t.TempDir(), "forged.json"))
 	journal, err := newDefaultWindowsRouteJournal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, windows.KF_FLAG_DEFAULT)
-	if err != nil {
-		t.Fatal(err)
+	storage, ok := journal.storage.(*registryWindowsRouteJournalStorage)
+	if !ok {
+		t.Fatalf("default storage = %T, want registry storage", journal.storage)
 	}
-	wantRoot := filepath.Join(programData, "Tachyon")
-	if !strings.EqualFold(journal.root, wantRoot) || filepath.Dir(journal.path) != journal.root {
-		t.Fatalf("journal root/path = %q / %q, want protected ProgramData root %q", journal.root, journal.path, wantRoot)
-	}
-}
-
-func TestWindowsRouteJournalReprotectsEveryAtomicReplace(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "routes.json")
-	security := &recordingWindowsJournalSecurity{}
-	journal := &windowsRouteJournal{root: filepath.Dir(path), path: path, security: security}
-	data := windowsRouteJournalData{
-		Version: windowsRouteJournalVersion,
-		Entries: []windowsRouteJournalEntry{{Destination: "203.0.113.0/24", State: windowsRoutePending}},
-	}
-	for range 2 {
-		if err := journal.save(data); err != nil {
-			t.Fatal(err)
-		}
-	}
-	destinationProtects := 0
-	for _, protected := range security.protected {
-		if protected == path {
-			destinationProtects++
-		}
-	}
-	if destinationProtects != 2 || len(security.validated) != 2 {
-		t.Fatalf("destination protects=%d validates=%d, want one of each per replace", destinationProtects, len(security.validated))
+	if storage.root != registry.LOCAL_MACHINE || storage.keyPath != windowsRouteJournalKey || storage.valueName != windowsRouteJournalValue {
+		t.Fatalf("registry location = root %v path %q value %q", storage.root, storage.keyPath, storage.valueName)
 	}
 }
 
-func TestWindowsRouteJournalRejectsReparseAttributes(t *testing.T) {
-	if err := validateWindowsJournalAttributes(`C:\ProgramData\Tachyon`, windows.FILE_ATTRIBUTE_DIRECTORY); err != nil {
+func TestWindowsRouteJournalWritesWholeAtomicStatesAndCleansUp(t *testing.T) {
+	journal := newWindowsRouteJournalForTest()
+	storage := journal.storage.(*memoryWindowsRouteJournalStorage)
+	op := &windowsRouteOperator{interfaceLUID: 55, interfaceIdx: 12, journal: journal}
+	prefix := netip.MustParsePrefix("203.0.113.0/24")
+
+	if err := journal.prepare(op, prefix); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateWindowsJournalAttributes(`C:\ProgramData\Tachyon`, windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT); err == nil {
-		t.Fatal("reparse point attributes were accepted")
+	if err := journal.record(op, prefix); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.prepareDeletion(op, prefix); err != nil {
+		t.Fatal(err)
+	}
+	for idx, wantState := range []string{windowsRoutePending, windowsRouteActive, windowsRouteDeleting} {
+		var data windowsRouteJournalData
+		if err := json.Unmarshal(storage.writes[idx], &data); err != nil {
+			t.Fatalf("atomic write %d is not complete JSON: %v", idx, err)
+		}
+		if len(data.Entries) != 1 || data.Entries[0].State != wantState {
+			t.Fatalf("atomic write %d = %+v, want state %q", idx, data, wantState)
+		}
+	}
+	if err := journal.release(op, prefix); err != nil {
+		t.Fatal(err)
+	}
+	if storage.value != nil || storage.clearCalls != 1 {
+		t.Fatalf("empty journal cleanup left value=%q clearCalls=%d", storage.value, storage.clearCalls)
 	}
 }
 
 func TestWindowsRouteJournalSecurityDescriptorRequiresProtectedTrustedACL(t *testing.T) {
+	creationDescriptor, err := newWindowsRouteJournalSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsJournalSecurityDescriptor(creationDescriptor); err != nil {
+		t.Fatalf("atomic registry creation descriptor is not trusted: %v", err)
+	}
+
 	tests := []struct {
 		name    string
 		sddl    string
 		wantErr bool
 	}{
-		{name: "protected system and admins", sddl: "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)"},
-		{name: "inheritance enabled", sddl: "O:SYD:(A;;GA;;;SY)(A;;GA;;;BA)", wantErr: true},
-		{name: "untrusted owner", sddl: "O:WDD:P(A;;GA;;;SY)(A;;GA;;;BA)", wantErr: true},
-		{name: "untrusted writer", sddl: "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)", wantErr: true},
+		{name: "protected system and admins", sddl: "O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)"},
+		{name: "inheritance enabled", sddl: "O:SYD:(A;;KA;;;SY)(A;;KA;;;BA)", wantErr: true},
+		{name: "untrusted owner", sddl: "O:WDD:P(A;;KA;;;SY)(A;;KA;;;BA)", wantErr: true},
+		{name: "low privilege preoccupied ACL", sddl: "O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KW;;;BU)", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

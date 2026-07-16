@@ -40,6 +40,8 @@ type windowsRouteOperator struct {
 	interfaceIdx  uint32
 	api           windowsRouteAPI
 	journal       *windowsRouteJournal
+	routeMetrics  map[netip.Prefix]uint32
+	transition    *windowsRouteJournalTransition
 }
 
 func SelectiveRoutesSupported() bool { return true }
@@ -129,6 +131,14 @@ func (o *windowsRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) 
 }
 
 func (o *windowsRouteOperator) routeRow(prefix netip.Prefix) windows.MibIpForwardRow2 {
+	metric := uint32(windowsRouteMetric)
+	if prepared, ok := o.routeMetrics[prefix.Masked()]; ok {
+		metric = prepared
+	}
+	return o.routeRowWithMetric(prefix, metric)
+}
+
+func (o *windowsRouteOperator) routeRowWithMetric(prefix netip.Prefix, metric uint32) windows.MibIpForwardRow2 {
 	prefix = prefix.Masked()
 	var row windows.MibIpForwardRow2
 	o.api.initEntry(&row)
@@ -143,7 +153,7 @@ func (o *windowsRouteOperator) routeRow(prefix netip.Prefix) windows.MibIpForwar
 	} else {
 		row.NextHop = rawSockaddrInet(netip.IPv6Unspecified())
 	}
-	row.Metric = windowsRouteMetric
+	row.Metric = metric
 	row.Protocol = windowsRouteProtocol
 	return row
 }
@@ -212,14 +222,14 @@ func (o *windowsRouteOperator) RecordOwnership(prefix netip.Prefix) error {
 	return o.journal.record(o, prefix)
 }
 
-func (o *windowsRouteOperator) PrepareOwnership(prefix netip.Prefix) error {
-	return o.journal.prepare(o, prefix)
+func (o *windowsRouteOperator) PrepareOwnership(ctx context.Context, prefix netip.Prefix) error {
+	return o.journal.prepare(ctx, o, prefix)
 }
 
 func (o *windowsRouteOperator) ReleaseOwnership(prefix netip.Prefix) error {
 	return o.journal.release(o, prefix)
 }
 
-func (o *windowsRouteOperator) PrepareDeletion(prefix netip.Prefix) error {
-	return o.journal.prepareDeletion(o, prefix)
+func (o *windowsRouteOperator) PrepareDeletion(ctx context.Context, prefix netip.Prefix) error {
+	return o.journal.prepareDeletion(ctx, o, prefix)
 }

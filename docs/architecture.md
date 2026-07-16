@@ -22,14 +22,21 @@ Therefore `auto_route=true`, `dns_hijack=true`, and `tgp_only=false` are invalid
 client configurations. Windows installs only `client.tun.game_routes` in a
 transaction and removes them on initialization failure or shutdown. Route
 identity is the Wintun adapter LUID plus interface index, destination, next hop,
-metric, and protocol, so adapter renames are harmless. Each Add is bracketed by
-exact baseline/readback checks; cleanup retains failed ownership for later
-`Close` retries. If both an uncommitted delete and its readback fail, ownership
-stays in the `deleting` state for `Close` or startup recovery to retry. A
-SYSTEM/Administrators-only machine registry journal at
+metric signature, and protocol, so adapter renames are harmless. A protected
+SYSTEM/Administrators-only `Global\\` mutex serializes the complete journal
+read-modify-write operation with each corresponding IP Helper create/delete.
+Lock timeout fails closed; an abandoned owner is recovered from durable state.
+Before Add, a `pending` entry records both an absent baseline and a random,
+nonzero metric signature. Startup recovery deletes only a row carrying that
+exact signature, while an absent signature is released without touching a
+same-prefix replacement. Each Add is bracketed by exact baseline/readback
+checks; cleanup retains failed ownership for later `Close` retries. If both an
+uncommitted delete and its readback fail, ownership stays in the `deleting`
+state for `Close` or startup recovery to retry. A machine registry journal at
 `HKLM\\SOFTWARE\\Tachyon\\RouteJournal` atomically records complete states and
-reconciles only previously confirmed Tachyon routes on the same stable Wintun
-identity after a process crash. Linux and
+rejects untrusted ACLs, non-binary or larger-than-1-MiB values, and malformed
+content. Its protected 64-bit key is retained with a legal empty journal value.
+Linux and
 macOS reject non-empty `game_routes` before TUN creation until their route
 transactions have equivalent safety. A direct decision for a packet that
 nevertheless enters the TUN is a fatal fail-closed error.

@@ -104,8 +104,8 @@ func TestWindowsRouteJournalReconcilesOnlyExactStableIdentity(t *testing.T) {
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
 		Entries: []windowsRouteJournalEntry{
-			{InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteActive},
-			{InterfaceLUID: 99, InterfaceIndex: 12, Destination: otherPrefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteActive},
+			{InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteActive},
+			{InterfaceLUID: 99, InterfaceIndex: 12, Destination: otherPrefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteActive},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestWindowsRouteJournalAbandonsChangedReplacement(t *testing.T) {
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
 		Entries: []windowsRouteJournalEntry{{
-			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteActive,
+			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteActive,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestWindowsRouteJournalAbandonsChangedReplacement(t *testing.T) {
 	}
 }
 
-func TestWindowsRouteJournalDropsAmbiguousPendingRoute(t *testing.T) {
+func TestWindowsRouteJournalRecoversPendingCreateByExactSignature(t *testing.T) {
 	prefix := netip.MustParsePrefix("203.0.113.0/24")
 	op := &windowsRouteOperator{
 		interfaceLUID: 55,
@@ -180,8 +180,12 @@ func TestWindowsRouteJournalDropsAmbiguousPendingRoute(t *testing.T) {
 		*got = row
 		return nil
 	}
-	op.api.delete = func(*windows.MibIpForwardRow2) error {
-		t.Fatal("pending route must not be deleted automatically")
+	deleteCalls := 0
+	op.api.delete = func(got *windows.MibIpForwardRow2) error {
+		deleteCalls++
+		if !windowsRouteRowsMatch(*got, row) {
+			t.Fatalf("deleted row = %+v, want exact pending signature %+v", *got, row)
+		}
 		return nil
 	}
 	journal := newWindowsRouteJournalForTest()
@@ -189,7 +193,7 @@ func TestWindowsRouteJournalDropsAmbiguousPendingRoute(t *testing.T) {
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
 		Entries: []windowsRouteJournalEntry{{
-			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRoutePending,
+			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRoutePending,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -201,8 +205,112 @@ func TestWindowsRouteJournalDropsAmbiguousPendingRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(data.Entries) != 0 || deleteCalls != 1 {
+		t.Fatalf("pending create recovery left entries=%+v deleteCalls=%d", data.Entries, deleteCalls)
+	}
+}
+
+func TestWindowsRouteJournalReleasesPendingWhenOnlySamePrefixForeignSignatureExists(t *testing.T) {
+	prefix := netip.MustParsePrefix("203.0.113.0/24")
+	op := &windowsRouteOperator{interfaceLUID: 55, interfaceIdx: 12, api: windowsRouteAPI{initEntry: func(*windows.MibIpForwardRow2) {}}}
+	foreign := op.routeRowWithMetric(prefix, 9001)
+	op.api.get = func(got *windows.MibIpForwardRow2) error {
+		*got = foreign
+		return nil
+	}
+	op.api.delete = func(*windows.MibIpForwardRow2) error {
+		t.Fatal("same-prefix route with a different signature must not be deleted")
+		return nil
+	}
+	journal := newWindowsRouteJournalForTest()
+	op.journal = journal
+	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion, Entries: []windowsRouteJournalEntry{{
+		InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: 9002, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRoutePending,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := journal.load()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(data.Entries) != 0 {
-		t.Fatalf("pending non-ownership entry was preserved: %+v", data.Entries)
+		t.Fatalf("absent pending signature was not released: %+v", data.Entries)
+	}
+}
+
+func TestWindowsRouteJournalRecoversCrashAfterCreateBeforeRecordOwnership(t *testing.T) {
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	journal := newWindowsRouteJournalForTest()
+	var created *windows.MibIpForwardRow2
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get: func(got *windows.MibIpForwardRow2) error {
+				if created == nil {
+					return windows.ERROR_NOT_FOUND
+				}
+				*got = *created
+				return nil
+			},
+			create: func(row *windows.MibIpForwardRow2) error {
+				copy := *row
+				created = &copy
+				return nil
+			},
+		},
+	}
+	if err := journal.prepare(context.Background(), op, prefix); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := op.Add(context.Background(), prefix); err != nil || !result.Committed {
+		t.Fatalf("create result=%+v error=%v", result, err)
+	}
+	if created.Metric == windowsRouteMetric || created.Metric == 0 {
+		t.Fatalf("create did not use a unique journal signature metric: %d", created.Metric)
+	}
+
+	// Simulate process termination after CreateIpForwardEntry2 and before RecordOwnership.
+	transition := op.transition
+	op.transition = nil
+	if err := transition.lock.unlock(); err != nil {
+		t.Fatal(err)
+	}
+
+	deleteCalls := 0
+	recovery := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get: func(got *windows.MibIpForwardRow2) error {
+				*got = *created
+				return nil
+			},
+			delete: func(row *windows.MibIpForwardRow2) error {
+				deleteCalls++
+				if !windowsRouteRowsMatch(*row, *created) {
+					t.Fatalf("recovery deleted non-signature row: got=%+v want=%+v", *row, *created)
+				}
+				return nil
+			},
+		},
+	}
+	if err := recovery.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := journal.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteCalls != 1 || len(data.Entries) != 0 {
+		t.Fatalf("crash recovery deleteCalls=%d entries=%+v", deleteCalls, data.Entries)
 	}
 }
 
@@ -236,7 +344,7 @@ func TestWindowsRouteJournalDeleteSuccessAbandonsRecreatedRoute(t *testing.T) {
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
 		Entries: []windowsRouteJournalEntry{{
-			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteActive,
+			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteActive,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -285,7 +393,7 @@ func TestWindowsRouteJournalRetriesDeletingEntryAfterDeleteAndReadFailures(t *te
 	if err := journal.save(windowsRouteJournalData{
 		Version: windowsRouteJournalVersion,
 		Entries: []windowsRouteJournalEntry{{
-			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, State: windowsRouteDeleting,
+			InterfaceLUID: 55, InterfaceIndex: 12, Destination: prefix.String(), Metric: windowsRouteMetric, Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteDeleting,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -354,13 +462,17 @@ func TestWindowsRouteJournalWritesWholeAtomicStatesAndCleansUp(t *testing.T) {
 	op := &windowsRouteOperator{interfaceLUID: 55, interfaceIdx: 12, journal: journal}
 	prefix := netip.MustParsePrefix("203.0.113.0/24")
 
-	if err := journal.prepare(op, prefix); err != nil {
+	op.api = windowsRouteAPI{
+		initEntry: func(*windows.MibIpForwardRow2) {},
+		get:       func(*windows.MibIpForwardRow2) error { return windows.ERROR_NOT_FOUND },
+	}
+	if err := journal.prepare(context.Background(), op, prefix); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.record(op, prefix); err != nil {
 		t.Fatal(err)
 	}
-	if err := journal.prepareDeletion(op, prefix); err != nil {
+	if err := journal.prepareDeletion(context.Background(), op, prefix); err != nil {
 		t.Fatal(err)
 	}
 	for idx, wantState := range []string{windowsRoutePending, windowsRouteActive, windowsRouteDeleting} {
@@ -371,12 +483,16 @@ func TestWindowsRouteJournalWritesWholeAtomicStatesAndCleansUp(t *testing.T) {
 		if len(data.Entries) != 1 || data.Entries[0].State != wantState {
 			t.Fatalf("atomic write %d = %+v, want state %q", idx, data, wantState)
 		}
+		if !data.Entries[0].BaselineAbsent || data.Entries[0].Metric == 0 {
+			t.Fatalf("atomic write %d lacks absent baseline or route signature: %+v", idx, data.Entries[0])
+		}
 	}
 	if err := journal.release(op, prefix); err != nil {
 		t.Fatal(err)
 	}
-	if storage.value != nil || storage.clearCalls != 1 {
-		t.Fatalf("empty journal cleanup left value=%q clearCalls=%d", storage.value, storage.clearCalls)
+	var empty windowsRouteJournalData
+	if err := json.Unmarshal(storage.value, &empty); err != nil || empty.Version != windowsRouteJournalVersion || len(empty.Entries) != 0 {
+		t.Fatalf("empty journal was not retained as valid state: data=%+v error=%v", empty, err)
 	}
 }
 
@@ -387,6 +503,13 @@ func TestWindowsRouteJournalSecurityDescriptorRequiresProtectedTrustedACL(t *tes
 	}
 	if err := validateWindowsJournalSecurityDescriptor(creationDescriptor); err != nil {
 		t.Fatalf("atomic registry creation descriptor is not trusted: %v", err)
+	}
+	mutexDescriptor, err := newWindowsRouteMutexSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsTrustedACL(mutexDescriptor, windows.MUTEX_ALL_ACCESS, "mutex", false); err != nil {
+		t.Fatalf("Global mutex creation descriptor is not trusted: %v", err)
 	}
 
 	tests := []struct {

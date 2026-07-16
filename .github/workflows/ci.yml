@@ -48,6 +48,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Test elevated Windows route journal integration
+        shell: pwsh
+        run: |
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "Windows route journal integration requires an elevated runner"
+          }
+          go test -tags=routejournalintegration ./internal/tun -run '^TestWindowsRouteJournal(RegistryIntegration|MachineMutexMultiProcess|MachineMutexTimeoutAndAbandonment)$' -count=1 -v
+
       - name: Test
         run: go test ./...
 

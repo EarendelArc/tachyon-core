@@ -60,9 +60,9 @@ type routeState struct {
 
 type routeOwnershipStore interface {
 	Reconcile(context.Context) error
-	PrepareOwnership(netip.Prefix) error
+	PrepareOwnership(context.Context, netip.Prefix) error
 	RecordOwnership(netip.Prefix) error
-	PrepareDeletion(netip.Prefix) error
+	PrepareDeletion(context.Context, netip.Prefix) error
 	ReleaseOwnership(netip.Prefix) error
 }
 
@@ -151,7 +151,7 @@ func installRouteTransaction(ctx context.Context, op routeOperator, plan []netip
 		}
 		store, hasStore := op.(routeOwnershipStore)
 		if hasStore {
-			if err := store.PrepareOwnership(prefix); err != nil {
+			if err := store.PrepareOwnership(ctx, prefix); err != nil {
 				return nil, errors.Join(fmt.Errorf("prepare route journal ownership %s: %w", prefix, err), txn.rollback())
 			}
 		}
@@ -208,14 +208,15 @@ func (t *routeTransaction) rollbackLocked() error {
 	store, hasStore := t.op.(routeOwnershipStore)
 	for idx := len(t.installed) - 1; idx >= 0; idx-- {
 		prefix := t.installed[idx]
+		ctx, cancel := context.WithTimeout(context.Background(), routeCleanupTimeout)
 		if hasStore {
-			if err := store.PrepareDeletion(prefix); err != nil {
+			if err := store.PrepareDeletion(ctx, prefix); err != nil {
+				cancel()
 				remaining = append(remaining, prefix)
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("prepare route journal deletion %s: %w", prefix, err))
 				continue
 			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), routeCleanupTimeout)
 		state, readErr := t.op.Read(ctx, prefix)
 		if readErr != nil {
 			cancel()

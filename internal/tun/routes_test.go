@@ -42,7 +42,7 @@ func (f *fakeOwnershipRouteOperator) setOwnership(prefix netip.Prefix, state str
 	f.ownership[prefix] = state
 }
 
-func (f *fakeOwnershipRouteOperator) PrepareOwnership(prefix netip.Prefix) error {
+func (f *fakeOwnershipRouteOperator) PrepareOwnership(_ context.Context, prefix netip.Prefix) error {
 	f.setOwnership(prefix, windowsRoutePendingForTest)
 	return nil
 }
@@ -52,7 +52,7 @@ func (f *fakeOwnershipRouteOperator) RecordOwnership(prefix netip.Prefix) error 
 	return nil
 }
 
-func (f *fakeOwnershipRouteOperator) PrepareDeletion(prefix netip.Prefix) error {
+func (f *fakeOwnershipRouteOperator) PrepareDeletion(_ context.Context, prefix netip.Prefix) error {
 	f.setOwnership(prefix, windowsRouteDeletingForTest)
 	return nil
 }

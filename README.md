@@ -49,6 +49,15 @@ tachyonctl health --addr 127.0.0.1:55123
   that set and the game CIDRs, so installed game routes never make reconnects
   depend on system DNS. Empty `game_routes` means no additional destination
   routes; Windows still configures the TUN address and MTU with `store=active`.
+- Windows route ownership comes only from a successful synchronous IP Helper
+  create result, including a typed committed result followed by context
+  cancellation; readback after an ordinary create error never claims a
+  concurrent route. A successful delete immediately releases ownership, so an
+  identical route recreated later is not removed by a subsequent cleanup.
+- Crash recovery state is stored under the machine-wide protected
+  `ProgramData\\Tachyon` directory. Its non-inheriting ACL permits only SYSTEM
+  and Administrators, and Core rejects reparse points, paths outside that root,
+  untrusted owners or ACLs, and malformed journal data before route deletion.
 - Client route rules support process name, CIDR, and protocol matching.
   `domain` and `geoip` rules fail validation until Core has implementations
   that can make deterministic packet-path decisions.

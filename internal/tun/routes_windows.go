@@ -53,12 +53,16 @@ func newPlatformRouteOperator(interfaceName string, interfaceLUID uint64) (route
 	if err != nil {
 		return nil, fmt.Errorf("resolve Wintun LUID %d to interface index: %w", interfaceLUID, err)
 	}
+	journal, err := newDefaultWindowsRouteJournal()
+	if err != nil {
+		return nil, err
+	}
 	return &windowsRouteOperator{
 		interfaceName: interfaceName,
 		interfaceLUID: interfaceLUID,
 		interfaceIdx:  index,
 		api:           api,
-		journal:       newWindowsRouteJournal(defaultWindowsRouteJournalPath()),
+		journal:       journal,
 	}, nil
 }
 
@@ -88,40 +92,40 @@ func (o *windowsRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (r
 	return routeState{Exists: true, Matches: windowsRouteRowsMatch(got, want)}, nil
 }
 
-func (o *windowsRouteOperator) Add(ctx context.Context, prefix netip.Prefix) error {
+func (o *windowsRouteOperator) Add(ctx context.Context, prefix netip.Prefix) (routeAddResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return routeAddResult{}, err
 	}
 	row := o.routeRow(prefix)
 	err := o.api.create(&row)
 	if errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		return errors.Join(ErrRouteAlreadyExists, err)
+		return routeAddResult{}, errors.Join(ErrRouteAlreadyExists, err)
 	}
 	if err != nil {
-		return fmt.Errorf("CreateIpForwardEntry2: %w", err)
+		return routeAddResult{}, fmt.Errorf("CreateIpForwardEntry2: %w", err)
 	}
-	return ctx.Err()
+	return routeAddResult{Committed: true}, ctx.Err()
 }
 
-func (o *windowsRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) error {
+func (o *windowsRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) (routeDeleteResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return routeDeleteResult{}, err
 	}
 	row := o.routeRow(prefix)
 	if err := o.api.get(&row); err != nil {
 		if errors.Is(err, windows.ERROR_NOT_FOUND) {
-			return nil
+			return routeDeleteResult{}, nil
 		}
-		return fmt.Errorf("GetIpForwardEntry2 before delete: %w", err)
+		return routeDeleteResult{}, fmt.Errorf("GetIpForwardEntry2 before delete: %w", err)
 	}
 	want := o.routeRow(prefix)
 	if !windowsRouteRowsMatch(row, want) {
-		return fmt.Errorf("route no longer matches Tachyon-owned attributes")
+		return routeDeleteResult{}, fmt.Errorf("route no longer matches Tachyon-owned attributes")
 	}
 	if err := o.api.delete(&row); err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) {
-		return fmt.Errorf("DeleteIpForwardEntry2: %w", err)
+		return routeDeleteResult{}, fmt.Errorf("DeleteIpForwardEntry2: %w", err)
 	}
-	return ctx.Err()
+	return routeDeleteResult{Committed: true}, ctx.Err()
 }
 
 func (o *windowsRouteOperator) routeRow(prefix netip.Prefix) windows.MibIpForwardRow2 {
@@ -214,4 +218,8 @@ func (o *windowsRouteOperator) PrepareOwnership(prefix netip.Prefix) error {
 
 func (o *windowsRouteOperator) ReleaseOwnership(prefix netip.Prefix) error {
 	return o.journal.release(o, prefix)
+}
+
+func (o *windowsRouteOperator) PrepareDeletion(prefix netip.Prefix) error {
+	return o.journal.prepareDeletion(o, prefix)
 }

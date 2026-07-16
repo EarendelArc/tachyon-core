@@ -177,7 +177,7 @@ func selectiveRoutesCheck(goos string, routes []string) Check {
 		return Check{
 			ID:          CheckSelectiveRoutes,
 			Status:      StatusOK,
-			Message:     "client.tun.game_routes is empty; Core will not resolve the Relay or install OS destination routes during startup.",
+			Message:     "client.tun.game_routes is empty, so Core installs no OS destination routes; client startup still parses the Relay address, resolves its hostname once, and pins the approved IP:port set before TUN setup.",
 			Remediation: "",
 		}
 	}

@@ -16,8 +16,11 @@ All notable changes to Tachyon Core will be documented in this file.
   means no additional destination routes, while Windows TUN addresses and MTU
   remain explicit `store=active` OS state.
 - Windows selective routes now use Wintun LUID/IP Helper identity, exact
-  baseline/readback ownership, retryable per-route cleanup, and an auditable
-  crash journal that reconciles only matching routes on the same adapter.
+  baseline/readback validation, explicit committed create/delete results, and
+  retryable per-route cleanup without claiming concurrent replacements. The
+  crash journal now lives under protected machine-wide ProgramData with a
+  SYSTEM/Administrators-only DACL and validates path, reparse, owner, ACL, and
+  content trust before reconciling matching routes on the same adapter.
 - TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
   budget, carries relay time for path-request clock alignment, rejects v1/v2
   peers, and records oversized receive drops.

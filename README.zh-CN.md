@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Windows 路由以 Wintun 的稳定 LUID/interface index 和精确目标属性作为身份；接口重命名不会改变 ownership。Add 前记录 baseline，Add 后无论成功、超时或取消都读回；删除失败会保留 ownership，后续 `Close` 可重试。崩溃恢复 journal 只处理同一 Wintun 身份上已确认由 Tachyon 创建且属性完全匹配的路由。
+Windows 路由以 Wintun 的稳定 LUID/interface index 和精确目标属性作为身份；接口重命名不会改变 ownership。只有同步 IP Helper Create 明确成功（包括成功后观察到 context 取消的 typed committed 结果）才建立 ownership；普通错误后的匹配 readback 不会认领并发对象。Delete 明确成功后立即放弃 ownership，之后重建的同属性路由不会被后续 `Close` 删除。崩溃恢复 journal 位于机器级受保护的 `ProgramData\\Tachyon` 目录，仅允许 SYSTEM/Administrators，且在删除路由前拒绝 reparse、越界路径、不可信 owner/DACL 和损坏内容。
 
 Core 在创建 TUN 和安装路由前只解析一次 Relay，并 pin 获批的 `IP:port` 集合。拨号、重连和迁移复用同一 validator，安装路由后不再依赖系统 DNS。空 `game_routes` 表示“无额外游戏目标路由”，并不表示没有 OS 状态；Windows TUN 地址和 MTU 都显式使用 `store=active`。
 

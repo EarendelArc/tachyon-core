@@ -77,8 +77,8 @@ func TestRunWithFactsEmptyGameRoutesNeedsNoRouteSupport(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("SELECTIVE_ROUTES_SUPPORTED status = %q, want ok", check.Status)
 	}
-	if !strings.Contains(check.Message, "will not resolve the Relay") || check.Remediation != "" {
-		t.Fatalf("empty game_routes check does not explain no-op startup: %#v", check)
+	if !strings.Contains(check.Message, "resolves its hostname once") || !strings.Contains(check.Message, "pins the approved IP:port set") || check.Remediation != "" {
+		t.Fatalf("empty game_routes check does not describe Relay pinning semantics: %#v", check)
 	}
 }
 

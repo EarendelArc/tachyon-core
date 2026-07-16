@@ -39,8 +39,18 @@ type RouteTransaction interface {
 
 type routeOperator interface {
 	Read(context.Context, netip.Prefix) (routeState, error)
-	Add(context.Context, netip.Prefix) error
-	Delete(context.Context, netip.Prefix) error
+	Add(context.Context, netip.Prefix) (routeAddResult, error)
+	Delete(context.Context, netip.Prefix) (routeDeleteResult, error)
+}
+
+// routeAddResult reports whether the platform create API committed a new
+// route. Callers must never infer ownership from readback after an error.
+type routeAddResult struct {
+	Committed bool
+}
+
+type routeDeleteResult struct {
+	Committed bool
 }
 
 type routeState struct {
@@ -52,6 +62,7 @@ type routeOwnershipStore interface {
 	Reconcile(context.Context) error
 	PrepareOwnership(netip.Prefix) error
 	RecordOwnership(netip.Prefix) error
+	PrepareDeletion(netip.Prefix) error
 	ReleaseOwnership(netip.Prefix) error
 }
 
@@ -68,20 +79,27 @@ func InstallSelectiveRoutes(ctx context.Context, opts SelectiveRouteOptions) (Ro
 	if err != nil {
 		return nil, err
 	}
-	if len(plan) == 0 {
-		return &routeTransaction{}, nil
-	}
 	if !SelectiveRoutesSupported() {
+		if len(plan) == 0 {
+			return &routeTransaction{}, nil
+		}
 		return nil, ErrSelectiveRoutesUnsupported
 	}
 	op, err := newPlatformRouteOperator(opts.InterfaceName, opts.InterfaceLUID)
 	if err != nil {
 		return nil, err
 	}
+	return installPlannedSelectiveRoutes(ctx, op, plan)
+}
+
+func installPlannedSelectiveRoutes(ctx context.Context, op routeOperator, plan []netip.Prefix) (RouteTransaction, error) {
 	if store, ok := op.(routeOwnershipStore); ok {
 		if err := store.Reconcile(ctx); err != nil {
 			return nil, fmt.Errorf("reconcile selective route journal: %w", err)
 		}
+	}
+	if len(plan) == 0 {
+		return &routeTransaction{op: op}, nil
 	}
 	return installRouteTransaction(ctx, op, plan)
 }
@@ -138,19 +156,19 @@ func installRouteTransaction(ctx context.Context, op routeOperator, plan []netip
 			}
 		}
 
-		addErr := op.Add(ctx, prefix)
-		readCtx, cancel := context.WithTimeout(context.Background(), routeReadbackTimeout)
-		result, readErr := op.Read(readCtx, prefix)
-		cancel()
-		owned := result.Matches && !errors.Is(addErr, ErrRouteAlreadyExists)
-		if owned {
+		addResult, addErr := op.Add(ctx, prefix)
+		if addResult.Committed {
 			txn.installed = append(txn.installed, prefix)
 			if hasStore {
 				if err := store.RecordOwnership(prefix); err != nil {
-					return nil, errors.Join(fmt.Errorf("journal owned game destination route %s: %w", prefix, err), txn.rollback())
+					return nil, errors.Join(fmt.Errorf("journal owned game destination route %s: %w", prefix, err), addErr, txn.rollback())
 				}
 			}
-		} else if hasStore && readErr == nil {
+		}
+		readCtx, cancel := context.WithTimeout(context.Background(), routeReadbackTimeout)
+		result, readErr := op.Read(readCtx, prefix)
+		cancel()
+		if !addResult.Committed && hasStore {
 			if err := store.ReleaseOwnership(prefix); err != nil {
 				return nil, errors.Join(fmt.Errorf("clear unowned route journal intent %s: %w", prefix, err), addErr, txn.rollback())
 			}
@@ -187,41 +205,67 @@ func (t *routeTransaction) rollbackLocked() error {
 
 	var rollbackErr error
 	remaining := make([]netip.Prefix, 0, len(t.installed))
+	store, hasStore := t.op.(routeOwnershipStore)
 	for idx := len(t.installed) - 1; idx >= 0; idx-- {
 		prefix := t.installed[idx]
+		if hasStore {
+			if err := store.PrepareDeletion(prefix); err != nil {
+				remaining = append(remaining, prefix)
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("prepare route journal deletion %s: %w", prefix, err))
+				continue
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), routeCleanupTimeout)
 		state, readErr := t.op.Read(ctx, prefix)
-		var deleteErr error
-		if readErr == nil && state.Exists && !state.Matches {
-			deleteErr = fmt.Errorf("owned route attributes changed; refusing deletion")
-		} else if readErr == nil && state.Matches {
-			deleteErr = t.op.Delete(ctx, prefix)
+		if readErr != nil {
+			cancel()
+			remaining = append(remaining, prefix)
+			if hasStore {
+				rollbackErr = errors.Join(rollbackErr, store.RecordOwnership(prefix))
+			}
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove game destination route %s: %w", prefix, readErr))
+			continue
 		}
+		if !state.Matches {
+			cancel()
+			if hasStore {
+				rollbackErr = errors.Join(rollbackErr, releaseRouteOwnership(store, prefix))
+			}
+			continue
+		}
+
+		deleteResult, deleteErr := t.op.Delete(ctx, prefix)
 		cancel()
+		if deleteResult.Committed || deleteErr == nil {
+			if hasStore {
+				rollbackErr = errors.Join(rollbackErr, releaseRouteOwnership(store, prefix))
+			}
+			continue
+		}
 
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), routeReadbackTimeout)
 		result, verifyErr := t.op.Read(verifyCtx, prefix)
 		verifyCancel()
-		if verifyErr == nil && !result.Exists {
-			if store, ok := t.op.(routeOwnershipStore); ok {
-				if err := store.ReleaseOwnership(prefix); err != nil {
-					rollbackErr = errors.Join(rollbackErr, fmt.Errorf("release route journal ownership %s: %w", prefix, err))
-					remaining = append(remaining, prefix)
-					continue
-				}
+		if verifyErr == nil && result.Matches {
+			remaining = append(remaining, prefix)
+			if hasStore {
+				rollbackErr = errors.Join(rollbackErr, store.RecordOwnership(prefix))
 			}
-			continue
+		} else if hasStore {
+			rollbackErr = errors.Join(rollbackErr, releaseRouteOwnership(store, prefix))
 		}
-		remaining = append(remaining, prefix)
-		cause := errors.Join(readErr, deleteErr, verifyErr)
-		if cause == nil {
-			cause = errors.New("route still exists after deletion")
-		}
-		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove game destination route %s: %w", prefix, cause))
+		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove game destination route %s: %w", prefix, errors.Join(deleteErr, verifyErr)))
 	}
 	for left, right := 0, len(remaining)-1; left < right; left, right = left+1, right-1 {
 		remaining[left], remaining[right] = remaining[right], remaining[left]
 	}
 	t.installed = remaining
 	return rollbackErr
+}
+
+func releaseRouteOwnership(store routeOwnershipStore, prefix netip.Prefix) error {
+	if err := store.ReleaseOwnership(prefix); err != nil {
+		return fmt.Errorf("release route journal ownership %s: %w", prefix, err)
+	}
+	return nil
 }

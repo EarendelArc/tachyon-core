@@ -18,8 +18,25 @@ type fakeRouteOperator struct {
 	failAddAt   int
 	addErr      error
 	createOnErr bool
+	commitOnErr bool
 	deleteFails map[netip.Prefix]int
+	recreate    map[netip.Prefix]routeState
 }
+
+type fakeOwnershipRouteOperator struct {
+	*fakeRouteOperator
+	reconcileCalls int
+}
+
+func (f *fakeOwnershipRouteOperator) Reconcile(context.Context) error {
+	f.reconcileCalls++
+	return nil
+}
+
+func (f *fakeOwnershipRouteOperator) PrepareOwnership(netip.Prefix) error { return nil }
+func (f *fakeOwnershipRouteOperator) RecordOwnership(netip.Prefix) error  { return nil }
+func (f *fakeOwnershipRouteOperator) PrepareDeletion(netip.Prefix) error  { return nil }
+func (f *fakeOwnershipRouteOperator) ReleaseOwnership(netip.Prefix) error { return nil }
 
 func (f *fakeRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (routeState, error) {
 	if err := ctx.Err(); err != nil {
@@ -30,9 +47,9 @@ func (f *fakeRouteOperator) Read(ctx context.Context, prefix netip.Prefix) (rout
 	return f.routes[prefix], nil
 }
 
-func (f *fakeRouteOperator) Add(ctx context.Context, prefix netip.Prefix) error {
+func (f *fakeRouteOperator) Add(ctx context.Context, prefix netip.Prefix) (routeAddResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return routeAddResult{}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -42,25 +59,28 @@ func (f *fakeRouteOperator) Add(ctx context.Context, prefix netip.Prefix) error 
 			f.setRoute(prefix, routeState{Exists: true, Matches: true})
 		}
 		if f.addErr != nil {
-			return f.addErr
+			return routeAddResult{Committed: f.commitOnErr}, f.addErr
 		}
-		return errors.New("injected add failure")
+		return routeAddResult{Committed: f.commitOnErr}, errors.New("injected add failure")
 	}
 	f.setRoute(prefix, routeState{Exists: true, Matches: true})
-	return nil
+	return routeAddResult{Committed: true}, nil
 }
 
-func (f *fakeRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) error {
+func (f *fakeRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) (routeDeleteResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, prefix)
 	f.deleteCtxs = append(f.deleteCtxs, ctx)
 	if f.deleteFails[prefix] > 0 {
 		f.deleteFails[prefix]--
-		return errors.New("injected delete failure")
+		return routeDeleteResult{}, errors.New("injected delete failure")
 	}
 	delete(f.routes, prefix)
-	return nil
+	if replacement, ok := f.recreate[prefix]; ok {
+		f.setRoute(prefix, replacement)
+	}
+	return routeDeleteResult{Committed: true}, nil
 }
 
 func (f *fakeRouteOperator) setRoute(prefix netip.Prefix, state routeState) {
@@ -106,6 +126,20 @@ func TestPlanSelectiveRoutesRejectsRelayOverlap(t *testing.T) {
 	}
 }
 
+func TestEmptySelectiveRoutePlanStillReconcilesOwnership(t *testing.T) {
+	op := &fakeOwnershipRouteOperator{fakeRouteOperator: &fakeRouteOperator{}}
+	txn, err := installPlannedSelectiveRoutes(context.Background(), op, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.reconcileCalls != 1 {
+		t.Fatalf("reconcile calls = %d, want 1", op.reconcileCalls)
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInstallRouteTransactionRollsBackInReverseOrder(t *testing.T) {
 	op := &fakeRouteOperator{failAddAt: 3}
 	plan := []netip.Prefix{
@@ -140,6 +174,7 @@ func TestInstallRouteTransactionOwnsAndRollsBackAddThatTimedOutAfterCreation(t *
 		failAddAt:   1,
 		addErr:      context.DeadlineExceeded,
 		createOnErr: true,
+		commitOnErr: true,
 	}
 
 	_, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix})
@@ -148,6 +183,22 @@ func TestInstallRouteTransactionOwnsAndRollsBackAddThatTimedOutAfterCreation(t *
 	}
 	if !reflect.DeepEqual(op.deleteCalls, []netip.Prefix{prefix}) {
 		t.Fatalf("created route was not rolled back: %v", op.deleteCalls)
+	}
+}
+
+func TestInstallRouteTransactionDoesNotOwnMatchingReadbackAfterOrdinaryAddError(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{
+		failAddAt:   1,
+		addErr:      errors.New("create failed while another actor added the route"),
+		createOnErr: true,
+	}
+
+	if _, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix}); err == nil {
+		t.Fatal("expected add failure")
+	}
+	if len(op.deleteCalls) != 0 {
+		t.Fatalf("matching concurrent route was treated as owned: %v", op.deleteCalls)
 	}
 }
 
@@ -254,5 +305,24 @@ func TestRouteTransactionConcurrentCloseSerializesOwnership(t *testing.T) {
 	}
 	if len(op.deleteCalls) != 1 {
 		t.Fatalf("concurrent Close deleted route %d times", len(op.deleteCalls))
+	}
+}
+
+func TestRouteTransactionDeleteSuccessAbandonsRecreatedMatchingRoute(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	op := &fakeRouteOperator{
+		routes:   map[netip.Prefix]routeState{prefix: {Exists: true, Matches: true}},
+		recreate: map[netip.Prefix]routeState{prefix: {Exists: true, Matches: true}},
+	}
+	txn := &routeTransaction{op: op, installed: []netip.Prefix{prefix}}
+
+	if err := txn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(op.deleteCalls) != 1 {
+		t.Fatalf("recreated replacement was deleted on a later Close: %v", op.deleteCalls)
 	}
 }

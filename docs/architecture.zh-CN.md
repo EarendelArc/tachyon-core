@@ -2,7 +2,7 @@
 
 [English](architecture.md)
 
-Windows 选择性路由以 Wintun adapter LUID、interface index、目标、next hop、metric 和 protocol 作为精确身份，因此接口重命名不影响 ownership。每次 Add 前记录 baseline，Add 后无论成功、超时或取消都读回；每条删除使用独立超时，失败项保留给后续 `Close` 重试。进程崩溃后的 journal 只 reconcile 同一稳定 Wintun 身份上曾确认由 Tachyon 创建且属性完全匹配的路由。
+Windows 选择性路由以 Wintun adapter LUID、interface index、目标、next hop、固定低 metric `1` 和 protocol 作为精确身份，因此接口重命名不影响 ownership。每次 Add 前记录不存在的 baseline 和随机 128-bit journal transaction ID，但 transaction ID 不写入路由属性；Add 后无论成功、超时或取消都读回。受保护的 HKLM coordination 子键原子初始化 128-bit secret，使并发的首次管理员启动派生同一个由 Administrators 持有、仅允许 SYSTEM/Administrators 的 `Global\\` mutex；这把锁覆盖完整 journal read-modify-write 和对应 IP Helper create/delete。每条删除使用独立超时，失败项保留给后续 `Close` 重试。进程崩溃后的 journal 只 reconcile 当前进程持有的同一稳定 Wintun 身份上属性完全匹配的路由，并拒绝非 Administrators owner、不可信 ACL、异常值或损坏内容。SYSTEM 和 Administrators 构成信任边界：恶意或不协作的同权限管理员本就能改写 HKLM 和系统路由表，因此这类同管理员权限 race 不在不可信攻击者模型内。
 
 Core 在 TUN 创建和路由修改前一次解析 Relay 并 pin 获批的 `IP:port` 集合。拨号、重连和 remote 迁移均复用同一 validator，安装路由后不再依赖系统 DNS。空 `game_routes` 仅表示无额外游戏目标路由；Windows 仍以 `store=active` 配置 TUN 地址和 MTU。
 

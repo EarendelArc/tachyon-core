@@ -19,12 +19,18 @@ All notable changes to Tachyon Core will be documented in this file.
   baseline/readback validation, explicit committed create/delete results, and
   retryable per-route cleanup without claiming concurrent replacements. The
   crash journal now uses an atomically created, SYSTEM/Administrators-only HKLM
-  registry key and a single atomic state value. A protected Global mutex binds
-  machine-wide journal updates to route transitions, while per-create random
-  metric signatures close the Create-before-Record crash window without
-  touching same-prefix foreign routes. Reads enforce REG_BINARY and a 1 MiB
-  allocation ceiling, empty state keeps the protected 64-bit key, and Windows
-  CI exercises real HKLM ACL/type/size plus multiprocess lock behavior.
+  registry key and a single atomic state value. An atomically initialized
+  128-bit secret in its protected coordination subkey derives the
+  Administrators-owned Global mutex name, so concurrent elevated first starts
+  converge on one lock. The mutex binds machine-wide journal updates to route
+  transitions; routes keep the fixed low metric `1`, while random transaction
+  IDs remain journal-only. Recovery additionally requires current-process
+  Wintun ownership and the exact fixed route identity. Reads enforce REG_BINARY
+  and a 1 MiB allocation ceiling, empty state keeps the protected 64-bit key,
+  and Windows CI exercises real HKLM ACL/type/size, multiprocess locking, and
+  real-route abandoned-pending recovery. SYSTEM/Administrators are the trust
+  boundary because a same-privilege administrator can already rewrite HKLM and
+  the route table; malicious same-administrator races remain out of scope.
 - TGP v3 authenticates and negotiates the 1232-1452 byte encrypted datagram
   budget, carries relay time for path-request clock alignment, rejects v1/v2
   peers, and records oversized receive drops.

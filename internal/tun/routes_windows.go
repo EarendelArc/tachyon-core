@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -40,15 +41,23 @@ type windowsRouteOperator struct {
 	interfaceIdx  uint32
 	api           windowsRouteAPI
 	journal       *windowsRouteJournal
-	routeMetrics  map[netip.Prefix]uint32
 	transition    *windowsRouteJournalTransition
+	adapterOwned  func() bool
 }
+
+var currentWindowsAdapters = struct {
+	sync.Mutex
+	luids map[uint64]uint32
+}{luids: make(map[uint64]uint32)}
 
 func SelectiveRoutesSupported() bool { return true }
 
 func newPlatformRouteOperator(interfaceName string, interfaceLUID uint64) (routeOperator, error) {
 	if interfaceLUID == 0 {
 		return nil, fmt.Errorf("selective routes require the stable Wintun interface LUID")
+	}
+	if !windowsAdapterOwnedByCurrentProcess(interfaceLUID) {
+		return nil, fmt.Errorf("selective routes require a Wintun adapter owned by the current process")
 	}
 	api := systemWindowsRouteAPI()
 	index, err := api.toIndex(interfaceLUID)
@@ -65,6 +74,7 @@ func newPlatformRouteOperator(interfaceName string, interfaceLUID uint64) (route
 		interfaceIdx:  index,
 		api:           api,
 		journal:       journal,
+		adapterOwned:  func() bool { return windowsAdapterOwnedByCurrentProcess(interfaceLUID) },
 	}, nil
 }
 
@@ -113,6 +123,8 @@ func (o *windowsRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) 
 	if err := ctx.Err(); err != nil {
 		return routeDeleteResult{}, err
 	}
+	// DeleteIpForwardEntry2 has no compare-delete primitive. The ownership
+	// store must hold the protected machine lock across this read and delete.
 	row := o.routeRow(prefix)
 	if err := o.api.get(&row); err != nil {
 		if errors.Is(err, windows.ERROR_NOT_FOUND) {
@@ -131,11 +143,33 @@ func (o *windowsRouteOperator) Delete(ctx context.Context, prefix netip.Prefix) 
 }
 
 func (o *windowsRouteOperator) routeRow(prefix netip.Prefix) windows.MibIpForwardRow2 {
-	metric := uint32(windowsRouteMetric)
-	if prepared, ok := o.routeMetrics[prefix.Masked()]; ok {
-		metric = prepared
+	return o.routeRowWithMetric(prefix, windowsRouteMetric)
+}
+
+func registerCurrentWindowsAdapter(luid uint64) {
+	currentWindowsAdapters.Lock()
+	defer currentWindowsAdapters.Unlock()
+	currentWindowsAdapters.luids[luid]++
+}
+
+func unregisterCurrentWindowsAdapter(luid uint64) {
+	currentWindowsAdapters.Lock()
+	defer currentWindowsAdapters.Unlock()
+	if currentWindowsAdapters.luids[luid] <= 1 {
+		delete(currentWindowsAdapters.luids, luid)
+		return
 	}
-	return o.routeRowWithMetric(prefix, metric)
+	currentWindowsAdapters.luids[luid]--
+}
+
+func windowsAdapterOwnedByCurrentProcess(luid uint64) bool {
+	currentWindowsAdapters.Lock()
+	defer currentWindowsAdapters.Unlock()
+	return currentWindowsAdapters.luids[luid] != 0
+}
+
+func (o *windowsRouteOperator) adapterOwnershipProven() bool {
+	return o.adapterOwned == nil || o.adapterOwned()
 }
 
 func (o *windowsRouteOperator) routeRowWithMetric(prefix netip.Prefix, metric uint32) windows.MibIpForwardRow2 {

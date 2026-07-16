@@ -30,6 +30,7 @@ type windowsTUN struct {
 	writeMu       sync.Mutex
 	closeOnce     sync.Once
 	closeErr      error
+	registered    bool
 }
 
 type wintunAPI struct {
@@ -92,6 +93,8 @@ func newDevice(opts Options) (Device, error) {
 		_ = tun.Close()
 		return nil, err
 	}
+	registerCurrentWindowsAdapter(luid)
+	tun.registered = true
 	return tun, nil
 }
 
@@ -149,6 +152,10 @@ func (t *windowsTUN) WritePacket(buf []byte) error {
 
 func (t *windowsTUN) Close() error {
 	t.closeOnce.Do(func() {
+		if t.registered {
+			unregisterCurrentWindowsAdapter(t.luid)
+			t.registered = false
+		}
 		if t.session != 0 {
 			t.api.endSession.Call(t.session)
 		}

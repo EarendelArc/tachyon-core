@@ -56,17 +56,24 @@ tachyonctl health --addr 127.0.0.1:55123
   identical route recreated later is not removed by a subsequent cleanup.
 - Crash recovery state is stored as one atomic machine-wide registry value at
   `HKLM\\SOFTWARE\\Tachyon\\RouteJournal`. The key is created with a protected
-  DACL that permits only SYSTEM and Administrators; Core rejects an untrusted
-  owner, ACL, value type, values larger than 1 MiB, or malformed journal before
-  route deletion. A protected SYSTEM/Administrators-only `Global\\` mutex
-  serializes every machine journal update with its IP Helper route transition;
-  timeout fails closed and an abandoned owner is recovered from the durable
-  journal. Before Create, each pending entry records an absent baseline and a
-  random nonzero metric signature. Recovery claims and removes only a route
-  with that exact signature, and releases an absent signature without touching
-  another actor's route at the same prefix. Empty state remains a valid journal
-  value under the protected 64-bit registry key. Failed deletes whose readback
-  also fails remain in `deleting` for `Close` or the next startup to retry.
+  DACL that permits only SYSTEM and Administrators and requires Administrators
+  ownership; Core rejects an untrusted owner, ACL, value type, values larger
+  than 1 MiB, or malformed journal before route deletion. The protected HKLM
+  coordination subkey atomically initializes a 128-bit secret from which Core
+  derives a protected, Administrators-owned `Global\\` mutex name, so concurrent
+  elevated first starts converge on the same lock. That mutex serializes every
+  machine journal update with its IP Helper route transition; timeout fails
+  closed and an abandoned owner is recovered from durable state. Routes always
+  use the fixed low metric `1`; the random transaction ID stays in the journal
+  and is never encoded into route attributes. Recovery acts only on the exact
+  fixed route identity for a Wintun adapter currently owned by the Core process,
+  while an absent row releases the journal entry without touching a same-prefix
+  replacement. Empty state remains valid under the protected 64-bit registry
+  key. Failed deletes whose readback also fails remain in `deleting` for `Close`
+  or the next startup to retry. SYSTEM and Administrators are the trust boundary:
+  a malicious or non-cooperating peer with the same administrator authority can
+  already rewrite HKLM and the route table, so that same-privilege race is out of
+  scope rather than treated as an untrusted attacker.
 - Client route rules support process name, CIDR, and protocol matching.
   `domain` and `geoip` rules fail validation until Core has implementations
   that can make deterministic packet-path decisions.

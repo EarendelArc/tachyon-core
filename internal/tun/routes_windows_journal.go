@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,12 +22,13 @@ import (
 )
 
 const (
-	windowsRouteJournalVersion = 3
-	windowsRouteJournalKey     = `SOFTWARE\Tachyon\RouteJournal`
-	windowsRouteJournalValue   = "StateV3"
-	windowsRouteJournalMutex   = `Global\Tachyon.RouteJournal.v3`
-	windowsRouteJournalMaxSize = 1 << 20
-	windowsRouteLockTimeout    = 15 * time.Second
+	windowsRouteJournalVersion     = 4
+	windowsRouteJournalKey         = `SOFTWARE\Tachyon\RouteJournal`
+	windowsRouteJournalValue       = "StateV4"
+	windowsRouteCoordinationKey    = "CoordinationV4"
+	windowsRouteJournalMutexPrefix = `Global\Tachyon.RouteJournal.v4.`
+	windowsRouteJournalMaxSize     = 1 << 20
+	windowsRouteLockTimeout        = 15 * time.Second
 
 	windowsRoutePending  = "pending"
 	windowsRouteActive   = "active"
@@ -61,7 +63,7 @@ type windowsRouteJournalLock struct {
 
 type windowsRouteJournalTransition struct {
 	prefix netip.Prefix
-	metric uint32
+	txnID  string
 	lock   *windowsRouteJournalLock
 }
 
@@ -74,19 +76,25 @@ type windowsRouteJournalEntry struct {
 	InterfaceLUID  uint64    `json:"interface_luid"`
 	InterfaceIndex uint32    `json:"interface_index"`
 	Destination    string    `json:"destination"`
+	NextHop        string    `json:"next_hop"`
 	Metric         uint32    `json:"metric"`
 	Protocol       uint32    `json:"protocol"`
+	TransactionID  string    `json:"transaction_id"`
 	BaselineAbsent bool      `json:"baseline_absent"`
 	State          string    `json:"state"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
 func newDefaultWindowsRouteJournal() (*windowsRouteJournal, error) {
-	return &windowsRouteJournal{storage: &registryWindowsRouteJournalStorage{
+	storage := &registryWindowsRouteJournalStorage{
 		root:      registry.LOCAL_MACHINE,
 		keyPath:   windowsRouteJournalKey,
 		valueName: windowsRouteJournalValue,
-	}, locker: &namedWindowsRouteJournalLocker{name: windowsRouteJournalMutex, timeout: windowsRouteLockTimeout}}, nil
+	}
+	return &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{
+		storage: storage,
+		timeout: windowsRouteLockTimeout,
+	}}, nil
 }
 
 func newWindowsRouteJournalForTest() *windowsRouteJournal {
@@ -94,6 +102,9 @@ func newWindowsRouteJournalForTest() *windowsRouteJournal {
 }
 
 func (j *windowsRouteJournal) prepare(ctx context.Context, op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
+	if !op.adapterOwnershipProven() {
+		return errors.New("Wintun adapter is not owned by the current process")
+	}
 	lock, err := j.locker.Lock()
 	if err != nil {
 		return err
@@ -124,20 +135,16 @@ func (j *windowsRouteJournal) prepare(ctx context.Context, op *windowsRouteOpera
 			return fmt.Errorf("route journal already contains ownership for %s", key)
 		}
 	}
-	metric, err := newWindowsRouteSignature(data)
+	txnID, err := newWindowsRouteTransactionID()
 	if err != nil {
 		return err
 	}
-	entry := newWindowsRouteJournalEntry(op, key, metric, windowsRoutePending)
+	entry := newWindowsRouteJournalEntry(op, prefix, txnID, windowsRoutePending)
 	data.Entries = append(data.Entries, entry)
 	if err := j.save(data); err != nil {
 		return err
 	}
-	if op.routeMetrics == nil {
-		op.routeMetrics = make(map[netip.Prefix]uint32)
-	}
-	op.routeMetrics[prefix] = metric
-	op.transition = &windowsRouteJournalTransition{prefix: prefix, metric: metric, lock: lock}
+	op.transition = &windowsRouteJournalTransition{prefix: prefix, txnID: txnID, lock: lock}
 	return nil
 }
 
@@ -146,6 +153,9 @@ func (j *windowsRouteJournal) record(op *windowsRouteOperator, prefix netip.Pref
 }
 
 func (j *windowsRouteJournal) prepareDeletion(ctx context.Context, op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
+	if !op.adapterOwnershipProven() {
+		return errors.New("Wintun adapter is not owned by the current process; refusing route deletion")
+	}
 	lock, err := j.locker.Lock()
 	if err != nil {
 		return err
@@ -168,18 +178,17 @@ func (j *windowsRouteJournal) prepareDeletion(ctx context.Context, op *windowsRo
 	}
 	for idx, entry := range data.Entries {
 		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == prefix.String() {
-			if !entry.BaselineAbsent || entry.Metric == 0 {
-				return fmt.Errorf("route journal ownership for %s has no verifiable signature", prefix)
+			if _, err := validateWindowsRouteJournalEntry(op, entry); err != nil {
+				return fmt.Errorf("route journal ownership for %s has no verifiable signature: %w", prefix, err)
+			}
+			if entry.State != windowsRouteActive && entry.State != windowsRouteDeleting {
+				return fmt.Errorf("route journal ownership for %s is in state %q", prefix, entry.State)
 			}
 			data.Entries[idx].State = windowsRouteDeleting
 			if err := j.save(data); err != nil {
 				return err
 			}
-			if op.routeMetrics == nil {
-				op.routeMetrics = make(map[netip.Prefix]uint32)
-			}
-			op.routeMetrics[prefix] = entry.Metric
-			op.transition = &windowsRouteJournalTransition{prefix: prefix, metric: entry.Metric, lock: lock}
+			op.transition = &windowsRouteJournalTransition{prefix: prefix, txnID: entry.TransactionID, lock: lock}
 			return nil
 		}
 	}
@@ -198,7 +207,10 @@ func (j *windowsRouteJournal) setState(op *windowsRouteOperator, prefix netip.Pr
 	}
 	key := prefix.Masked().String()
 	for idx, entry := range data.Entries {
-		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == key && entry.Metric == transition.metric {
+		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == key && entry.TransactionID == transition.txnID {
+			if _, err := validateWindowsRouteJournalEntry(op, entry); err != nil {
+				return err
+			}
 			data.Entries[idx].State = state
 			return j.save(data)
 		}
@@ -206,17 +218,48 @@ func (j *windowsRouteJournal) setState(op *windowsRouteOperator, prefix netip.Pr
 	return fmt.Errorf("route journal ownership is missing for %s", key)
 }
 
-func newWindowsRouteJournalEntry(op *windowsRouteOperator, key string, metric uint32, state string) windowsRouteJournalEntry {
+func newWindowsRouteJournalEntry(op *windowsRouteOperator, prefix netip.Prefix, txnID, state string) windowsRouteJournalEntry {
+	prefix = prefix.Masked()
 	return windowsRouteJournalEntry{
 		InterfaceLUID:  op.interfaceLUID,
 		InterfaceIndex: op.interfaceIdx,
-		Destination:    key,
-		Metric:         metric,
+		Destination:    prefix.String(),
+		NextHop:        windowsRouteNextHop(prefix),
+		Metric:         windowsRouteMetric,
 		Protocol:       windowsRouteProtocol,
+		TransactionID:  txnID,
 		BaselineAbsent: true,
 		State:          state,
 		CreatedAt:      time.Now().UTC(),
 	}
+}
+
+func validateWindowsRouteJournalEntry(op *windowsRouteOperator, entry windowsRouteJournalEntry) (netip.Prefix, error) {
+	prefix, err := netip.ParsePrefix(entry.Destination)
+	if err != nil || prefix != prefix.Masked() || prefix.Bits() == 0 {
+		return netip.Prefix{}, fmt.Errorf("invalid canonical destination %q", entry.Destination)
+	}
+	if entry.InterfaceLUID != op.interfaceLUID || entry.InterfaceIndex != op.interfaceIdx {
+		return netip.Prefix{}, errors.New("adapter LUID/index does not match the current Wintun adapter")
+	}
+	if entry.NextHop != windowsRouteNextHop(prefix) || entry.Metric != windowsRouteMetric || entry.Protocol != windowsRouteProtocol {
+		return netip.Prefix{}, errors.New("next-hop/protocol/metric does not match the fixed Tachyon route signature")
+	}
+	if !entry.BaselineAbsent {
+		return netip.Prefix{}, errors.New("route baseline was not recorded absent")
+	}
+	txn, err := hex.DecodeString(entry.TransactionID)
+	if err != nil || len(txn) != 16 {
+		return netip.Prefix{}, errors.New("transaction ID is not a 128-bit hexadecimal value")
+	}
+	return prefix, nil
+}
+
+func windowsRouteNextHop(prefix netip.Prefix) string {
+	if prefix.Addr().Is4() {
+		return netip.IPv4Unspecified().String()
+	}
+	return netip.IPv6Unspecified().String()
 }
 
 func (j *windowsRouteJournal) release(op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
@@ -225,7 +268,6 @@ func (j *windowsRouteJournal) release(op *windowsRouteOperator, prefix netip.Pre
 		return err
 	}
 	defer func() {
-		delete(op.routeMetrics, prefix.Masked())
 		retErr = errors.Join(retErr, transition.lock.unlock())
 	}()
 	data, err := j.load()
@@ -235,7 +277,7 @@ func (j *windowsRouteJournal) release(op *windowsRouteOperator, prefix netip.Pre
 	key := prefix.Masked().String()
 	kept := data.Entries[:0]
 	for _, entry := range data.Entries {
-		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == key && entry.Metric == transition.metric {
+		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == key && entry.TransactionID == transition.txnID {
 			continue
 		}
 		kept = append(kept, entry)
@@ -245,6 +287,9 @@ func (j *windowsRouteJournal) release(op *windowsRouteOperator, prefix netip.Pre
 }
 
 func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOperator) (retErr error) {
+	if !op.adapterOwnershipProven() {
+		return errors.New("Wintun adapter is not owned by the current process; refusing route recovery")
+	}
 	lock, err := j.locker.Lock()
 	if err != nil {
 		return err
@@ -261,10 +306,10 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 			kept = append(kept, entry)
 			continue
 		}
-		prefix, parseErr := netip.ParsePrefix(entry.Destination)
-		if parseErr != nil || entry.InterfaceIndex != op.interfaceIdx || entry.Metric == 0 || entry.Protocol != windowsRouteProtocol || !entry.BaselineAbsent {
+		prefix, signatureErr := validateWindowsRouteJournalEntry(op, entry)
+		if signatureErr != nil {
 			kept = append(kept, entry)
-			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("unsafe route journal entry for Wintun LUID %d destination %q", entry.InterfaceLUID, entry.Destination))
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("unsafe route journal entry for Wintun LUID %d destination %q: %w", entry.InterfaceLUID, entry.Destination, signatureErr))
 			continue
 		}
 		if entry.State != windowsRouteActive && entry.State != windowsRouteDeleting {
@@ -274,19 +319,13 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 				continue
 			}
 		}
-		if op.routeMetrics == nil {
-			op.routeMetrics = make(map[netip.Prefix]uint32)
-		}
-		op.routeMetrics[prefix.Masked()] = entry.Metric
 		state, readErr := op.Read(ctx, prefix)
 		if readErr != nil {
-			delete(op.routeMetrics, prefix.Masked())
 			kept = append(kept, entry)
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("read journaled route %s: %w", prefix, readErr))
 			continue
 		}
 		if !state.Matches {
-			delete(op.routeMetrics, prefix.Masked())
 			continue
 		}
 		if entry.State == windowsRoutePending {
@@ -294,7 +333,6 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 			staged := append(append([]windowsRouteJournalEntry(nil), kept...), entry)
 			staged = append(staged, data.Entries[entryIdx+1:]...)
 			if err := j.save(windowsRouteJournalData{Version: data.Version, Entries: staged}); err != nil {
-				delete(op.routeMetrics, prefix.Masked())
 				kept = append(kept, entry)
 				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("claim pending journaled route %s: %w", prefix, err))
 				continue
@@ -311,14 +349,11 @@ func (j *windowsRouteJournal) reconcile(ctx context.Context, op *windowsRouteOpe
 		}
 		deleteResult, deleteErr := op.Delete(ctx, prefix)
 		if deleteResult.Committed || deleteErr == nil {
-			delete(op.routeMetrics, prefix.Masked())
 			continue
 		}
 		state, readErr = op.Read(ctx, prefix)
 		if readErr != nil || state.Matches {
 			kept = append(kept, entry)
-		} else {
-			delete(op.routeMetrics, prefix.Masked())
 		}
 		reconcileErr = errors.Join(reconcileErr, fmt.Errorf("delete journaled route %s: %w", prefix, errors.Join(deleteErr, readErr)))
 	}
@@ -336,28 +371,21 @@ func (o *windowsRouteOperator) takeTransition(prefix netip.Prefix) (*windowsRout
 	return transition, nil
 }
 
-func newWindowsRouteSignature(data windowsRouteJournalData) (uint32, error) {
-	used := make(map[uint32]struct{}, len(data.Entries))
-	for _, entry := range data.Entries {
-		used[entry.Metric] = struct{}{}
+func newWindowsRouteTransactionID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate route transaction ID: %w", err)
 	}
-	for range 32 {
-		var wire [4]byte
-		if _, err := rand.Read(wire[:]); err != nil {
-			return 0, fmt.Errorf("generate route ownership signature: %w", err)
-		}
-		metric := uint32(wire[0]) | uint32(wire[1])<<8 | uint32(wire[2])<<16 | uint32(wire[3])<<24
-		if metric != 0 {
-			if _, exists := used[metric]; !exists {
-				return metric, nil
-			}
-		}
-	}
-	return 0, errors.New("could not generate a unique route ownership signature")
+	return hex.EncodeToString(id[:]), nil
 }
 
 type namedWindowsRouteJournalLocker struct {
 	name    string
+	timeout time.Duration
+}
+
+type protectedWindowsRouteJournalLocker struct {
+	storage *registryWindowsRouteJournalStorage
 	timeout time.Duration
 }
 
@@ -371,6 +399,14 @@ func (l *localWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error
 		l.mu.Unlock()
 		return nil
 	}}, nil
+}
+
+func (l *protectedWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error) {
+	name, err := l.storage.machineMutexName()
+	if err != nil {
+		return nil, fmt.Errorf("derive protected machine route journal mutex: %w", err)
+	}
+	return (&namedWindowsRouteJournalLocker{name: name, timeout: l.timeout}).Lock()
 }
 
 func (l *namedWindowsRouteJournalLocker) Lock() (_ *windowsRouteJournalLock, retErr error) {
@@ -439,7 +475,7 @@ func (l *namedWindowsRouteJournalLocker) Lock() (_ *windowsRouteJournalLock, ret
 }
 
 func newWindowsRouteMutexSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
-	return windows.SecurityDescriptorFromString("D:P(A;;0x001F0001;;;SY)(A;;0x001F0001;;;BA)")
+	return windows.SecurityDescriptorFromString("O:BAG:SYD:P(A;;0x001F0001;;;SY)(A;;0x001F0001;;;BA)")
 }
 
 func validateWindowsRouteMutex(handle windows.Handle) error {
@@ -451,7 +487,7 @@ func validateWindowsRouteMutex(handle windows.Handle) error {
 	if err != nil {
 		return err
 	}
-	return validateWindowsTrustedACL(descriptor, windows.MUTEX_ALL_ACCESS, "mutex", false)
+	return validateWindowsTrustedACL(descriptor, windows.MUTEX_ALL_ACCESS, "mutex")
 }
 
 func (j *windowsRouteJournal) load() (windowsRouteJournalData, error) {
@@ -468,6 +504,13 @@ func (j *windowsRouteJournal) load() (windowsRouteJournalData, error) {
 	}
 	if data.Version != windowsRouteJournalVersion {
 		return data, fmt.Errorf("unsupported route journal version %d", data.Version)
+	}
+	seenTransactions := make(map[string]struct{}, len(data.Entries))
+	for _, entry := range data.Entries {
+		if _, exists := seenTransactions[entry.TransactionID]; exists {
+			return data, fmt.Errorf("duplicate route journal transaction ID %q", entry.TransactionID)
+		}
+		seenTransactions[entry.TransactionID] = struct{}{}
 	}
 	return data, nil
 }
@@ -515,7 +558,7 @@ func (s *registryWindowsRouteJournalStorage) Write(wire []byte) error {
 	if len(wire) > windowsRouteJournalMaxSize {
 		return fmt.Errorf("registry value is %d bytes; maximum is %d", len(wire), windowsRouteJournalMaxSize)
 	}
-	key, _, err := createWindowsRouteJournalRegistryKey(s.root, s.keyPath)
+	key, _, err := createWindowsRouteJournalRegistryKey(s.root, s.keyPath, "")
 	if err != nil {
 		return err
 	}
@@ -539,14 +582,59 @@ func (s *registryWindowsRouteJournalStorage) Write(wire []byte) error {
 	return nil
 }
 
+func (s *registryWindowsRouteJournalStorage) machineMutexName() (string, error) {
+	base, _, err := createWindowsRouteJournalRegistryKey(s.root, s.keyPath, "")
+	if err != nil {
+		return "", err
+	}
+	if err := validateWindowsRouteJournalRegistryKey(base); err != nil {
+		base.Close()
+		return "", fmt.Errorf("untrusted route journal registry key: %w", err)
+	}
+	if err := base.Close(); err != nil {
+		return "", err
+	}
+
+	secret, err := newWindowsRouteTransactionID()
+	if err != nil {
+		return "", err
+	}
+	coordinationPath := s.keyPath + `\` + windowsRouteCoordinationKey
+	coordination, _, err := createWindowsRouteJournalRegistryKey(s.root, coordinationPath, secret)
+	if err != nil {
+		return "", err
+	}
+	defer coordination.Close()
+	if err := validateWindowsRouteJournalRegistryKey(coordination); err != nil {
+		return "", fmt.Errorf("untrusted route journal coordination key: %w", err)
+	}
+	secret, err = queryWindowsRegistryKeyClass(coordination)
+	if err != nil {
+		return "", err
+	}
+	decoded, err := hex.DecodeString(secret)
+	if err != nil || len(decoded) != 16 {
+		return "", errors.New("route journal coordination secret is not a 128-bit hexadecimal value")
+	}
+	return windowsRouteJournalMutexPrefix + secret, nil
+}
+
 func queryBoundedWindowsRegistryBinaryValue(key registry.Key, valueName string) ([]byte, error) {
 	name, err := windows.UTF16PtrFromString(valueName)
 	if err != nil {
 		return nil, err
 	}
+	return readBoundedWindowsRegistryBinaryValue(func(valueType *uint32, data *byte, size *uint32) error {
+		return windows.RegQueryValueEx(windows.Handle(key), name, nil, valueType, data, size)
+	})
+}
+
+type windowsRegistryValueQuery func(valueType *uint32, data *byte, size *uint32) error
+
+func readBoundedWindowsRegistryBinaryValue(query windowsRegistryValueQuery) ([]byte, error) {
 	var valueType uint32
 	var size uint32
-	err = windows.RegQueryValueEx(windows.Handle(key), name, nil, &valueType, nil, &size)
+	err := query(&valueType, nil, &size)
 	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
 		return nil, nil
 	}
@@ -564,16 +652,16 @@ func queryBoundedWindowsRegistryBinaryValue(key registry.Key, valueName string) 
 	}
 	wire := make([]byte, size)
 	actual := size
-	if err := windows.RegQueryValueEx(windows.Handle(key), name, nil, &valueType, &wire[0], &actual); err != nil {
+	if err := query(&valueType, &wire[0], &actual); err != nil {
 		return nil, fmt.Errorf("read registry value after bounded size query: %w", err)
 	}
-	if valueType != registry.BINARY || actual > size {
+	if valueType != registry.BINARY || actual != size {
 		return nil, errors.New("registry value type or size changed during read")
 	}
-	return wire[:actual], nil
+	return wire, nil
 }
 
-func createWindowsRouteJournalRegistryKey(root registry.Key, keyPath string) (registry.Key, bool, error) {
+func createWindowsRouteJournalRegistryKey(root registry.Key, keyPath, class string) (registry.Key, bool, error) {
 	descriptor, err := newWindowsRouteJournalSecurityDescriptor()
 	if err != nil {
 		return 0, false, err
@@ -581,6 +669,13 @@ func createWindowsRouteJournalRegistryKey(root registry.Key, keyPath string) (re
 	path, err := windows.UTF16PtrFromString(keyPath)
 	if err != nil {
 		return 0, false, err
+	}
+	var classPtr *uint16
+	if class != "" {
+		classPtr, err = windows.UTF16PtrFromString(class)
+		if err != nil {
+			return 0, false, err
+		}
 	}
 	security := syscall.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
@@ -592,7 +687,7 @@ func createWindowsRouteJournalRegistryKey(root registry.Key, keyPath string) (re
 		uintptr(root),
 		uintptr(unsafe.Pointer(path)),
 		0,
-		0,
+		uintptr(unsafe.Pointer(classPtr)),
 		0,
 		registry.ALL_ACCESS|registry.WOW64_64KEY,
 		uintptr(unsafe.Pointer(&security)),
@@ -632,10 +727,10 @@ func validateWindowsRouteJournalRegistryKey(key registry.Key) error {
 }
 
 func validateWindowsJournalSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR) error {
-	return validateWindowsTrustedACL(descriptor, registry.ALL_ACCESS, "registry", true)
+	return validateWindowsTrustedACL(descriptor, registry.ALL_ACCESS, "registry")
 }
 
-func validateWindowsTrustedACL(descriptor *windows.SECURITY_DESCRIPTOR, requiredMask windows.ACCESS_MASK, objectKind string, requireTrustedOwner bool) error {
+func validateWindowsTrustedACL(descriptor *windows.SECURITY_DESCRIPTOR, requiredMask windows.ACCESS_MASK, objectKind string) error {
 	if descriptor == nil || !descriptor.IsValid() {
 		return errors.New("missing or invalid security descriptor")
 	}
@@ -643,8 +738,8 @@ func validateWindowsTrustedACL(descriptor *windows.SECURITY_DESCRIPTOR, required
 	if err != nil {
 		return err
 	}
-	if requireTrustedOwner && (owner == nil || (!owner.IsWellKnown(windows.WinLocalSystemSid) && !owner.IsWellKnown(windows.WinBuiltinAdministratorsSid))) {
-		return fmt.Errorf("owner %v is not SYSTEM or Administrators", owner)
+	if owner == nil || !owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+		return fmt.Errorf("owner %v is not Administrators", owner)
 	}
 	control, _, err := descriptor.Control()
 	if err != nil {
@@ -684,6 +779,18 @@ func validateWindowsTrustedACL(descriptor *windows.SECURITY_DESCRIPTOR, required
 		return errors.New("DACL does not grant both SYSTEM and Administrators")
 	}
 	return nil
+}
+
+func queryWindowsRegistryKeyClass(key registry.Key) (string, error) {
+	buffer := make([]uint16, 64)
+	length := uint32(len(buffer))
+	if err := windows.RegQueryInfoKey(windows.Handle(key), &buffer[0], &length, nil, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
+		return "", fmt.Errorf("read route journal coordination secret: %w", err)
+	}
+	if length == 0 || length >= uint32(len(buffer)) {
+		return "", errors.New("route journal coordination key has an invalid class secret")
+	}
+	return windows.UTF16ToString(buffer[:length]), nil
 }
 
 func aclEntryCount(acl *windows.ACL) uint16 {

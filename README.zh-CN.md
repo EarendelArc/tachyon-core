@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Windows 路由以 Wintun 的稳定 LUID/interface index 和精确目标属性作为身份；接口重命名不会改变 ownership。只有同步 IP Helper Create 明确成功（包括成功后观察到 context 取消的 typed committed 结果）才建立 ownership；普通错误后的匹配 readback 不会认领并发对象。Delete 明确成功后立即放弃 ownership，之后重建的同属性路由不会被后续 `Close` 删除。Delete 未提交且 readback 也失败时，当前进程和 journal 都保留 `deleting` ownership，供 `Close` 或下次启动重试。崩溃恢复 journal 是 `HKLM\\SOFTWARE\\Tachyon\\RouteJournal` 下的单个原子机器级注册表值；键在创建时即带仅允许 SYSTEM/Administrators 的 protected DACL，并在删除路由前拒绝不可信 owner/DACL、值类型和损坏内容。doctor 会区分直接 pin 的 IP literal 与只解析一次后 pin 获准 `IP:port` 集合的 hostname。
+Windows 路由以 Wintun 的稳定 LUID/interface index 和精确目标属性作为身份；接口重命名不会改变 ownership。生产路由始终使用固定低 metric `1`，随机 128-bit transaction ID 只保存在 journal 中，不写入路由属性。只有同步 IP Helper Create 明确成功（包括成功后观察到 context 取消的 typed committed 结果）才建立 ownership；普通错误后的匹配 readback 不会认领并发对象。Delete 明确成功后立即放弃 ownership，之后重建的同属性路由不会被后续 `Close` 删除。Delete 未提交且 readback 也失败时，当前进程和 journal 都保留 `deleting` ownership，供 `Close` 或下次启动重试。崩溃恢复 journal 是 `HKLM\\SOFTWARE\\Tachyon\\RouteJournal` 下的单个原子机器级注册表值；键要求 Administrators owner 和仅允许 SYSTEM/Administrators 的 protected DACL。受保护的 HKLM coordination 子键会原子初始化 128-bit secret 并派生同样受保护且由 Administrators 持有的 `Global\\` mutex 名称，使并发的首次管理员启动收敛到同一把锁；Core 在删除路由前拒绝不可信 owner/DACL、值类型和损坏内容，并只处理当前进程持有的 Wintun adapter 上属性完全匹配的路由。SYSTEM 和 Administrators 是信任边界：恶意或不协作的同权限管理员本就能修改 HKLM 和系统路由表，因此同管理员权限 race 不作为不可信攻击者场景防御。doctor 会区分直接 pin 的 IP literal 与只解析一次后 pin 获准 `IP:port` 集合的 hostname。
 
 Core 在创建 TUN 和安装路由前只解析一次 Relay，并 pin 获批的 `IP:port` 集合。拨号、重连和迁移复用同一 validator，安装路由后不再依赖系统 DNS。空 `game_routes` 表示“无额外游戏目标路由”，并不表示没有 OS 状态；Windows TUN 地址和 MTU 都显式使用 `store=active`。
 

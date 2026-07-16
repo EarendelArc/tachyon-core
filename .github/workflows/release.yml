@@ -36,9 +36,43 @@ jobs:
       - name: Test
         run: go test ./...
 
+  test-windows:
+    name: Test and route integration (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify elevated runner
+        shell: pwsh
+        run: |
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "Windows release route integrations require an elevated runner"
+          }
+
+      - name: Test full Windows suite
+        run: go test ./...
+
+      - name: Test protected HKLM journal and mutex integration
+        shell: pwsh
+        run: go test -tags=routejournalintegration ./internal/tun -run '^TestWindowsRouteJournal(RegistryIntegration|InitializesSecretFromProtectedEmptyHKLMKey|MachineMutexMultiProcess|MachineMutexTimeoutAndAbandonment)$' -count=1 -v
+
+      - name: Test real route abandoned pending recovery
+        shell: pwsh
+        env:
+          TACHYON_ALLOW_REAL_ROUTE_TEST: "1"
+        run: go test -tags=routeintegration ./internal/tun -run '^TestWindowsRouteJournalAbandonedPendingRealChildRecovery$' -count=1 -v
+
   build:
     name: Build ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
-    needs: test
+    needs: [test, test-windows]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

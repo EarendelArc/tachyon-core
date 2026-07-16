@@ -5,6 +5,7 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"runtime"
@@ -27,7 +28,7 @@ func TestWindowsRouteJournalRegistryIntegration(t *testing.T) {
 	cleanupWindowsRouteJournalTestKey(t, keyPath)
 	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
 
-	want := []byte(`{"version":3,"entries":[]}`)
+	want := []byte(`{"version":4,"entries":[]}`)
 	if err := storage.Write(want); err != nil {
 		t.Fatalf("write protected HKLM journal (Windows CI must run elevated): %v", err)
 	}
@@ -71,6 +72,14 @@ func TestWindowsRouteJournalRegistryIntegration(t *testing.T) {
 		t.Fatalf("oversized registry value error = %v", err)
 	}
 
+	boundary := make([]byte, windowsRouteJournalMaxSize)
+	if err := storage.Write(boundary); err != nil {
+		t.Fatalf("write exact 1 MiB boundary: %v", err)
+	}
+	if got, err := storage.Read(); err != nil || len(got) != windowsRouteJournalMaxSize {
+		t.Fatalf("read exact 1 MiB boundary length=%d error=%v", len(got), err)
+	}
+
 	untrustedPath := uniqueWindowsRouteJournalTestKey("Untrusted")
 	cleanupWindowsRouteJournalTestKey(t, untrustedPath)
 	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, untrustedPath) })
@@ -89,13 +98,39 @@ func TestWindowsRouteJournalRegistryIntegration(t *testing.T) {
 	}
 }
 
+func TestWindowsRouteJournalInitializesSecretFromProtectedEmptyHKLMKey(t *testing.T) {
+	keyPath := uniqueWindowsRouteJournalTestKey("Empty")
+	cleanupWindowsRouteJournalTestKey(t, keyPath)
+	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
+	key, _, err := createWindowsRouteJournalRegistryKey(registry.LOCAL_MACHINE, keyPath, "")
+	if err != nil {
+		t.Fatalf("create protected empty HKLM key: %v", err)
+	}
+	key.Close()
+
+	storage := &registryWindowsRouteJournalStorage{root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State"}
+	first, err := storage.machineMutexName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := storage.machineMutexName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || !strings.HasPrefix(first, windowsRouteJournalMutexPrefix) {
+		t.Fatalf("derived mutex names first=%q second=%q", first, second)
+	}
+	if wire, err := storage.Read(); err != nil || len(wire) != 0 {
+		t.Fatalf("empty journal read=%q error=%v", wire, err)
+	}
+}
+
 func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 	keyPath := uniqueWindowsRouteJournalTestKey("MultiProcess")
-	mutexName := uniqueWindowsRouteJournalTestMutex("MultiProcess")
 	storage := &registryWindowsRouteJournalStorage{root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State"}
 	cleanupWindowsRouteJournalTestKey(t, keyPath)
 	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
-	journal := &windowsRouteJournal{storage: storage, locker: &namedWindowsRouteJournalLocker{name: mutexName, timeout: windowsRouteLockTimeout}}
+	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
 	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion}); err != nil {
 		t.Fatalf("initialize multiprocess HKLM journal: %v", err)
 	}
@@ -113,7 +148,6 @@ func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 			cmd.Env = append(os.Environ(),
 				windowsRouteJournalHelperEnv+"=append",
 				"TACHYON_ROUTE_JOURNAL_TEST_KEY="+keyPath,
-				"TACHYON_ROUTE_JOURNAL_TEST_MUTEX="+mutexName,
 				"TACHYON_ROUTE_JOURNAL_TEST_MARKER="+strconv.Itoa(marker),
 			)
 			wire, err := cmd.CombinedOutput()
@@ -200,8 +234,14 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 	if action == "" {
 		return
 	}
-	mutexName := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MUTEX")
-	locker := &namedWindowsRouteJournalLocker{name: mutexName, timeout: windowsRouteLockTimeout}
+	keyPath := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_KEY")
+	storage := &registryWindowsRouteJournalStorage{
+		root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State",
+	}
+	var locker windowsRouteJournalLocker = &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}
+	if mutexName := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MUTEX"); mutexName != "" {
+		locker = &namedWindowsRouteJournalLocker{name: mutexName, timeout: windowsRouteLockTimeout}
+	}
 	lock, err := locker.Lock()
 	if err != nil {
 		t.Fatal(err)
@@ -218,17 +258,18 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 		lock.unlock()
 		t.Fatal(err)
 	}
-	storage := &registryWindowsRouteJournalStorage{
-		root: registry.LOCAL_MACHINE, keyPath: os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_KEY"), valueName: "State",
-	}
 	journal := &windowsRouteJournal{storage: storage, locker: locker}
 	data, err := journal.load()
 	if err == nil {
 		time.Sleep(75 * time.Millisecond)
-		data.Entries = append(data.Entries, windowsRouteJournalEntry{
-			InterfaceLUID: uint64(marker), InterfaceIndex: uint32(marker), Destination: fmt.Sprintf("192.0.2.%d/32", marker),
-			Metric: uint32(marker), Protocol: windowsRouteProtocol, BaselineAbsent: true, State: windowsRouteActive,
-		})
+		op := &windowsRouteOperator{interfaceLUID: uint64(marker), interfaceIdx: uint32(marker)}
+		txnID, txnErr := newWindowsRouteTransactionID()
+		if txnErr != nil {
+			err = txnErr
+		} else {
+			prefix := netip.MustParsePrefix(fmt.Sprintf("192.0.2.%d/32", marker))
+			data.Entries = append(data.Entries, newWindowsRouteJournalEntry(op, prefix, txnID, windowsRouteActive))
+		}
 		err = journal.save(data)
 	}
 	err = errors.Join(err, lock.unlock())
@@ -248,6 +289,10 @@ func uniqueWindowsRouteJournalTestMutex(label string) string {
 func cleanupWindowsRouteJournalTestKey(t *testing.T, keyPath string) {
 	t.Helper()
 	parts := strings.Split(keyPath, `\`)
+	if key, openErr := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.ALL_ACCESS|registry.WOW64_64KEY); openErr == nil {
+		_ = registry.DeleteKey(key, windowsRouteCoordinationKey)
+		key.Close()
+	}
 	parentPath := strings.Join(parts[:len(parts)-1], `\`)
 	parent, err := registry.OpenKey(registry.LOCAL_MACHINE, parentPath, registry.ALL_ACCESS|registry.WOW64_64KEY)
 	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {

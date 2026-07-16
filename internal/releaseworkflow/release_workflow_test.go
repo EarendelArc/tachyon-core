@@ -104,3 +104,20 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 		t.Fatal("local release script must not publish legacy windows/386 assets")
 	}
 }
+
+func TestReleaseRequiresWindowsRouteSecurityIntegrations(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	required := []string{
+		"test-windows:",
+		"Test full Windows suite",
+		"-tags=routejournalintegration",
+		"TestWindowsRouteJournalAbandonedPendingRealChildRecovery",
+		"TACHYON_ALLOW_REAL_ROUTE_TEST: \"1\"",
+		"needs: [test, test-windows]",
+	}
+	for _, text := range required {
+		if !strings.Contains(workflow, text) {
+			t.Fatalf("release workflow is missing Windows route security gate %q", text)
+		}
+	}
+}

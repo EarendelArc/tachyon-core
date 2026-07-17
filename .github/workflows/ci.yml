@@ -20,6 +20,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Verify release policy
+        shell: bash
+        run: |
+          bash -n .github/scripts/verify-release-tag.sh
+          bash -n .github/scripts/test-release-policy.sh
+          bash .github/scripts/test-release-policy.sh
+
       - name: Verify server diagnostics script
         shell: bash
         run: |

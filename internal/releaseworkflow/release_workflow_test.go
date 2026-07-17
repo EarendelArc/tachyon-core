@@ -113,11 +113,37 @@ func TestReleaseRequiresWindowsRouteSecurityIntegrations(t *testing.T) {
 		"-tags=routejournalintegration",
 		"TestWindowsRouteJournalAbandonedPendingRealChildRecovery",
 		"TACHYON_ALLOW_REAL_ROUTE_TEST: \"1\"",
-		"needs: [test, test-windows]",
+		"needs: [verify_tag, test, test-windows]",
 	}
 	for _, text := range required {
 		if !strings.Contains(workflow, text) {
 			t.Fatalf("release workflow is missing Windows route security gate %q", text)
 		}
+	}
+}
+
+func TestReleasePinsTagBuildAndAssetsToVerifiedCommit(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	required := []string{
+		"verify_tag:",
+		"EXPECTED_COMMIT: ${{ needs.verify_tag.outputs.commit }}",
+		"EXPECTED_TAG_OBJECT: ${{ needs.verify_tag.outputs.tag_object }}",
+		`--target "${COMMIT}"`,
+		"--verify-tag",
+	}
+	for _, text := range required {
+		if !strings.Contains(workflow, text) {
+			t.Fatalf("release workflow is missing tag/commit gate %q", text)
+		}
+	}
+
+	const pinnedCheckout = "ref: ${{ needs.verify_tag.outputs.commit }}"
+	if count := strings.Count(workflow, pinnedCheckout); count < 4 {
+		t.Fatalf("release workflow has %d commit-pinned checkouts, want at least 4", count)
+	}
+
+	const tagGate = `bash .github/scripts/verify-release-tag.sh`
+	if count := strings.Count(workflow, tagGate); count < 2 {
+		t.Fatalf("release workflow runs the tag gate %d times, want initial and pre-publish checks", count)
 	}
 }

@@ -1,0 +1,31 @@
+# Release tag gate / 发布标签门禁
+
+Every tag release is built from the commit selected by the verified remote tag. For a manual
+`workflow_dispatch`, the selected branch commit and the input tag's peeled commit must be identical.
+All test, build, and publish jobs then check out that full commit ID. The publish job repeats the
+remote tag check immediately before updating GitHub Release assets and requires both the tag object
+ID and peeled commit ID to remain unchanged.
+
+每次标签发布都从已验证远端标签所指向的提交构建。手动触发 `workflow_dispatch` 时，所选分支提交必须与
+输入标签最终指向的提交完全相同。测试、构建和发布 job 随后统一检出该完整 commit ID；发布 job 在更新
+GitHub Release 资产前还会再次检查远端标签，并要求标签对象 ID 与最终提交 ID 均未发生变化。
+
+## Verification modes / 验证模式
+
+- `signature`: `git verify-tag` successfully validates an annotated signed tag. A present but invalid
+  or unverifiable signature fails closed.
+- `ref-commit`: compatibility mode for the repository's existing lightweight or unsigned annotated
+  tags. Signature authenticity is unavailable; publishing is allowed only after fetching the exact
+  remote tag ref and proving that it peels to the expected checkout commit.
+- `signature`：`git verify-tag` 已成功验证带签名的 annotated tag。标签存在签名但签名无效或无法验证时，
+  流程会直接失败。
+- `ref-commit`：兼容仓库现有的轻量标签或未签名 annotated tag。该模式不具备签名真实性保证；只有精确抓取
+  远端标签 ref，并证明其最终指向预期 checkout commit 后才允许发布。
+
+Run the policy checks locally with:
+
+```bash
+bash -n .github/scripts/verify-release-tag.sh
+bash -n .github/scripts/test-release-policy.sh
+bash .github/scripts/test-release-policy.sh
+```

@@ -20,12 +20,37 @@ permissions:
   contents: write
 
 jobs:
+  verify_tag:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      commit: ${{ steps.gate.outputs.commit }}
+      tag_object: ${{ steps.gate.outputs.tag_object }}
+      verification: ${{ steps.gate.outputs.verification }}
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v6.0.3
+
+      - name: Verify selected ref and release tag
+        id: gate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected_commit=$(git rev-parse HEAD)
+          bash .github/scripts/verify-release-tag.sh "${RELEASE_TAG}" "${expected_commit}"
+
   test:
     name: Test
+    needs: verify_tag
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
 
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
@@ -38,10 +63,13 @@ jobs:
 
   test-windows:
     name: Test and route integration (Windows)
+    needs: verify_tag
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
 
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
@@ -72,7 +100,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
-    needs: [test, test-windows]
+    needs: [verify_tag, test, test-windows]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -111,6 +139,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
 
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
@@ -121,13 +151,11 @@ jobs:
       - name: Resolve version metadata
         id: meta
         shell: bash
+        env:
+          VERIFIED_TAG: ${{ needs.verify_tag.outputs.tag }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.tag }}"
-          else
-            version="${GITHUB_REF_NAME}"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          set -euo pipefail
+          echo "version=${VERIFIED_TAG}" >> "${GITHUB_OUTPUT}"
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
           echo "go_version=$(go version | awk '{print $3}')" >> "${GITHUB_OUTPUT}"
 
@@ -171,11 +199,22 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [verify_tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
+
+      - name: Reverify release tag before publishing
+        id: publish_gate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify_tag.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.verify_tag.outputs.tag_object }}
+        run: bash .github/scripts/verify-release-tag.sh "${RELEASE_TAG}" "${EXPECTED_COMMIT}" origin "${EXPECTED_TAG_OBJECT}"
 
       - name: Download artifacts
         uses: actions/download-artifact@v7.0.0
@@ -185,15 +224,16 @@ jobs:
       - name: Prepare release assets
         id: meta
         shell: bash
+        env:
+          VERIFIED_TAG: ${{ steps.publish_gate.outputs.tag }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.tag }}"
             prerelease="${{ inputs.prerelease }}"
           else
-            version="${GITHUB_REF_NAME}"
             prerelease="true"
           fi
+          version="${VERIFIED_TAG}"
           mkdir -p release
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
           (cd release && sha256sum *.zip > SHA256SUMS.txt)
@@ -226,6 +266,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.meta.outputs.version }}
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          COMMIT: ${{ steps.publish_gate.outputs.commit }}
         run: |
           set -euo pipefail
           prerelease_flag=()
@@ -234,11 +275,15 @@ jobs:
           fi
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             gh release edit "${VERSION}" \
+              --verify-tag \
               --title "Tachyon Core ${VERSION}" \
+              --target "${COMMIT}" \
               --notes-file release/RELEASE_NOTES.md \
               "${prerelease_flag[@]}"
           else
             gh release create "${VERSION}" \
+              --verify-tag \
+              --target "${COMMIT}" \
               --title "Tachyon Core ${VERSION}" \
               --notes-file release/RELEASE_NOTES.md \
               "${prerelease_flag[@]}"

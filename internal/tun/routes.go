@@ -43,6 +43,15 @@ type routeOperator interface {
 	Delete(context.Context, netip.Prefix) (routeDeleteResult, error)
 }
 
+type routeOperatorCloser interface {
+	Close() error
+}
+
+type routeOwnershipRecordFailure interface {
+	error
+	RouteRolledBack() bool
+}
+
 // routeAddResult reports whether the platform create API committed a new
 // route. Callers must never infer ownership from readback after an error.
 type routeAddResult struct {
@@ -95,7 +104,7 @@ func InstallSelectiveRoutes(ctx context.Context, opts SelectiveRouteOptions) (Ro
 func installPlannedSelectiveRoutes(ctx context.Context, op routeOperator, plan []netip.Prefix) (RouteTransaction, error) {
 	if store, ok := op.(routeOwnershipStore); ok {
 		if err := store.Reconcile(ctx); err != nil {
-			return nil, fmt.Errorf("reconcile selective route journal: %w", err)
+			return nil, errors.Join(fmt.Errorf("reconcile selective route journal: %w", err), closeRouteOperator(op))
 		}
 	}
 	if len(plan) == 0 {
@@ -161,6 +170,10 @@ func installRouteTransaction(ctx context.Context, op routeOperator, plan []netip
 			txn.installed = append(txn.installed, prefix)
 			if hasStore {
 				if err := store.RecordOwnership(prefix); err != nil {
+					var recordFailure routeOwnershipRecordFailure
+					if errors.As(err, &recordFailure) && recordFailure.RouteRolledBack() {
+						txn.installed = txn.installed[:len(txn.installed)-1]
+					}
 					return nil, errors.Join(fmt.Errorf("journal owned game destination route %s: %w", prefix, err), addErr, txn.rollback())
 				}
 			}
@@ -199,7 +212,7 @@ func (t *routeTransaction) rollback() error {
 }
 
 func (t *routeTransaction) rollbackLocked() error {
-	if t.op == nil || len(t.installed) == 0 {
+	if t.op == nil {
 		return nil
 	}
 
@@ -263,7 +276,21 @@ func (t *routeTransaction) rollbackLocked() error {
 		remaining[left], remaining[right] = remaining[right], remaining[left]
 	}
 	t.installed = remaining
+	if len(t.installed) == 0 {
+		if err := closeRouteOperator(t.op); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("close selective route operator: %w", err))
+		} else {
+			t.op = nil
+		}
+	}
 	return rollbackErr
+}
+
+func closeRouteOperator(op routeOperator) error {
+	if closer, ok := op.(routeOperatorCloser); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 func releaseRouteOwnership(store routeOwnershipStore, prefix netip.Prefix) error {

@@ -30,6 +30,17 @@ type fakeOwnershipRouteOperator struct {
 	ownership      map[netip.Prefix]string
 }
 
+type closableFakeRouteOperator struct {
+	*fakeRouteOperator
+	closeCalls int
+	closeErr   error
+}
+
+func (f *closableFakeRouteOperator) Close() error {
+	f.closeCalls++
+	return f.closeErr
+}
+
 func (f *fakeOwnershipRouteOperator) Reconcile(context.Context) error {
 	f.reconcileCalls++
 	return nil
@@ -176,6 +187,36 @@ func TestEmptySelectiveRoutePlanStillReconcilesOwnership(t *testing.T) {
 	if err := txn.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRouteTransactionClosesOperatorAfterEmptyOrFailedInstall(t *testing.T) {
+	t.Run("empty transaction", func(t *testing.T) {
+		op := &closableFakeRouteOperator{fakeRouteOperator: &fakeRouteOperator{}}
+		txn, err := installRouteTransaction(context.Background(), op, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if op.closeCalls != 1 {
+			t.Fatalf("operator close calls = %d, want 1", op.closeCalls)
+		}
+	})
+
+	t.Run("failed install", func(t *testing.T) {
+		op := &closableFakeRouteOperator{fakeRouteOperator: &fakeRouteOperator{failAddAt: 1}}
+		_, err := installRouteTransaction(context.Background(), op, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")})
+		if err == nil {
+			t.Fatal("expected injected install failure")
+		}
+		if op.closeCalls != 1 {
+			t.Fatalf("operator close calls = %d, want 1", op.closeCalls)
+		}
+	})
 }
 
 func TestInstallRouteTransactionRollsBackInReverseOrder(t *testing.T) {

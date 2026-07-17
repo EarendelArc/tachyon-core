@@ -267,3 +267,21 @@ func (o *windowsRouteOperator) ReleaseOwnership(prefix netip.Prefix) error {
 func (o *windowsRouteOperator) PrepareDeletion(ctx context.Context, prefix netip.Prefix) error {
 	return o.journal.prepareDeletion(ctx, o, prefix)
 }
+
+func (o *windowsRouteOperator) Close() error {
+	if o.transition != nil {
+		return errors.New("cannot close Windows route operator during a journal transition")
+	}
+	return o.journal.Close()
+}
+
+type windowsRouteOwnershipRecordError struct {
+	err        error
+	rolledBack bool
+}
+
+func (e *windowsRouteOwnershipRecordError) Error() string { return e.err.Error() }
+func (e *windowsRouteOwnershipRecordError) Unwrap() error { return e.err }
+func (e *windowsRouteOwnershipRecordError) RouteRolledBack() bool {
+	return e.rolledBack
+}

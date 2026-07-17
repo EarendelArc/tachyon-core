@@ -56,6 +56,11 @@ type windowsRouteJournalLocker interface {
 	Lock() (*windowsRouteJournalLock, error)
 }
 
+type windowsRouteJournalLockerLifecycle interface {
+	Open() error
+	Close() error
+}
+
 type windowsRouteJournalLock struct {
 	abandoned bool
 	unlock    func() error
@@ -86,19 +91,34 @@ type windowsRouteJournalEntry struct {
 }
 
 func newDefaultWindowsRouteJournal() (*windowsRouteJournal, error) {
-	storage := &registryWindowsRouteJournalStorage{
+	storage := defaultWindowsRouteJournalStorage()
+	locker := &protectedWindowsRouteJournalLocker{
+		storage: storage,
+		timeout: windowsRouteLockTimeout,
+	}
+	if err := locker.Open(); err != nil {
+		return nil, err
+	}
+	return &windowsRouteJournal{storage: storage, locker: locker}, nil
+}
+
+func defaultWindowsRouteJournalStorage() *registryWindowsRouteJournalStorage {
+	return &registryWindowsRouteJournalStorage{
 		root:      registry.LOCAL_MACHINE,
 		keyPath:   windowsRouteJournalKey,
 		valueName: windowsRouteJournalValue,
 	}
-	return &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{
-		storage: storage,
-		timeout: windowsRouteLockTimeout,
-	}}, nil
 }
 
 func newWindowsRouteJournalForTest() *windowsRouteJournal {
 	return &windowsRouteJournal{storage: &memoryWindowsRouteJournalStorage{}, locker: &localWindowsRouteJournalLocker{}}
+}
+
+func (j *windowsRouteJournal) Close() error {
+	if lifecycle, ok := j.locker.(windowsRouteJournalLockerLifecycle); ok {
+		return lifecycle.Close()
+	}
+	return nil
 }
 
 func (j *windowsRouteJournal) prepare(ctx context.Context, op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
@@ -131,8 +151,12 @@ func (j *windowsRouteJournal) prepare(ctx context.Context, op *windowsRouteOpera
 	}
 	key := prefix.String()
 	for _, entry := range data.Entries {
-		if entry.InterfaceLUID == op.interfaceLUID && entry.Destination == key {
-			return fmt.Errorf("route journal already contains ownership for %s", key)
+		ownedPrefix, err := canonicalWindowsRouteJournalDestination(entry.Destination)
+		if err != nil {
+			return fmt.Errorf("unsafe route journal destination %q: %w", entry.Destination, err)
+		}
+		if ownedPrefix == prefix {
+			return fmt.Errorf("route journal destination %s is already owned by Wintun LUID %d", key, entry.InterfaceLUID)
 		}
 	}
 	txnID, err := newWindowsRouteTransactionID()
@@ -148,8 +172,101 @@ func (j *windowsRouteJournal) prepare(ctx context.Context, op *windowsRouteOpera
 	return nil
 }
 
-func (j *windowsRouteJournal) record(op *windowsRouteOperator, prefix netip.Prefix) error {
-	return j.setState(op, prefix, windowsRouteActive)
+func (j *windowsRouteJournal) record(op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
+	transition, err := op.takeTransition(prefix)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, transition.lock.unlock())
+	}()
+
+	data, err := j.load()
+	if err != nil {
+		retErr = err
+		return retErr
+	}
+	key := prefix.Masked().String()
+	for idx, entry := range data.Entries {
+		if entry.InterfaceLUID != op.interfaceLUID || entry.Destination != key || entry.TransactionID != transition.txnID {
+			continue
+		}
+		if _, err := validateWindowsRouteJournalEntry(op, entry); err != nil {
+			retErr = err
+			return retErr
+		}
+		if entry.State != windowsRoutePending {
+			retErr = fmt.Errorf("route journal ownership for %s is in state %q, want %q", prefix, entry.State, windowsRoutePending)
+			return retErr
+		}
+		data.Entries[idx].State = windowsRouteActive
+		if err := j.save(data); err == nil {
+			return nil
+		} else {
+			rolledBack, rollbackErr := j.rollbackFailedRecordLocked(op, prefix, transition)
+			retErr = &windowsRouteOwnershipRecordError{
+				err: errors.Join(
+					fmt.Errorf("persist active route ownership: %w", err),
+					rollbackErr,
+				),
+				rolledBack: rolledBack,
+			}
+			return retErr
+		}
+	}
+	retErr = fmt.Errorf("route journal ownership is missing for %s", key)
+	return retErr
+}
+
+func (j *windowsRouteJournal) rollbackFailedRecordLocked(op *windowsRouteOperator, prefix netip.Prefix, transition *windowsRouteJournalTransition) (bool, error) {
+	data, err := j.load()
+	if err != nil {
+		return false, fmt.Errorf("reload failed active ownership while holding machine lock: %w", err)
+	}
+	entryIdx := -1
+	for idx, entry := range data.Entries {
+		if entry.InterfaceLUID != op.interfaceLUID || entry.Destination != prefix.Masked().String() || entry.TransactionID != transition.txnID {
+			continue
+		}
+		if _, err := validateWindowsRouteJournalEntry(op, entry); err != nil {
+			return false, fmt.Errorf("validate failed active ownership rollback: %w", err)
+		}
+		if entry.State != windowsRoutePending && entry.State != windowsRouteActive {
+			return false, fmt.Errorf("failed active ownership rollback found unsafe state %q", entry.State)
+		}
+		entryIdx = idx
+		break
+	}
+	if entryIdx < 0 {
+		return false, errors.New("failed active ownership rollback could not verify its journal transaction")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), routeCleanupTimeout)
+	state, readErr := op.Read(ctx, prefix)
+	if readErr != nil {
+		cancel()
+		return false, fmt.Errorf("read route during failed active ownership rollback: %w", readErr)
+	}
+	if state.Matches {
+		deleteResult, deleteErr := op.Delete(ctx, prefix)
+		cancel()
+		if !deleteResult.Committed && deleteErr != nil {
+			verifyCtx, verifyCancel := context.WithTimeout(context.Background(), routeReadbackTimeout)
+			verified, verifyErr := op.Read(verifyCtx, prefix)
+			verifyCancel()
+			if verifyErr != nil || verified.Matches {
+				return false, fmt.Errorf("delete route during failed active ownership rollback: %w", errors.Join(deleteErr, verifyErr))
+			}
+		}
+	} else {
+		cancel()
+	}
+
+	data.Entries = append(data.Entries[:entryIdx], data.Entries[entryIdx+1:]...)
+	if err := j.save(data); err != nil {
+		return true, fmt.Errorf("release failed active ownership rollback intent: %w", err)
+	}
+	return true, nil
 }
 
 func (j *windowsRouteJournal) prepareDeletion(ctx context.Context, op *windowsRouteOperator, prefix netip.Prefix) (retErr error) {
@@ -235,9 +352,9 @@ func newWindowsRouteJournalEntry(op *windowsRouteOperator, prefix netip.Prefix, 
 }
 
 func validateWindowsRouteJournalEntry(op *windowsRouteOperator, entry windowsRouteJournalEntry) (netip.Prefix, error) {
-	prefix, err := netip.ParsePrefix(entry.Destination)
-	if err != nil || prefix != prefix.Masked() || prefix.Bits() == 0 {
-		return netip.Prefix{}, fmt.Errorf("invalid canonical destination %q", entry.Destination)
+	prefix, err := canonicalWindowsRouteJournalDestination(entry.Destination)
+	if err != nil {
+		return netip.Prefix{}, err
 	}
 	if entry.InterfaceLUID != op.interfaceLUID || entry.InterfaceIndex != op.interfaceIdx {
 		return netip.Prefix{}, errors.New("adapter LUID/index does not match the current Wintun adapter")
@@ -251,6 +368,14 @@ func validateWindowsRouteJournalEntry(op *windowsRouteOperator, entry windowsRou
 	txn, err := hex.DecodeString(entry.TransactionID)
 	if err != nil || len(txn) != 16 {
 		return netip.Prefix{}, errors.New("transaction ID is not a 128-bit hexadecimal value")
+	}
+	return prefix, nil
+}
+
+func canonicalWindowsRouteJournalDestination(destination string) (netip.Prefix, error) {
+	prefix, err := netip.ParsePrefix(destination)
+	if err != nil || prefix != prefix.Masked() || prefix.Bits() == 0 {
+		return netip.Prefix{}, fmt.Errorf("invalid canonical destination %q", destination)
 	}
 	return prefix, nil
 }
@@ -380,13 +505,19 @@ func newWindowsRouteTransactionID() (string, error) {
 }
 
 type namedWindowsRouteJournalLocker struct {
-	name    string
-	timeout time.Duration
+	name      string
+	timeout   time.Duration
+	lifecycle sync.Mutex
+	handle    windows.Handle
+	closed    bool
 }
 
 type protectedWindowsRouteJournalLocker struct {
-	storage *registryWindowsRouteJournalStorage
-	timeout time.Duration
+	storage  *registryWindowsRouteJournalStorage
+	timeout  time.Duration
+	mu       sync.Mutex
+	delegate *namedWindowsRouteJournalLocker
+	closed   bool
 }
 
 type localWindowsRouteJournalLocker struct {
@@ -401,51 +532,98 @@ func (l *localWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error
 	}}, nil
 }
 
+func (l *localWindowsRouteJournalLocker) Open() error  { return nil }
+func (l *localWindowsRouteJournalLocker) Close() error { return nil }
+
 func (l *protectedWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error) {
+	delegate, err := l.namedLocker()
+	if err != nil {
+		return nil, err
+	}
+	return delegate.Lock()
+}
+
+func (l *protectedWindowsRouteJournalLocker) Open() error {
+	delegate, err := l.namedLocker()
+	if err != nil {
+		return err
+	}
+	return delegate.Open()
+}
+
+func (l *protectedWindowsRouteJournalLocker) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	delegate := l.delegate
+	l.mu.Unlock()
+	if delegate == nil {
+		return nil
+	}
+	return delegate.Close()
+}
+
+func (l *protectedWindowsRouteJournalLocker) namedLocker() (*namedWindowsRouteJournalLocker, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("machine route journal locker is closed")
+	}
+	if l.delegate != nil {
+		return l.delegate, nil
+	}
 	name, err := l.storage.machineMutexName()
 	if err != nil {
 		return nil, fmt.Errorf("derive protected machine route journal mutex: %w", err)
 	}
-	return (&namedWindowsRouteJournalLocker{name: name, timeout: l.timeout}).Lock()
+	l.delegate = &namedWindowsRouteJournalLocker{name: name, timeout: l.timeout}
+	return l.delegate, nil
+}
+
+func (l *namedWindowsRouteJournalLocker) Open() error {
+	l.lifecycle.Lock()
+	defer l.lifecycle.Unlock()
+	_, err := l.openHandleLocked()
+	return err
+}
+
+func (l *namedWindowsRouteJournalLocker) Close() error {
+	l.lifecycle.Lock()
+	defer l.lifecycle.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	if l.handle == 0 {
+		return nil
+	}
+	err := windows.CloseHandle(l.handle)
+	l.handle = 0
+	return err
 }
 
 func (l *namedWindowsRouteJournalLocker) Lock() (_ *windowsRouteJournalLock, retErr error) {
-	descriptor, err := newWindowsRouteMutexSecurityDescriptor()
+	l.lifecycle.Lock()
+	handle, err := l.openHandleLocked()
 	if err != nil {
+		l.lifecycle.Unlock()
 		return nil, err
 	}
-	name, err := windows.UTF16PtrFromString(l.name)
-	if err != nil {
-		return nil, err
+	if err := validateWindowsRouteMutex(handle); err != nil {
+		l.lifecycle.Unlock()
+		return nil, fmt.Errorf("untrusted machine route journal mutex %q: %w", l.name, err)
 	}
-	security := windows.SecurityAttributes{
-		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
-		SecurityDescriptor: descriptor,
-	}
+
 	runtime.LockOSThread()
 	defer func() {
 		if retErr != nil {
 			runtime.UnlockOSThread()
+			l.lifecycle.Unlock()
 		}
 	}()
-	handle, err := windows.CreateMutex(&security, false, name)
-	runtime.KeepAlive(descriptor)
-	runtime.KeepAlive(security)
-	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		return nil, fmt.Errorf("create machine route journal mutex %q: %w", l.name, err)
-	}
-	if handle == 0 {
-		return nil, fmt.Errorf("create machine route journal mutex %q returned an invalid handle", l.name)
-	}
-	closeOnError := true
-	defer func() {
-		if closeOnError {
-			windows.CloseHandle(handle)
-		}
-	}()
-	if err := validateWindowsRouteMutex(handle); err != nil {
-		return nil, fmt.Errorf("untrusted machine route journal mutex %q: %w", l.name, err)
-	}
 	timeout := l.timeout
 	if timeout <= 0 {
 		timeout = windowsRouteLockTimeout
@@ -462,16 +640,55 @@ func (l *namedWindowsRouteJournalLocker) Lock() (_ *windowsRouteJournalLock, ret
 	}
 	// WAIT_ABANDONED transfers ownership to this thread. Every caller reloads
 	// and validates the durable journal before making its next mutation.
-	closeOnError = false
 	return &windowsRouteJournalLock{
 		abandoned: wait == windows.WAIT_ABANDONED,
 		unlock: func() error {
 			releaseErr := windows.ReleaseMutex(handle)
-			closeErr := windows.CloseHandle(handle)
 			runtime.UnlockOSThread()
-			return errors.Join(releaseErr, closeErr)
+			l.lifecycle.Unlock()
+			return releaseErr
 		},
 	}, nil
+}
+
+func (l *namedWindowsRouteJournalLocker) openHandleLocked() (_ windows.Handle, retErr error) {
+	if l.closed {
+		return 0, errors.New("machine route journal locker is closed")
+	}
+	if l.handle != 0 {
+		return l.handle, nil
+	}
+	descriptor, err := newWindowsRouteMutexSecurityDescriptor()
+	if err != nil {
+		return 0, err
+	}
+	name, err := windows.UTF16PtrFromString(l.name)
+	if err != nil {
+		return 0, err
+	}
+	security := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	handle, err := windows.CreateMutex(&security, false, name)
+	runtime.KeepAlive(descriptor)
+	runtime.KeepAlive(security)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return 0, fmt.Errorf("create machine route journal mutex %q: %w", l.name, err)
+	}
+	if handle == 0 {
+		return 0, fmt.Errorf("create machine route journal mutex %q returned an invalid handle", l.name)
+	}
+	defer func() {
+		if retErr != nil {
+			windows.CloseHandle(handle)
+		}
+	}()
+	if err := validateWindowsRouteMutex(handle); err != nil {
+		return 0, fmt.Errorf("untrusted machine route journal mutex %q: %w", l.name, err)
+	}
+	l.handle = handle
+	return handle, nil
 }
 
 func newWindowsRouteMutexSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
@@ -801,10 +1018,12 @@ func aclEntryCount(acl *windows.ACL) uint16 {
 }
 
 type memoryWindowsRouteJournalStorage struct {
-	value    []byte
-	writes   [][]byte
-	readErr  error
-	writeErr error
+	value       []byte
+	writes      [][]byte
+	readErr     error
+	writeErr    error
+	writeCalls  int
+	writeErrors map[int]error
 }
 
 func (s *memoryWindowsRouteJournalStorage) Location() string { return "test memory" }
@@ -814,6 +1033,10 @@ func (s *memoryWindowsRouteJournalStorage) Read() ([]byte, error) {
 }
 
 func (s *memoryWindowsRouteJournalStorage) Write(wire []byte) error {
+	s.writeCalls++
+	if err := s.writeErrors[s.writeCalls]; err != nil {
+		return err
+	}
 	if s.writeErr != nil {
 		return s.writeErr
 	}

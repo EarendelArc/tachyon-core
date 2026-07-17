@@ -3,6 +3,7 @@
 package tun
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -131,6 +132,11 @@ func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 	cleanupWindowsRouteJournalTestKey(t, keyPath)
 	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
 	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Errorf("close multiprocess journal: %v", err)
+		}
+	})
 	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion}); err != nil {
 		t.Fatalf("initialize multiprocess HKLM journal: %v", err)
 	}
@@ -177,11 +183,46 @@ func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 	if len(data.Entries) != processCount || len(seen) != processCount {
 		t.Fatalf("multiprocess journal entries=%+v, want %d unique entries", data.Entries, processCount)
 	}
+
+	conflictPrefix := netip.MustParsePrefix("198.51.100.0/24")
+	owner := &windowsRouteOperator{interfaceLUID: 1000, interfaceIdx: 1000}
+	txnID, err := newWindowsRouteTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err = journal.locker.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = journal.load()
+	if err == nil {
+		data.Entries = append(data.Entries, newWindowsRouteJournalEntry(owner, conflictPrefix, txnID, windowsRouteActive))
+		err = journal.save(data)
+	}
+	err = errors.Join(err, lock.unlock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsRouteJournalProcessHelper$", "-test.count=1")
+	cmd.Env = append(os.Environ(),
+		windowsRouteJournalHelperEnv+"=claim-conflict",
+		"TACHYON_ROUTE_JOURNAL_TEST_KEY="+keyPath,
+		"TACHYON_ROUTE_JOURNAL_TEST_MARKER=1001",
+		"TACHYON_ROUTE_JOURNAL_TEST_PREFIX="+conflictPrefix.String(),
+	)
+	if wire, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("different-LUID conflict helper: %v\n%s", err, wire)
+	}
 }
 
 func TestWindowsRouteJournalMachineMutexTimeoutAndAbandonment(t *testing.T) {
 	mutexName := uniqueWindowsRouteJournalTestMutex("Wait")
 	locker := &namedWindowsRouteJournalLocker{name: mutexName, timeout: 2 * time.Second}
+	t.Cleanup(func() {
+		if err := locker.Close(); err != nil {
+			t.Errorf("close persistent machine mutex: %v", err)
+		}
+	})
 	held := make(chan *windowsRouteJournalLock, 1)
 	release := make(chan struct{})
 	done := make(chan error, 1)
@@ -208,6 +249,24 @@ func TestWindowsRouteJournalMachineMutexTimeoutAndAbandonment(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+	keeper := locker.handle
+	if keeper == 0 {
+		t.Fatal("machine mutex keeper handle was destroyed after transition unlock")
+	}
+	if err := validateWindowsRouteMutex(keeper); err != nil {
+		t.Fatalf("persistent machine mutex keeper is no longer trusted: %v", err)
+	}
+	lock, err := locker.Lock()
+	if err != nil {
+		t.Fatalf("reacquire persistent machine mutex: %v", err)
+	}
+	if locker.handle != keeper {
+		lock.unlock()
+		t.Fatal("machine mutex was recreated between transitions")
+	}
+	if err := lock.unlock(); err != nil {
+		t.Fatal(err)
+	}
 
 	persistentHandle := openWindowsRouteJournalTestMutex(t, mutexName)
 	defer windows.CloseHandle(persistentHandle)
@@ -216,7 +275,7 @@ func TestWindowsRouteJournalMachineMutexTimeoutAndAbandonment(t *testing.T) {
 	if wire, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("abandon helper: %v\n%s", err, wire)
 	}
-	lock, err := locker.Lock()
+	lock, err = locker.Lock()
 	if err != nil {
 		t.Fatalf("acquire abandoned machine mutex: %v", err)
 	}
@@ -242,6 +301,29 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 	if mutexName := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MUTEX"); mutexName != "" {
 		locker = &namedWindowsRouteJournalLocker{name: mutexName, timeout: windowsRouteLockTimeout}
 	}
+	journal := &windowsRouteJournal{storage: storage, locker: locker}
+	if action == "claim-conflict" {
+		marker, err := strconv.Atoi(os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MARKER"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix, err := netip.ParsePrefix(os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_PREFIX"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		op := &windowsRouteOperator{
+			interfaceLUID: uint64(marker),
+			interfaceIdx:  uint32(marker),
+			api: windowsRouteAPI{
+				initEntry: func(*windows.MibIpForwardRow2) {},
+				get:       func(*windows.MibIpForwardRow2) error { return windows.ERROR_NOT_FOUND },
+			},
+		}
+		if err := journal.prepare(context.Background(), op, prefix); err == nil || !strings.Contains(err.Error(), "already owned") {
+			t.Fatalf("different-LUID destination claim error = %v", err)
+		}
+		return
+	}
 	lock, err := locker.Lock()
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +340,6 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 		lock.unlock()
 		t.Fatal(err)
 	}
-	journal := &windowsRouteJournal{storage: storage, locker: locker}
 	data, err := journal.load()
 	if err == nil {
 		time.Sleep(75 * time.Millisecond)

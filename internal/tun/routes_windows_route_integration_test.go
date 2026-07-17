@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -75,6 +76,11 @@ func TestWindowsRouteJournalAbandonedPendingRealChildRecovery(t *testing.T) {
 
 	observed := &observingWindowsRouteJournalLocker{inner: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
 	journal := &windowsRouteJournal{storage: storage, locker: observed}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Errorf("close real-route journal: %v", err)
+		}
+	})
 	op.journal = journal
 	if err := op.Reconcile(context.Background()); err != nil {
 		t.Fatalf("recover abandoned pending real route: %v", err)
@@ -89,6 +95,64 @@ func TestWindowsRouteJournalAbandonedPendingRealChildRecovery(t *testing.T) {
 	data, err := journal.load()
 	if err != nil || len(data.Entries) != 0 {
 		t.Fatalf("journal remains after real route recovery: data=%+v error=%v", data, err)
+	}
+}
+
+func TestWindowsRouteJournalRecordFailureRealRouteRollback(t *testing.T) {
+	if os.Getenv("TACHYON_ALLOW_REAL_ROUTE_TEST") != "1" {
+		t.Fatal("real route integration is fail-closed; set TACHYON_ALLOW_REAL_ROUTE_TEST=1 on an isolated elevated CI runner")
+	}
+
+	keyPath := uniqueRealRouteTestKey()
+	baseStorage := &registryWindowsRouteJournalStorage{root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State"}
+	cleanupRealRouteTestKey(t, keyPath)
+	t.Cleanup(func() { cleanupRealRouteTestKey(t, keyPath) })
+	if err := (&windowsRouteJournal{storage: baseStorage}).save(windowsRouteJournalData{Version: windowsRouteJournalVersion}); err != nil {
+		t.Fatalf("initialize protected real-route journal: %v", err)
+	}
+
+	interfaceLUID, interfaceIndex, err := realRouteTestInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &failNthWindowsRouteJournalStorage{
+		windowsRouteJournalStorage: baseStorage,
+		failAt:                     2,
+		err:                        errors.New("injected real active persistence failure"),
+	}
+	locker := &protectedWindowsRouteJournalLocker{storage: baseStorage, timeout: windowsRouteLockTimeout}
+	if err := locker.Open(); err != nil {
+		t.Fatal(err)
+	}
+	journal := &windowsRouteJournal{storage: storage, locker: locker}
+	op := &windowsRouteOperator{
+		interfaceLUID: interfaceLUID,
+		interfaceIdx:  interfaceIndex,
+		api:           systemWindowsRouteAPI(),
+		journal:       journal,
+		adapterOwned:  func() bool { return true },
+	}
+	prefix, err := unusedRealRouteTestPrefix(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = op.Delete(ctx, prefix)
+		_ = journal.Close()
+	})
+
+	if _, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix}); err == nil || !strings.Contains(err.Error(), "injected real active persistence failure") {
+		t.Fatalf("real route install error = %v", err)
+	}
+	state, err := op.Read(context.Background(), prefix)
+	if err != nil || state.Exists {
+		t.Fatalf("real route remains after failed active persistence: state=%+v error=%v", state, err)
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 0 {
+		t.Fatalf("journal remains after failed active persistence: data=%+v error=%v", data, err)
 	}
 }
 
@@ -132,6 +196,35 @@ func TestWindowsRouteJournalRealRouteProcessHelper(t *testing.T) {
 type observingWindowsRouteJournalLocker struct {
 	inner     windowsRouteJournalLocker
 	abandoned bool
+}
+
+func (l *observingWindowsRouteJournalLocker) Open() error {
+	if lifecycle, ok := l.inner.(windowsRouteJournalLockerLifecycle); ok {
+		return lifecycle.Open()
+	}
+	return nil
+}
+
+func (l *observingWindowsRouteJournalLocker) Close() error {
+	if lifecycle, ok := l.inner.(windowsRouteJournalLockerLifecycle); ok {
+		return lifecycle.Close()
+	}
+	return nil
+}
+
+type failNthWindowsRouteJournalStorage struct {
+	windowsRouteJournalStorage
+	writes int
+	failAt int
+	err    error
+}
+
+func (s *failNthWindowsRouteJournalStorage) Write(wire []byte) error {
+	s.writes++
+	if s.writes == s.failAt {
+		return s.err
+	}
+	return s.windowsRouteJournalStorage.Write(wire)
 }
 
 func (l *observingWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error) {

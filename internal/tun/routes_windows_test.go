@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -319,6 +320,175 @@ func TestWindowsRouteJournalRecoversCrashAfterCreateBeforeRecordOwnership(t *tes
 	}
 }
 
+func TestWindowsRouteJournalRejectsDestinationOwnedByDifferentLUID(t *testing.T) {
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	journal := newWindowsRouteJournalForTest()
+	owner := &windowsRouteOperator{interfaceLUID: 55, interfaceIdx: 12}
+	entry := testWindowsRouteJournalEntry(t, owner, prefix, windowsRouteActive)
+	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion, Entries: []windowsRouteJournalEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+
+	contender := &windowsRouteOperator{
+		interfaceLUID: 99,
+		interfaceIdx:  13,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get:       func(*windows.MibIpForwardRow2) error { return windows.ERROR_NOT_FOUND },
+		},
+	}
+	if err := journal.prepare(context.Background(), contender, prefix); err == nil || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("different-LUID destination claim error = %v", err)
+	}
+	if contender.transition != nil {
+		t.Fatal("rejected destination claim retained a transition")
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 1 || data.Entries[0].InterfaceLUID != owner.interfaceLUID {
+		t.Fatalf("rejected claim changed ownership: data=%+v error=%v", data, err)
+	}
+}
+
+func TestWindowsRouteJournalRecordFailureRollsBackCreatedRouteUnderLock(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	storage := &memoryWindowsRouteJournalStorage{writeErrors: map[int]error{2: errors.New("injected active persistence failure")}}
+	locker := &observedLocalWindowsRouteJournalLocker{}
+	journal := &windowsRouteJournal{storage: storage, locker: locker}
+	var route *windows.MibIpForwardRow2
+	deleteCalls := 0
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get: func(row *windows.MibIpForwardRow2) error {
+				if route == nil {
+					return windows.ERROR_NOT_FOUND
+				}
+				*row = *route
+				return nil
+			},
+			create: func(row *windows.MibIpForwardRow2) error {
+				copy := *row
+				route = &copy
+				return nil
+			},
+			delete: func(*windows.MibIpForwardRow2) error {
+				if !locker.held {
+					t.Fatal("RecordOwnership rollback deleted outside the machine journal lock")
+				}
+				deleteCalls++
+				route = nil
+				return nil
+			},
+		},
+	}
+
+	_, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix})
+	if err == nil || !strings.Contains(err.Error(), "persist active route ownership") {
+		t.Fatalf("install error = %v", err)
+	}
+	if route != nil || deleteCalls != 1 {
+		t.Fatalf("failed active record left route=%+v deleteCalls=%d", route, deleteCalls)
+	}
+	data, loadErr := journal.load()
+	if loadErr != nil || len(data.Entries) != 0 {
+		t.Fatalf("failed active record left journal=%+v error=%v", data, loadErr)
+	}
+	if locker.held {
+		t.Fatal("failed active record left machine journal lock held")
+	}
+}
+
+func TestWindowsRouteJournalRecordFailureRemovesRouteWhenIntentCleanupAlsoFails(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.1/32")
+	storage := &memoryWindowsRouteJournalStorage{writeErrors: map[int]error{
+		2: errors.New("injected active persistence failure"),
+		3: errors.New("injected intent cleanup failure"),
+	}}
+	journal := &windowsRouteJournal{storage: storage, locker: &localWindowsRouteJournalLocker{}}
+	var route *windows.MibIpForwardRow2
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get: func(row *windows.MibIpForwardRow2) error {
+				if route == nil {
+					return windows.ERROR_NOT_FOUND
+				}
+				*row = *route
+				return nil
+			},
+			create: func(row *windows.MibIpForwardRow2) error {
+				copy := *row
+				route = &copy
+				return nil
+			},
+			delete: func(*windows.MibIpForwardRow2) error {
+				route = nil
+				return nil
+			},
+		},
+	}
+
+	if _, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix}); err == nil || !strings.Contains(err.Error(), "intent cleanup failure") {
+		t.Fatalf("install error = %v", err)
+	}
+	if route != nil {
+		t.Fatal("failed intent cleanup left the just-created route installed")
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 1 || data.Entries[0].State != windowsRoutePending {
+		t.Fatalf("cleanup failure must retain fail-closed pending intent: data=%+v error=%v", data, err)
+	}
+}
+
+func TestWindowsRouteJournalRecordFailureRetainsPendingWhenImmediateDeleteFails(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.2/32")
+	storage := &memoryWindowsRouteJournalStorage{writeErrors: map[int]error{2: errors.New("injected active persistence failure")}}
+	journal := &windowsRouteJournal{storage: storage, locker: &localWindowsRouteJournalLocker{}}
+	var route *windows.MibIpForwardRow2
+	deleteCalls := 0
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get: func(row *windows.MibIpForwardRow2) error {
+				if route == nil {
+					return windows.ERROR_NOT_FOUND
+				}
+				*row = *route
+				return nil
+			},
+			create: func(row *windows.MibIpForwardRow2) error {
+				copy := *row
+				route = &copy
+				return nil
+			},
+			delete: func(*windows.MibIpForwardRow2) error {
+				deleteCalls++
+				return windows.ERROR_RETRY
+			},
+		},
+	}
+
+	if _, err := installRouteTransaction(context.Background(), op, []netip.Prefix{prefix}); err == nil || !strings.Contains(err.Error(), "delete route during failed active ownership rollback") {
+		t.Fatalf("install error = %v", err)
+	}
+	if route == nil || deleteCalls != 1 {
+		t.Fatalf("failed immediate delete route=%+v deleteCalls=%d", route, deleteCalls)
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 1 || data.Entries[0].State != windowsRoutePending {
+		t.Fatalf("failed immediate delete must retain pending ownership: data=%+v error=%v", data, err)
+	}
+}
+
 func TestWindowsRouteJournalDeleteSuccessAbandonsRecreatedRoute(t *testing.T) {
 	prefix := netip.MustParsePrefix("203.0.113.0/24")
 	rows := make(map[string]windows.MibIpForwardRow2)
@@ -502,14 +672,7 @@ func TestWindowsRegistryBinaryReadRejectsTwoPhaseValueChanges(t *testing.T) {
 
 func TestDefaultWindowsRouteJournalUsesFixedMachineRegistryKey(t *testing.T) {
 	t.Setenv("TACHYON_ROUTE_JOURNAL", filepath.Join(t.TempDir(), "forged.json"))
-	journal, err := newDefaultWindowsRouteJournal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	storage, ok := journal.storage.(*registryWindowsRouteJournalStorage)
-	if !ok {
-		t.Fatalf("default storage = %T, want registry storage", journal.storage)
-	}
+	storage := defaultWindowsRouteJournalStorage()
 	if storage.root != registry.LOCAL_MACHINE || storage.keyPath != windowsRouteJournalKey || storage.valueName != windowsRouteJournalValue {
 		t.Fatalf("registry location = root %v path %q value %q", storage.root, storage.keyPath, storage.valueName)
 	}
@@ -663,4 +826,19 @@ func testWindowsRouteJournalEntry(t *testing.T, op *windowsRouteOperator, prefix
 		t.Fatal(err)
 	}
 	return newWindowsRouteJournalEntry(op, prefix, txnID, state)
+}
+
+type observedLocalWindowsRouteJournalLocker struct {
+	mu   sync.Mutex
+	held bool
+}
+
+func (l *observedLocalWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error) {
+	l.mu.Lock()
+	l.held = true
+	return &windowsRouteJournalLock{unlock: func() error {
+		l.held = false
+		l.mu.Unlock()
+		return nil
+	}}, nil
 }

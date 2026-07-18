@@ -233,9 +233,99 @@ func TestWindowsRouteJournalRestrictedTokenCreatesUsersPrivateNamespace(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := validateWindowsUsersTestMutex(mutex); err != nil {
+		windows.CloseHandle(mutex)
+		t.Fatalf("returned Users mutex handle is not still valid: %v", err)
+	}
 	if err := windows.CloseHandle(mutex); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWindowsRouteJournalUsersMutexHandleLifecycle(t *testing.T) {
+	const fakeHandle windows.Handle = 0x1234
+
+	t.Run("creation error closes nonzero handle", func(t *testing.T) {
+		closeCalls := 0
+		api := windowsUsersTestMutexAPI{
+			create: func(*windows.SecurityAttributes, bool, *uint16) (windows.Handle, error) {
+				return fakeHandle, windows.ERROR_ALREADY_EXISTS
+			},
+			close: func(handle windows.Handle) error {
+				closeCalls++
+				if handle != fakeHandle {
+					t.Fatalf("closed handle %#x, want %#x", handle, fakeHandle)
+				}
+				return nil
+			},
+			validate: func(windows.Handle) error {
+				t.Fatal("validated mutex after CreateMutex error")
+				return nil
+			},
+		}
+		handle, err := createWindowsUsersTestMutexWithAPI(`Test\AlreadyExists`, api)
+		if handle != 0 || !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			t.Fatalf("CreateMutex error result handle=%#x error=%v", handle, err)
+		}
+		if closeCalls != 1 {
+			t.Fatalf("CreateMutex error closed handle %d times, want once", closeCalls)
+		}
+	})
+
+	t.Run("validation error closes handle", func(t *testing.T) {
+		validationErr := errors.New("injected validation failure")
+		closeCalls := 0
+		api := windowsUsersTestMutexAPI{
+			create: func(*windows.SecurityAttributes, bool, *uint16) (windows.Handle, error) {
+				return fakeHandle, nil
+			},
+			close: func(handle windows.Handle) error {
+				closeCalls++
+				return nil
+			},
+			validate: func(handle windows.Handle) error {
+				return validationErr
+			},
+		}
+		handle, err := createWindowsUsersTestMutexWithAPI(`Test\InvalidACL`, api)
+		if handle != 0 || !errors.Is(err, validationErr) {
+			t.Fatalf("mutex validation error result handle=%#x error=%v", handle, err)
+		}
+		if closeCalls != 1 {
+			t.Fatalf("mutex validation error closed handle %d times, want once", closeCalls)
+		}
+	})
+
+	t.Run("success transfers live handle", func(t *testing.T) {
+		closeCalls := 0
+		validateCalls := 0
+		api := windowsUsersTestMutexAPI{
+			create: func(*windows.SecurityAttributes, bool, *uint16) (windows.Handle, error) {
+				return fakeHandle, nil
+			},
+			close: func(handle windows.Handle) error {
+				closeCalls++
+				return nil
+			},
+			validate: func(handle windows.Handle) error {
+				validateCalls++
+				return nil
+			},
+		}
+		handle, err := createWindowsUsersTestMutexWithAPI(`Test\Success`, api)
+		if err != nil || handle != fakeHandle {
+			t.Fatalf("successful mutex result handle=%#x error=%v", handle, err)
+		}
+		if validateCalls != 1 || closeCalls != 0 {
+			t.Fatalf("successful mutex validate calls=%d close calls=%d, want 1 and 0", validateCalls, closeCalls)
+		}
+		if err := api.close(handle); err != nil {
+			t.Fatal(err)
+		}
+		if closeCalls != 1 {
+			t.Fatalf("caller closed transferred handle %d times, want once", closeCalls)
+		}
+	})
 }
 
 func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
@@ -654,7 +744,21 @@ func newWindowsUsersTestMutexSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR,
 	return windows.SecurityDescriptorFromString("D:P(A;;0x001F0001;;;BU)")
 }
 
-func createWindowsUsersTestMutex(name string) (_ windows.Handle, retErr error) {
+type windowsUsersTestMutexAPI struct {
+	create   func(*windows.SecurityAttributes, bool, *uint16) (windows.Handle, error)
+	close    func(windows.Handle) error
+	validate func(windows.Handle) error
+}
+
+func createWindowsUsersTestMutex(name string) (windows.Handle, error) {
+	return createWindowsUsersTestMutexWithAPI(name, windowsUsersTestMutexAPI{
+		create:   windows.CreateMutex,
+		close:    windows.CloseHandle,
+		validate: validateWindowsUsersTestMutex,
+	})
+}
+
+func createWindowsUsersTestMutexWithAPI(name string, api windowsUsersTestMutexAPI) (_ windows.Handle, retErr error) {
 	descriptor, err := newWindowsUsersTestMutexSecurityDescriptor()
 	if err != nil {
 		return 0, err
@@ -667,23 +771,25 @@ func createWindowsUsersTestMutex(name string) (_ windows.Handle, retErr error) {
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
 	}
-	handle, err := windows.CreateMutex(&security, false, namePtr)
+	handle, err := api.create(&security, false, namePtr)
 	runtime.KeepAlive(descriptor)
 	runtime.KeepAlive(security)
+	cleanup := handle != 0
+	defer func() {
+		if cleanup {
+			retErr = errors.Join(retErr, api.close(handle))
+		}
+	}()
 	if err != nil {
 		return 0, fmt.Errorf("create explicit-Users-ACL mutex %q: %w", name, err)
 	}
 	if handle == 0 {
 		return 0, fmt.Errorf("create explicit-Users-ACL mutex %q returned an invalid handle", name)
 	}
-	defer func() {
-		if retErr != nil {
-			windows.CloseHandle(handle)
-		}
-	}()
-	if err := validateWindowsUsersTestMutex(handle); err != nil {
+	if err := api.validate(handle); err != nil {
 		return 0, fmt.Errorf("validate explicit-Users-ACL mutex %q: %w", name, err)
 	}
+	cleanup = false
 	return handle, nil
 }
 

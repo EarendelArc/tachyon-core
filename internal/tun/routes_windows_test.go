@@ -945,6 +945,10 @@ func TestWindowsPrivateNamespaceRegistryLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	descriptor, err := newWindowsRouteNamespaceSecurityDescriptor()
 	if err != nil {
 		t.Fatal(err)
@@ -1036,14 +1040,16 @@ func TestWindowsPrivateNamespaceRegistryLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("different boundary or ACL fails closed", func(t *testing.T) {
+	t.Run("different boundary identity or ACL fails closed", func(t *testing.T) {
 		for _, test := range []struct {
 			name         string
 			boundaryName string
+			boundarySID  *windows.SID
 			security     *windows.SECURITY_DESCRIPTOR
 		}{
-			{name: "boundary", boundaryName: "OtherBoundary", security: descriptor},
-			{name: "ACL", boundaryName: "TrustedBoundary", security: mustWindowsSecurityDescriptor(t, "D:P(A;;GA;;;BU)")},
+			{name: "boundary name", boundaryName: "OtherBoundary", boundarySID: admins, security: descriptor},
+			{name: "boundary SID", boundaryName: "TrustedBoundary", boundarySID: users, security: descriptor},
+			{name: "ACL", boundaryName: "TrustedBoundary", boundarySID: admins, security: mustWindowsSecurityDescriptor(t, "D:P(A;;GA;;;BU)")},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				backend := &observedWindowsPrivateNamespaceBackend{}
@@ -1052,7 +1058,7 @@ func TestWindowsPrivateNamespaceRegistryLifecycle(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := registry.Acquire("IdentityAlias", test.boundaryName, admins, test.security); err == nil || !strings.Contains(err.Error(), "different boundary or ACL") {
+				if _, err := registry.Acquire("IdentityAlias", test.boundaryName, test.boundarySID, test.security); err == nil || !strings.Contains(err.Error(), "different boundary name, SID, or ACL") {
 					t.Fatalf("identity conflict error = %v", err)
 				}
 				if err := reference.Close(); err != nil {
@@ -1060,6 +1066,69 @@ func TestWindowsPrivateNamespaceRegistryLifecycle(t *testing.T) {
 				}
 				if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
 					t.Fatalf("identity conflict opens=%d closes=%d, want 1 and 1", opens, closes)
+				}
+			})
+		}
+	})
+
+	t.Run("empty canonical identity never enters registry", func(t *testing.T) {
+		for _, test := range []struct {
+			name         string
+			wantError    string
+			canonicalize func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (windowsPrivateNamespaceIdentity, error)
+		}{
+			{
+				name:      "identity error",
+				wantError: "injected identity failure",
+				canonicalize: func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (windowsPrivateNamespaceIdentity, error) {
+					return windowsPrivateNamespaceIdentity{}, errors.New("injected identity failure")
+				},
+			},
+			{
+				name:      "boundary SID",
+				wantError: "boundary SID could not be canonicalized",
+				canonicalize: func(alias, boundaryName string, sid *windows.SID, descriptor *windows.SECURITY_DESCRIPTOR) (windowsPrivateNamespaceIdentity, error) {
+					return newWindowsPrivateNamespaceIdentityWithCanonicalizers(
+						alias,
+						boundaryName,
+						sid,
+						descriptor,
+						func(*windows.SID) string { return "" },
+						func(descriptor *windows.SECURITY_DESCRIPTOR) string { return descriptor.String() },
+					)
+				},
+			},
+			{
+				name:      "descriptor",
+				wantError: "security descriptor could not be canonicalized",
+				canonicalize: func(alias, boundaryName string, sid *windows.SID, descriptor *windows.SECURITY_DESCRIPTOR) (windowsPrivateNamespaceIdentity, error) {
+					return newWindowsPrivateNamespaceIdentityWithCanonicalizers(
+						alias,
+						boundaryName,
+						sid,
+						descriptor,
+						func(sid *windows.SID) string { return sid.String() },
+						func(*windows.SECURITY_DESCRIPTOR) string { return "" },
+					)
+				},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				backend := &observedWindowsPrivateNamespaceBackend{}
+				registry := backend.Registry()
+				registry.identity = test.canonicalize
+				reference, err := registry.Acquire("EmptyIdentityAlias", "TrustedBoundary", admins, descriptor)
+				if reference != nil || err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("empty identity reference=%v error=%v", reference, err)
+				}
+				if opens, closes := backend.Counts(); opens != 0 || closes != 0 {
+					t.Fatalf("empty identity opens=%d closes=%d, want 0 and 0", opens, closes)
+				}
+				registry.mu.Lock()
+				entries := len(registry.entries)
+				registry.mu.Unlock()
+				if entries != 0 {
+					t.Fatalf("empty identity wrote %d registry entries", entries)
 				}
 			})
 		}

@@ -56,10 +56,11 @@ type windowsPrivateNamespaceEntry struct {
 }
 
 type windowsPrivateNamespaceRegistry struct {
-	mu      sync.Mutex
-	entries map[string]*windowsPrivateNamespaceEntry
-	open    func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error)
-	close   func(*windowsPrivateNamespace) error
+	mu       sync.Mutex
+	entries  map[string]*windowsPrivateNamespaceEntry
+	identity func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (windowsPrivateNamespaceIdentity, error)
+	open     func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error)
+	close    func(*windowsPrivateNamespace) error
 }
 
 type windowsPrivateNamespaceReference struct {
@@ -88,9 +89,10 @@ func newWindowsPrivateNamespaceRegistry(
 	close func(*windowsPrivateNamespace) error,
 ) *windowsPrivateNamespaceRegistry {
 	return &windowsPrivateNamespaceRegistry{
-		entries: make(map[string]*windowsPrivateNamespaceEntry),
-		open:    open,
-		close:   close,
+		entries:  make(map[string]*windowsPrivateNamespaceEntry),
+		identity: newWindowsPrivateNamespaceIdentity,
+		open:     open,
+		close:    close,
 	}
 }
 
@@ -188,12 +190,12 @@ func (r *windowsPrivateNamespaceRegistry) Acquire(
 	boundarySID *windows.SID,
 	descriptor *windows.SECURITY_DESCRIPTOR,
 ) (*windowsPrivateNamespaceReference, error) {
-	identity, err := newWindowsPrivateNamespaceIdentity(alias, boundaryName, boundarySID, descriptor)
+	if r == nil || r.identity == nil || r.open == nil || r.close == nil {
+		return nil, errors.New("private namespace registry is not initialized")
+	}
+	identity, err := r.identity(alias, boundaryName, boundarySID, descriptor)
 	if err != nil {
 		return nil, err
-	}
-	if r == nil || r.open == nil || r.close == nil {
-		return nil, errors.New("private namespace registry is not initialized")
 	}
 
 	r.mu.Lock()
@@ -203,7 +205,7 @@ func (r *windowsPrivateNamespaceRegistry) Acquire(
 	}
 	if entry := r.entries[alias]; entry != nil {
 		if entry.identity != identity {
-			return nil, fmt.Errorf("private namespace alias %q is already registered with a different boundary or ACL", alias)
+			return nil, fmt.Errorf("private namespace alias %q is already registered with a different boundary name, SID, or ACL", alias)
 		}
 		if entry.references <= 0 {
 			if entry.closeErr != nil {
@@ -236,6 +238,23 @@ func newWindowsPrivateNamespaceIdentity(
 	boundarySID *windows.SID,
 	descriptor *windows.SECURITY_DESCRIPTOR,
 ) (windowsPrivateNamespaceIdentity, error) {
+	return newWindowsPrivateNamespaceIdentityWithCanonicalizers(
+		alias,
+		boundaryName,
+		boundarySID,
+		descriptor,
+		func(sid *windows.SID) string { return sid.String() },
+		func(descriptor *windows.SECURITY_DESCRIPTOR) string { return descriptor.String() },
+	)
+}
+
+func newWindowsPrivateNamespaceIdentityWithCanonicalizers(
+	alias, boundaryName string,
+	boundarySID *windows.SID,
+	descriptor *windows.SECURITY_DESCRIPTOR,
+	canonicalizeSID func(*windows.SID) string,
+	canonicalizeDescriptor func(*windows.SECURITY_DESCRIPTOR) string,
+) (windowsPrivateNamespaceIdentity, error) {
 	if alias == "" || boundaryName == "" {
 		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace alias and boundary name are required")
 	}
@@ -245,14 +264,21 @@ func newWindowsPrivateNamespaceIdentity(
 	if descriptor == nil || !descriptor.IsValid() {
 		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace security descriptor is missing or invalid")
 	}
-	descriptorString := descriptor.String()
+	if canonicalizeSID == nil || canonicalizeDescriptor == nil {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace identity canonicalizer is missing")
+	}
+	boundarySIDString := canonicalizeSID(boundarySID)
+	if boundarySIDString == "" {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace boundary SID could not be canonicalized")
+	}
+	descriptorString := canonicalizeDescriptor(descriptor)
 	if descriptorString == "" {
 		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace security descriptor could not be canonicalized")
 	}
 	return windowsPrivateNamespaceIdentity{
 		alias:        alias,
 		boundaryName: boundaryName,
-		boundarySID:  boundarySID.String(),
+		boundarySID:  boundarySIDString,
 		descriptor:   descriptorString,
 	}, nil
 }

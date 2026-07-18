@@ -4,6 +4,7 @@ package tun
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -137,17 +138,30 @@ func TestWindowsRouteJournalInitializesSecretFromProtectedEmptyHKLMKey(t *testin
 		locker.Close()
 		t.Fatal(err)
 	}
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		locker.Close()
 		t.Fatal(err)
 	}
-	ready := bufio.NewScanner(stdout)
-	if !ready.Scan() || ready.Text() != "READY" {
+	output := bufio.NewScanner(stdout)
+	var stdoutLines []string
+	ready := false
+	for output.Scan() {
+		stdoutLines = append(stdoutLines, output.Text())
+		if output.Text() == "READY" {
+			ready = true
+			break
+		}
+	}
+	if !ready {
 		locker.Close()
 		stdin.Close()
-		_ = cmd.Wait()
-		t.Fatalf("low-privilege namespace helper did not become ready: %q error=%v", ready.Text(), ready.Err())
+		waitErr := cmd.Wait()
+		t.Fatalf(
+			"low-privilege namespace helper did not become ready: exit=%d wait=%v scanner=%v stdout=%q stderr=%q",
+			cmd.ProcessState.ExitCode(), waitErr, output.Err(), strings.Join(stdoutLines, "\n"), stderr.String(),
+		)
 	}
 
 	if err := locker.Close(); err != nil {
@@ -168,8 +182,58 @@ func TestWindowsRouteJournalInitializesSecretFromProtectedEmptyHKLMKey(t *testin
 	err = errors.Join(err, restarted.Close())
 	_, _ = io.WriteString(stdin, "release\n")
 	_ = stdin.Close()
-	err = errors.Join(err, cmd.Wait())
+	for output.Scan() {
+		stdoutLines = append(stdoutLines, output.Text())
+	}
+	err = errors.Join(err, output.Err(), cmd.Wait())
 	if err != nil {
+		t.Fatalf(
+			"restart while low-privilege same-alias namespace exists: %v; exit=%d stdout=%q stderr=%q",
+			err, cmd.ProcessState.ExitCode(), strings.Join(stdoutLines, "\n"), stderr.String(),
+		)
+	}
+}
+
+func TestWindowsRouteJournalRestrictedTokenCreatesUsersPrivateNamespace(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restricted, err := createNonAdminRestrictedToken(admins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restricted.Close()
+	if err := windows.SetThreadToken(nil, restricted); err != nil {
+		t.Fatal(err)
+	}
+	defer windows.RevertToSelf()
+	if member, err := restricted.IsMember(admins); err != nil || member {
+		t.Fatalf("restricted helper still belongs to Administrators: member=%v error=%v", member, err)
+	}
+
+	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := uniqueWindowsRoutePrivateNamespace("RestrictedToken")
+	namespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, nil)
+	if err != nil {
+		t.Fatalf("create Users-boundary private namespace under restricted token: %v", err)
+	}
+	defer namespace.Close(true)
+	name, err := windows.UTF16PtrFromString(alias + `\` + windowsRouteNamespaceMutexName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutex, err := windows.CreateMutex(nil, false, name)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(mutex); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -507,19 +571,23 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	logWindowsRouteJournalHelperStage("create-administrators-sid")
 	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 	if err != nil {
 		t.Fatal(err)
 	}
+	logWindowsRouteJournalHelperStage("create-restricted-token")
 	restricted, err := createNonAdminRestrictedToken(admins)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restricted.Close()
+	logWindowsRouteJournalHelperStage("impersonate-restricted-token")
 	if err := windows.SetThreadToken(nil, restricted); err != nil {
 		t.Fatal(err)
 	}
 	defer windows.RevertToSelf()
+	logWindowsRouteJournalHelperStage("verify-administrators-disabled")
 	if member, err := restricted.IsMember(admins); err != nil || member {
 		t.Fatalf("restricted helper still belongs to Administrators: member=%v error=%v", member, err)
 	}
@@ -530,12 +598,14 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	logWindowsRouteJournalHelperStage("open-administrators-namespace-must-fail")
 	if namespace, err := openExistingWindowsPrivateNamespace(alias, adminBoundary, admins); err == nil {
 		namespace.Close(false)
 		t.Fatal("restricted helper opened the Administrators private namespace")
 	} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		t.Fatalf("restricted Administrators namespace open error = %v, want access denied", err)
 	}
+	logWindowsRouteJournalHelperStage("create-administrators-namespace-must-fail")
 	if namespace, err := openWindowsPrivateNamespace(alias, adminBoundary, admins, descriptor); err == nil {
 		namespace.Close(false)
 		t.Fatal("restricted helper created or opened the Administrators private namespace")
@@ -543,15 +613,18 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 		t.Fatalf("restricted Administrators namespace create error = %v, want access denied", err)
 	}
 
+	logWindowsRouteJournalHelperStage("create-users-sid")
 	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
 	if err != nil {
 		t.Fatal(err)
 	}
+	logWindowsRouteJournalHelperStage("create-users-boundary-same-alias-namespace")
 	lowNamespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, nil)
 	if err != nil {
 		t.Fatalf("create low-privilege same-alias private namespace: %v", err)
 	}
 	defer lowNamespace.Close(false)
+	logWindowsRouteJournalHelperStage("create-users-boundary-mutex")
 	name, err := windows.UTF16PtrFromString(alias + `\` + windowsRouteNamespaceMutexName)
 	if err != nil {
 		t.Fatal(err)
@@ -562,23 +635,38 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 	}
 	defer windows.CloseHandle(mutex)
 
+	logWindowsRouteJournalHelperStage("ready")
 	fmt.Println("READY")
 	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
 		t.Fatal(err)
 	}
 }
 
+func logWindowsRouteJournalHelperStage(stage string) {
+	fmt.Fprintf(os.Stderr, "route-journal-helper stage=%s\n", stage)
+}
+
 func createNonAdminRestrictedToken(admins *windows.SID) (windows.Token, error) {
+	var process windows.Token
+	if err := windows.OpenProcessToken(
+		windows.CurrentProcess(),
+		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY,
+		&process,
+	); err != nil {
+		return 0, fmt.Errorf("open process token for restriction: %w", err)
+	}
+	defer process.Close()
+
 	var impersonation windows.Token
 	if err := windows.DuplicateTokenEx(
-		windows.GetCurrentProcessToken(),
-		windows.TOKEN_ALL_ACCESS,
+		process,
+		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_IMPERSONATE,
 		nil,
 		windows.SecurityImpersonation,
 		windows.TokenImpersonation,
 		&impersonation,
 	); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("duplicate process token for restriction: %w", err)
 	}
 	defer impersonation.Close()
 	type sidAndAttributes struct {

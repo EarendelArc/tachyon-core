@@ -220,17 +220,17 @@ func TestWindowsRouteJournalRestrictedTokenCreatesUsersPrivateNamespace(t *testi
 		t.Fatal(err)
 	}
 	alias := uniqueWindowsRoutePrivateNamespace("RestrictedToken")
-	namespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, nil)
+	namespaceDescriptor, err := newWindowsUsersTestNamespaceSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, namespaceDescriptor)
 	if err != nil {
 		t.Fatalf("create Users-boundary private namespace under restricted token: %v", err)
 	}
 	defer namespace.Close(true)
-	name, err := windows.UTF16PtrFromString(alias + `\` + windowsRouteNamespaceMutexName)
+	mutex, err := createWindowsUsersTestMutex(alias + `\` + windowsRouteNamespaceMutexName)
 	if err != nil {
-		t.Fatal(err)
-	}
-	mutex, err := windows.CreateMutex(nil, false, name)
-	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		t.Fatal(err)
 	}
 	if err := windows.CloseHandle(mutex); err != nil {
@@ -619,18 +619,18 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	logWindowsRouteJournalHelperStage("create-users-boundary-same-alias-namespace")
-	lowNamespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, nil)
+	lowDescriptor, err := newWindowsUsersTestNamespaceSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowNamespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, lowDescriptor)
 	if err != nil {
 		t.Fatalf("create low-privilege same-alias private namespace: %v", err)
 	}
 	defer lowNamespace.Close(false)
 	logWindowsRouteJournalHelperStage("create-users-boundary-mutex")
-	name, err := windows.UTF16PtrFromString(alias + `\` + windowsRouteNamespaceMutexName)
+	mutex, err := createWindowsUsersTestMutex(alias + `\` + windowsRouteNamespaceMutexName)
 	if err != nil {
-		t.Fatal(err)
-	}
-	mutex, err := windows.CreateMutex(nil, false, name)
-	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		t.Fatal(err)
 	}
 	defer windows.CloseHandle(mutex)
@@ -644,6 +644,84 @@ func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
 
 func logWindowsRouteJournalHelperStage(stage string) {
 	fmt.Fprintf(os.Stderr, "route-journal-helper stage=%s\n", stage)
+}
+
+func newWindowsUsersTestNamespaceSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
+	return windows.SecurityDescriptorFromString("D:P(A;;GA;;;BU)")
+}
+
+func newWindowsUsersTestMutexSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
+	return windows.SecurityDescriptorFromString("D:P(A;;0x001F0001;;;BU)")
+}
+
+func createWindowsUsersTestMutex(name string) (_ windows.Handle, retErr error) {
+	descriptor, err := newWindowsUsersTestMutexSecurityDescriptor()
+	if err != nil {
+		return 0, err
+	}
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0, err
+	}
+	security := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	handle, err := windows.CreateMutex(&security, false, namePtr)
+	runtime.KeepAlive(descriptor)
+	runtime.KeepAlive(security)
+	if err != nil {
+		return 0, fmt.Errorf("create explicit-Users-ACL mutex %q: %w", name, err)
+	}
+	if handle == 0 {
+		return 0, fmt.Errorf("create explicit-Users-ACL mutex %q returned an invalid handle", name)
+	}
+	defer func() {
+		if retErr != nil {
+			windows.CloseHandle(handle)
+		}
+	}()
+	if err := validateWindowsUsersTestMutex(handle); err != nil {
+		return 0, fmt.Errorf("validate explicit-Users-ACL mutex %q: %w", name, err)
+	}
+	return handle, nil
+}
+
+func validateWindowsUsersTestMutex(handle windows.Handle) error {
+	descriptor, err := windows.GetSecurityInfo(
+		handle,
+		windows.SE_KERNEL_OBJECT,
+		windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return err
+	}
+	control, _, err := descriptor.Control()
+	if err != nil {
+		return err
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		return errors.New("Users mutex DACL inheritance is enabled")
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if dacl == nil || dacl.AceCount != 1 {
+		return fmt.Errorf("Users mutex DACL has %d ACEs; expected exactly Builtin Users", aclEntryCount(dacl))
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(dacl, 0, &ace); err != nil {
+		return err
+	}
+	if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask != windows.MUTEX_ALL_ACCESS || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
+		return errors.New("Users mutex DACL entry is not an explicit full-control allow ACE")
+	}
+	sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+	if !sid.IsWellKnown(windows.WinBuiltinUsersSid) {
+		return fmt.Errorf("Users mutex DACL grants unexpected SID %s", sid.String())
+	}
+	return nil
 }
 
 func createNonAdminRestrictedToken(admins *windows.SID) (windows.Token, error) {

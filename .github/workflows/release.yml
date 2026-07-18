@@ -19,6 +19,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   verify_tag:
     name: Verify release tag
@@ -153,10 +157,14 @@ jobs:
         shell: bash
         env:
           VERIFIED_TAG: ${{ needs.verify_tag.outputs.tag }}
+          VERIFIED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
         run: |
           set -euo pipefail
+          source_date_epoch=$(git show -s --format=%ct "${VERIFIED_COMMIT}")
+          build_time=$(date -u --date="@${source_date_epoch}" +%Y-%m-%dT%H:%M:%SZ)
           echo "version=${VERIFIED_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
+          echo "source_date_epoch=${source_date_epoch}" >> "${GITHUB_OUTPUT}"
+          echo "build_time=${build_time}" >> "${GITHUB_OUTPUT}"
           echo "go_version=$(go version | awk '{print $3}')" >> "${GITHUB_OUTPUT}"
 
       - name: Build binaries
@@ -168,6 +176,7 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
           BUILD_TIME: ${{ steps.meta.outputs.build_time }}
           GO_VERSION: ${{ steps.meta.outputs.go_version }}
+          SOURCE_DATE_EPOCH: ${{ steps.meta.outputs.source_date_epoch }}
           EXT: ${{ matrix.ext }}
         run: |
           set -euo pipefail
@@ -175,6 +184,7 @@ jobs:
           ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.GoVersion=${GO_VERSION}"
           go build -trimpath -ldflags "${ldflags}" -o "build/tachyon-core${EXT}" ./cmd/tachyon-core
           go build -trimpath -ldflags "${ldflags}" -o "build/tachyonctl${EXT}" ./cmd/tachyonctl
+          touch --date="@${SOURCE_DATE_EPOCH}" "build/tachyon-core${EXT}" "build/tachyonctl${EXT}"
 
       - name: Package
         shell: bash
@@ -182,11 +192,13 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
           ASSET_OS: ${{ matrix.asset_os }}
           ASSET_ARCH: ${{ matrix.asset_arch }}
+          SOURCE_DATE_EPOCH: ${{ steps.meta.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
           asset="tachyon-core_${VERSION}_${ASSET_OS}_${ASSET_ARCH}.zip"
           cp README.md README.zh-CN.md build/
-          (cd build && zip -9 "../${asset}" ./*)
+          touch --date="@${SOURCE_DATE_EPOCH}" build/*
+          (cd build && TZ=UTC zip -X -9 "../${asset}" ./*)
           mkdir -p dist
           mv "${asset}" dist/
 
@@ -207,15 +219,6 @@ jobs:
         with:
           ref: ${{ needs.verify_tag.outputs.commit }}
 
-      - name: Reverify release tag before publishing
-        id: publish_gate
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.verify_tag.outputs.tag }}
-          EXPECTED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
-          EXPECTED_TAG_OBJECT: ${{ needs.verify_tag.outputs.tag_object }}
-        run: bash .github/scripts/verify-release-tag.sh "${RELEASE_TAG}" "${EXPECTED_COMMIT}" origin "${EXPECTED_TAG_OBJECT}"
-
       - name: Download artifacts
         uses: actions/download-artifact@v7.0.0
         with:
@@ -225,7 +228,7 @@ jobs:
         id: meta
         shell: bash
         env:
-          VERIFIED_TAG: ${{ steps.publish_gate.outputs.tag }}
+          VERIFIED_TAG: ${{ needs.verify_tag.outputs.tag }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -260,6 +263,15 @@ jobs:
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
+      - name: Reverify release tag before publishing
+        id: publish_gate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify_tag.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.verify_tag.outputs.tag_object }}
+        run: bash .github/scripts/verify-release-tag.sh "${RELEASE_TAG}" "${EXPECTED_COMMIT}" origin "${EXPECTED_TAG_OBJECT}"
+
       - name: Publish release
         shell: bash
         env:
@@ -269,23 +281,4 @@ jobs:
           COMMIT: ${{ steps.publish_gate.outputs.commit }}
         run: |
           set -euo pipefail
-          prerelease_flag=()
-          if [[ "${PRERELEASE}" == "true" ]]; then
-            prerelease_flag=(--prerelease)
-          fi
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            gh release edit "${VERSION}" \
-              --verify-tag \
-              --title "Tachyon Core ${VERSION}" \
-              --target "${COMMIT}" \
-              --notes-file release/RELEASE_NOTES.md \
-              "${prerelease_flag[@]}"
-          else
-            gh release create "${VERSION}" \
-              --verify-tag \
-              --target "${COMMIT}" \
-              --title "Tachyon Core ${VERSION}" \
-              --notes-file release/RELEASE_NOTES.md \
-              "${prerelease_flag[@]}"
-          fi
-          gh release upload "${VERSION}" release/*.zip release/SHA256SUMS.txt --clobber
+          bash .github/scripts/publish-release.sh "${VERSION}" "${COMMIT}" "${PRERELEASE}" release

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func readReleaseWorkflow(t *testing.T) string {
+func readRepoFile(t *testing.T, path ...string) string {
 	t.Helper()
 
 	_, filename, _, ok := runtime.Caller(0)
@@ -17,19 +17,23 @@ func readReleaseWorkflow(t *testing.T) string {
 	}
 
 	root := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
-	content, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
+	content, err := os.ReadFile(filepath.Join(append([]string{root}, path...)...))
 	if err != nil {
-		t.Fatalf("read release workflow: %v", err)
+		t.Fatalf("read %s: %v", filepath.Join(path...), err)
 	}
 
 	return string(content)
+}
+
+func readReleaseWorkflow(t *testing.T) string {
+	t.Helper()
+	return readRepoFile(t, ".github", "workflows", "release.yml")
 }
 
 func TestGitHubReleaseNotesPublishAlphaLimitations(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
 
 	required := []string{
-		"--notes-file release/RELEASE_NOTES.md",
 		"Tachyon Core is alpha software and is not stable or complete.",
 		"System proxy takeover remains disabled by default in Prism-managed alpha flows",
 		"Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.",
@@ -39,6 +43,11 @@ func TestGitHubReleaseNotesPublishAlphaLimitations(t *testing.T) {
 		if !strings.Contains(workflow, text) {
 			t.Fatalf("release workflow is missing %q", text)
 		}
+	}
+
+	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
+	if !strings.Contains(publication, `--notes-file "${release_dir}/RELEASE_NOTES.md"`) {
+		t.Fatal("release publication script does not use generated release notes")
 	}
 }
 
@@ -126,10 +135,12 @@ func TestReleasePinsTagBuildAndAssetsToVerifiedCommit(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
 	required := []string{
 		"verify_tag:",
+		"concurrency:",
+		"cancel-in-progress: false",
 		"EXPECTED_COMMIT: ${{ needs.verify_tag.outputs.commit }}",
 		"EXPECTED_TAG_OBJECT: ${{ needs.verify_tag.outputs.tag_object }}",
-		`--target "${COMMIT}"`,
-		"--verify-tag",
+		`source_date_epoch=$(git show -s --format=%ct "${VERIFIED_COMMIT}")`,
+		"bash .github/scripts/publish-release.sh",
 	}
 	for _, text := range required {
 		if !strings.Contains(workflow, text) {
@@ -145,5 +156,23 @@ func TestReleasePinsTagBuildAndAssetsToVerifiedCommit(t *testing.T) {
 	const tagGate = `bash .github/scripts/verify-release-tag.sh`
 	if count := strings.Count(workflow, tagGate); count < 2 {
 		t.Fatalf("release workflow runs the tag gate %d times, want initial and pre-publish checks", count)
+	}
+
+	for _, forbidden := range []string{"date -u +%Y-%m-%dT%H:%M:%SZ"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("release workflow contains forbidden publication behavior %q", forbidden)
+		}
+	}
+
+	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
+	for _, text := range []string{`--target "${commit}"`, "--verify-tag", "--draft", "gh release upload", "-F draft=false"} {
+		if !strings.Contains(publication, text) {
+			t.Fatalf("release publication script is missing %q", text)
+		}
+	}
+	for _, forbidden := range []string{"gh release edit", "--clobber"} {
+		if strings.Contains(publication, forbidden) {
+			t.Fatalf("release publication script contains forbidden behavior %q", forbidden)
+		}
 	}
 }

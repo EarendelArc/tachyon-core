@@ -24,6 +24,7 @@ jobs:
         shell: bash
         run: |
           bash -n .github/scripts/verify-release-tag.sh
+          bash -n .github/scripts/publish-release.sh
           bash -n .github/scripts/test-release-policy.sh
           bash .github/scripts/test-release-policy.sh
 

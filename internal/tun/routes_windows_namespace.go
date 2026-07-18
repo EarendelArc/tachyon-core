@@ -30,11 +30,43 @@ var (
 	procCreatePrivateNamespaceW    = namespaceAPI.NewProc("CreatePrivateNamespaceW")
 	procOpenPrivateNamespaceW      = namespaceAPI.NewProc("OpenPrivateNamespaceW")
 	procClosePrivateNamespace      = namespaceAPI.NewProc("ClosePrivateNamespace")
+	windowsRoutePrivateNamespaces  = newWindowsPrivateNamespaceRegistry(
+		openWindowsPrivateNamespace,
+		func(namespace *windowsPrivateNamespace) error { return namespace.Close(false) },
+	)
 )
 
 type windowsPrivateNamespace struct {
 	handle   windows.Handle
 	boundary windows.Handle
+}
+
+type windowsPrivateNamespaceIdentity struct {
+	alias        string
+	boundaryName string
+	boundarySID  string
+	descriptor   string
+}
+
+type windowsPrivateNamespaceEntry struct {
+	identity   windowsPrivateNamespaceIdentity
+	namespace  *windowsPrivateNamespace
+	references int
+	closeErr   error
+}
+
+type windowsPrivateNamespaceRegistry struct {
+	mu      sync.Mutex
+	entries map[string]*windowsPrivateNamespaceEntry
+	open    func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error)
+	close   func(*windowsPrivateNamespace) error
+}
+
+type windowsPrivateNamespaceReference struct {
+	registry *windowsPrivateNamespaceRegistry
+	entry    *windowsPrivateNamespaceEntry
+	once     sync.Once
+	closeErr error
 }
 
 type privateWindowsRouteJournalLocker struct {
@@ -44,9 +76,22 @@ type privateWindowsRouteJournalLocker struct {
 	timeout      time.Duration
 
 	mu        sync.Mutex
-	namespace *windowsPrivateNamespace
+	registry  *windowsPrivateNamespaceRegistry
+	namespace *windowsPrivateNamespaceReference
+	newMutex  func(string, time.Duration) *namedWindowsRouteJournalLocker
 	mutex     *namedWindowsRouteJournalLocker
 	closed    bool
+}
+
+func newWindowsPrivateNamespaceRegistry(
+	open func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error),
+	close func(*windowsPrivateNamespace) error,
+) *windowsPrivateNamespaceRegistry {
+	return &windowsPrivateNamespaceRegistry{
+		entries: make(map[string]*windowsPrivateNamespaceEntry),
+		open:    open,
+		close:   close,
+	}
 }
 
 func newPrivateWindowsRouteJournalLocker(alias, boundaryName, mutexName string, timeout time.Duration) *privateWindowsRouteJournalLocker {
@@ -55,6 +100,10 @@ func newPrivateWindowsRouteJournalLocker(alias, boundaryName, mutexName string, 
 		boundaryName: boundaryName,
 		mutexName:    mutexName,
 		timeout:      timeout,
+		registry:     windowsRoutePrivateNamespaces,
+		newMutex: func(name string, timeout time.Duration) *namedWindowsRouteJournalLocker {
+			return &namedWindowsRouteJournalLocker{name: name, timeout: timeout}
+		},
 	}
 }
 
@@ -88,7 +137,7 @@ func (l *privateWindowsRouteJournalLocker) Close() error {
 		l.mutex = nil
 	}
 	if l.namespace != nil {
-		closeErr = errors.Join(closeErr, l.namespace.Close(false))
+		closeErr = errors.Join(closeErr, l.namespace.Close())
 		l.namespace = nil
 	}
 	return closeErr
@@ -109,19 +158,141 @@ func (l *privateWindowsRouteJournalLocker) openLocked() error {
 	if err != nil {
 		return err
 	}
-	namespace, err := openWindowsPrivateNamespace(l.alias, l.boundaryName, admins, descriptor)
+	registry := l.registry
+	if registry == nil {
+		registry = windowsRoutePrivateNamespaces
+	}
+	namespace, err := registry.Acquire(l.alias, l.boundaryName, admins, descriptor)
 	runtime.KeepAlive(admins)
 	runtime.KeepAlive(descriptor)
 	if err != nil {
 		return fmt.Errorf("open protected route journal private namespace: %w", err)
 	}
-	mutex := &namedWindowsRouteJournalLocker{name: l.alias + `\` + l.mutexName, timeout: l.timeout}
+	newMutex := l.newMutex
+	if newMutex == nil {
+		newMutex = func(name string, timeout time.Duration) *namedWindowsRouteJournalLocker {
+			return &namedWindowsRouteJournalLocker{name: name, timeout: timeout}
+		}
+	}
+	mutex := newMutex(l.alias+`\`+l.mutexName, l.timeout)
 	if err := mutex.Open(); err != nil {
-		return errors.Join(err, namespace.Close(false))
+		return errors.Join(err, namespace.Close())
 	}
 	l.namespace = namespace
 	l.mutex = mutex
 	return nil
+}
+
+func (r *windowsPrivateNamespaceRegistry) Acquire(
+	alias, boundaryName string,
+	boundarySID *windows.SID,
+	descriptor *windows.SECURITY_DESCRIPTOR,
+) (*windowsPrivateNamespaceReference, error) {
+	identity, err := newWindowsPrivateNamespaceIdentity(alias, boundaryName, boundarySID, descriptor)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil || r.open == nil || r.close == nil {
+		return nil, errors.New("private namespace registry is not initialized")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.entries == nil {
+		r.entries = make(map[string]*windowsPrivateNamespaceEntry)
+	}
+	if entry := r.entries[alias]; entry != nil {
+		if entry.identity != identity {
+			return nil, fmt.Errorf("private namespace alias %q is already registered with a different boundary or ACL", alias)
+		}
+		if entry.references <= 0 {
+			if entry.closeErr != nil {
+				return nil, fmt.Errorf("private namespace alias %q is unavailable after close failure: %w", alias, entry.closeErr)
+			}
+			return nil, fmt.Errorf("private namespace alias %q has an invalid reference count", alias)
+		}
+		entry.references++
+		return &windowsPrivateNamespaceReference{registry: r, entry: entry}, nil
+	}
+
+	namespace, err := r.open(alias, boundaryName, boundarySID, descriptor)
+	if err != nil {
+		return nil, err
+	}
+	if namespace == nil {
+		return nil, errors.New("private namespace open returned nil without an error")
+	}
+	entry := &windowsPrivateNamespaceEntry{
+		identity:   identity,
+		namespace:  namespace,
+		references: 1,
+	}
+	r.entries[alias] = entry
+	return &windowsPrivateNamespaceReference{registry: r, entry: entry}, nil
+}
+
+func newWindowsPrivateNamespaceIdentity(
+	alias, boundaryName string,
+	boundarySID *windows.SID,
+	descriptor *windows.SECURITY_DESCRIPTOR,
+) (windowsPrivateNamespaceIdentity, error) {
+	if alias == "" || boundaryName == "" {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace alias and boundary name are required")
+	}
+	if boundarySID == nil || !boundarySID.IsValid() {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace boundary SID is missing or invalid")
+	}
+	if descriptor == nil || !descriptor.IsValid() {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace security descriptor is missing or invalid")
+	}
+	descriptorString := descriptor.String()
+	if descriptorString == "" {
+		return windowsPrivateNamespaceIdentity{}, errors.New("private namespace security descriptor could not be canonicalized")
+	}
+	return windowsPrivateNamespaceIdentity{
+		alias:        alias,
+		boundaryName: boundaryName,
+		boundarySID:  boundarySID.String(),
+		descriptor:   descriptorString,
+	}, nil
+}
+
+func (r *windowsPrivateNamespaceRegistry) release(entry *windowsPrivateNamespaceEntry) error {
+	if r == nil || entry == nil {
+		return errors.New("private namespace reference is invalid")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.entries[entry.identity.alias]
+	if current != entry {
+		return fmt.Errorf("private namespace alias %q reference is stale", entry.identity.alias)
+	}
+	if entry.references <= 0 {
+		return fmt.Errorf("private namespace alias %q reference count underflow", entry.identity.alias)
+	}
+	entry.references--
+	if entry.references > 0 {
+		return nil
+	}
+	if err := r.close(entry.namespace); err != nil {
+		entry.closeErr = err
+		return fmt.Errorf("close private namespace alias %q: %w", entry.identity.alias, err)
+	}
+	delete(r.entries, entry.identity.alias)
+	return nil
+}
+
+func (r *windowsPrivateNamespaceReference) Close() error {
+	if r == nil {
+		return nil
+	}
+	if r.registry == nil || r.entry == nil {
+		return errors.New("private namespace reference is invalid")
+	}
+	r.once.Do(func() {
+		r.closeErr = r.registry.release(r.entry)
+	})
+	return r.closeErr
 }
 
 func openWindowsPrivateNamespace(alias, boundaryName string, boundarySID *windows.SID, descriptor *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error) {

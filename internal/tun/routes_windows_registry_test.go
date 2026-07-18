@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -192,6 +193,7 @@ func TestWindowsRouteJournalInitializesSecretFromProtectedEmptyHKLMKey(t *testin
 			err, cmd.ProcessState.ExitCode(), strings.Join(stdoutLines, "\n"), stderr.String(),
 		)
 	}
+	t.Run("shared process lifecycle", testWindowsPrivateNamespaceSharedProcessLifecycle)
 }
 
 func TestWindowsRouteJournalRestrictedTokenCreatesUsersPrivateNamespace(t *testing.T) {
@@ -563,6 +565,7 @@ func TestWindowsRouteJournalMachineMutexTimeoutAndAbandonment(t *testing.T) {
 	if err := lock.unlock(); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("shared private namespace recovery", testWindowsPrivateNamespaceAbandonedRecovery)
 }
 
 func TestWindowsRouteJournalProcessHelper(t *testing.T) {
@@ -572,6 +575,10 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 	}
 	if action == "low-preoccupy-private-namespace" {
 		runLowPrivilegePrivateNamespaceHelper(t)
+		return
+	}
+	if action == "abandon-private-namespace" {
+		runPrivateNamespaceAbandonHelper(t)
 		return
 	}
 	keyPath := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_KEY")
@@ -654,6 +661,137 @@ func uniqueWindowsRouteJournalTestMutex(label string) string {
 
 func uniqueWindowsRoutePrivateNamespace(label string) string {
 	return fmt.Sprintf("TachyonRouteJournalTest%s%d%d", label, windows.GetCurrentProcessId(), time.Now().UnixNano())
+}
+
+func testWindowsPrivateNamespaceSharedProcessLifecycle(t *testing.T) {
+	alias := uniqueWindowsRoutePrivateNamespace("SharedLifecycle")
+	boundaryName := alias + ".Administrators"
+	first := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	second := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	t.Cleanup(func() {
+		_ = first.Close()
+		_ = second.Close()
+	})
+	if err := first.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := second.Lock()
+	if err != nil {
+		t.Fatalf("remaining locker lost shared namespace after first close: %v", err)
+	}
+	if err := lock.unlock(); err != nil {
+		t.Fatal(err)
+	}
+
+	const concurrentLockers = 16
+	lockers := make([]*privateWindowsRouteJournalLocker, concurrentLockers)
+	t.Cleanup(func() {
+		for _, locker := range lockers {
+			if locker != nil {
+				_ = locker.Close()
+			}
+		}
+	})
+	openErrors := make(chan error, concurrentLockers)
+	for idx := range concurrentLockers {
+		lockers[idx] = newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+		go func(locker *privateWindowsRouteJournalLocker) {
+			openErrors <- locker.Open()
+		}(lockers[idx])
+	}
+	for range concurrentLockers {
+		if err := <-openErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var closes sync.WaitGroup
+	closeErrors := make(chan error, concurrentLockers)
+	for _, locker := range lockers {
+		closes.Go(func() {
+			closeErrors <- locker.Close()
+		})
+	}
+	closes.Wait()
+	close(closeErrors)
+	for err := range closeErrors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	if err := reopened.Open(); err != nil {
+		t.Fatalf("reopen namespace after final reference close: %v", err)
+	}
+	lock, err = reopened.Lock()
+	if err == nil {
+		err = lock.unlock()
+	}
+	err = errors.Join(err, reopened.Close())
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testWindowsPrivateNamespaceAbandonedRecovery(t *testing.T) {
+	alias := uniqueWindowsRoutePrivateNamespace("Abandoned")
+	boundaryName := alias + ".Administrators"
+	keeper := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	recovery := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	t.Cleanup(func() {
+		_ = keeper.Close()
+		_ = recovery.Close()
+	})
+	if err := keeper.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsRouteJournalProcessHelper$", "-test.count=1")
+	cmd.Env = append(os.Environ(),
+		windowsRouteJournalHelperEnv+"=abandon-private-namespace",
+		"TACHYON_ROUTE_TEST_NAMESPACE_ALIAS="+alias,
+		"TACHYON_ROUTE_TEST_BOUNDARY_NAME="+boundaryName,
+	)
+	if wire, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("private namespace abandon helper: %v\n%s", err, wire)
+	}
+	lock, err := recovery.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lock.abandoned {
+		lock.unlock()
+		t.Fatal("shared private namespace recovery did not observe abandoned mutex")
+	}
+	if err := lock.unlock(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runPrivateNamespaceAbandonHelper(t *testing.T) {
+	t.Helper()
+	locker := newPrivateWindowsRouteJournalLocker(
+		os.Getenv("TACHYON_ROUTE_TEST_NAMESPACE_ALIAS"),
+		os.Getenv("TACHYON_ROUTE_TEST_BOUNDARY_NAME"),
+		windowsRouteNamespaceMutexName,
+		2*time.Second,
+	)
+	if _, err := locker.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(0)
 }
 
 func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {

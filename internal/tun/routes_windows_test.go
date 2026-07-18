@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -939,6 +940,172 @@ func TestWindowsRouteDeleteReportsCommittedBeforePostCallCancellation(t *testing
 	}
 }
 
+func TestWindowsPrivateNamespaceRegistryLifecycle(t *testing.T) {
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := newWindowsRouteNamespaceSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("multiple instances close only the final reference", func(t *testing.T) {
+		backend := &observedWindowsPrivateNamespaceBackend{}
+		registry := backend.Registry()
+		first, err := registry.Acquire("SharedAlias", "SharedBoundary", admins, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := registry.Acquire("SharedAlias", "SharedBoundary", admins, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 0 {
+			t.Fatalf("after two acquires opens=%d closes=%d, want 1 and 0", opens, closes)
+		}
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 0 {
+			t.Fatalf("after first close opens=%d closes=%d, want 1 and 0", opens, closes)
+		}
+		if err := second.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := second.Close(); err != nil {
+			t.Fatalf("repeat reference close: %v", err)
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
+			t.Fatalf("after final close opens=%d closes=%d, want 1 and 1", opens, closes)
+		}
+	})
+
+	t.Run("concurrent instances share one registration", func(t *testing.T) {
+		backend := &observedWindowsPrivateNamespaceBackend{}
+		registry := backend.Registry()
+		const instances = 32
+		ready := make(chan error, instances)
+		release := make(chan struct{})
+		closed := make(chan error, instances)
+		for range instances {
+			go func() {
+				reference, err := registry.Acquire("ConcurrentAlias", "ConcurrentBoundary", admins, descriptor)
+				ready <- err
+				if err != nil {
+					closed <- nil
+					return
+				}
+				<-release
+				closed <- reference.Close()
+			}()
+		}
+		for range instances {
+			if err := <-ready; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 0 {
+			t.Fatalf("while references live opens=%d closes=%d, want 1 and 0", opens, closes)
+		}
+		close(release)
+		for range instances {
+			if err := <-closed; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
+			t.Fatalf("after concurrent closes opens=%d closes=%d, want 1 and 1", opens, closes)
+		}
+	})
+
+	t.Run("last close permits a clean reopen", func(t *testing.T) {
+		backend := &observedWindowsPrivateNamespaceBackend{}
+		registry := backend.Registry()
+		for range 2 {
+			reference, err := registry.Acquire("ReopenAlias", "ReopenBoundary", admins, descriptor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reference.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if opens, closes := backend.Counts(); opens != 2 || closes != 2 {
+			t.Fatalf("close/reopen opens=%d closes=%d, want 2 and 2", opens, closes)
+		}
+	})
+
+	t.Run("different boundary or ACL fails closed", func(t *testing.T) {
+		for _, test := range []struct {
+			name         string
+			boundaryName string
+			security     *windows.SECURITY_DESCRIPTOR
+		}{
+			{name: "boundary", boundaryName: "OtherBoundary", security: descriptor},
+			{name: "ACL", boundaryName: "TrustedBoundary", security: mustWindowsSecurityDescriptor(t, "D:P(A;;GA;;;BU)")},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				backend := &observedWindowsPrivateNamespaceBackend{}
+				registry := backend.Registry()
+				reference, err := registry.Acquire("IdentityAlias", "TrustedBoundary", admins, descriptor)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := registry.Acquire("IdentityAlias", test.boundaryName, admins, test.security); err == nil || !strings.Contains(err.Error(), "different boundary or ACL") {
+					t.Fatalf("identity conflict error = %v", err)
+				}
+				if err := reference.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
+					t.Fatalf("identity conflict opens=%d closes=%d, want 1 and 1", opens, closes)
+				}
+			})
+		}
+	})
+
+	t.Run("close failure poisons alias", func(t *testing.T) {
+		closeErr := errors.New("injected namespace close failure")
+		backend := &observedWindowsPrivateNamespaceBackend{closeErr: closeErr}
+		registry := backend.Registry()
+		reference, err := registry.Acquire("PoisonAlias", "PoisonBoundary", admins, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reference.Close(); !errors.Is(err, closeErr) {
+			t.Fatalf("namespace close error = %v", err)
+		}
+		if err := reference.Close(); !errors.Is(err, closeErr) {
+			t.Fatalf("repeat namespace close error = %v", err)
+		}
+		if _, err := registry.Acquire("PoisonAlias", "PoisonBoundary", admins, descriptor); !errors.Is(err, closeErr) {
+			t.Fatalf("acquire poisoned alias error = %v", err)
+		}
+		if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
+			t.Fatalf("poisoned alias opens=%d closes=%d, want 1 and 1", opens, closes)
+		}
+	})
+}
+
+func TestPrivateWindowsRouteJournalLockerReleasesNamespaceAfterPartialInit(t *testing.T) {
+	backend := &observedWindowsPrivateNamespaceBackend{}
+	locker := newPrivateWindowsRouteJournalLocker("PartialAlias", "PartialBoundary", "Mutex", time.Second)
+	locker.registry = backend.Registry()
+	locker.newMutex = func(name string, timeout time.Duration) *namedWindowsRouteJournalLocker {
+		return &namedWindowsRouteJournalLocker{name: name, timeout: timeout, closed: true}
+	}
+	if err := locker.Open(); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("partial mutex initialization error = %v", err)
+	}
+	if opens, closes := backend.Counts(); opens != 1 || closes != 1 {
+		t.Fatalf("partial initialization opens=%d closes=%d, want 1 and 1", opens, closes)
+	}
+	if err := locker.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func windowsRouteRowKey(row windows.MibIpForwardRow2) string {
 	return fmt.Sprintf("%d:%d:%d:%x", row.InterfaceLuid, row.InterfaceIndex,
 		row.DestinationPrefix.PrefixLength, row.DestinationPrefix.Prefix.Data)
@@ -956,6 +1123,49 @@ func testWindowsRouteJournalEntry(t *testing.T, op *windowsRouteOperator, prefix
 type observedLocalWindowsRouteJournalLocker struct {
 	mu   sync.Mutex
 	held bool
+}
+
+type observedWindowsPrivateNamespaceBackend struct {
+	mu       sync.Mutex
+	opens    int
+	closes   int
+	openErr  error
+	closeErr error
+}
+
+func (b *observedWindowsPrivateNamespaceBackend) Registry() *windowsPrivateNamespaceRegistry {
+	return newWindowsPrivateNamespaceRegistry(
+		func(string, string, *windows.SID, *windows.SECURITY_DESCRIPTOR) (*windowsPrivateNamespace, error) {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			b.opens++
+			if b.openErr != nil {
+				return nil, b.openErr
+			}
+			return &windowsPrivateNamespace{}, nil
+		},
+		func(*windowsPrivateNamespace) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			b.closes++
+			return b.closeErr
+		},
+	)
+}
+
+func (b *observedWindowsPrivateNamespaceBackend) Counts() (int, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.opens, b.closes
+}
+
+func mustWindowsSecurityDescriptor(t *testing.T, sddl string) *windows.SECURITY_DESCRIPTOR {
+	t.Helper()
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return descriptor
 }
 
 func (l *observedLocalWindowsRouteJournalLocker) Lock() (*windowsRouteJournalLock, error) {

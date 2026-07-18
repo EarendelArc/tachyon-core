@@ -65,7 +65,7 @@ jobs:
           }
           go test -tags=routejournalintegration ./internal/tun -run '^TestWindowsRouteJournal(RegistryIntegration|InitializesSecretFromProtectedEmptyHKLMKey|MachineMutexMultiProcess|MachineMutexTimeoutAndAbandonment)$' -count=1 -v
 
-      - name: Test elevated Windows real route crash recovery
+      - name: Test elevated Windows real route recovery and rollback
         shell: pwsh
         env:
           TACHYON_ALLOW_REAL_ROUTE_TEST: "1"
@@ -74,7 +74,7 @@ jobs:
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "Windows real route integration requires an elevated runner"
           }
-          go test -tags=routeintegration ./internal/tun -run '^TestWindowsRouteJournalAbandonedPendingRealChildRecovery$' -count=1 -v
+          go test -tags=routeintegration ./internal/tun -run '^TestWindowsRouteJournal(AbandonedPendingRealChildRecovery|RecordFailureRealRouteRollback)$' -count=1 -v
 
       - name: Test
         run: go test ./...

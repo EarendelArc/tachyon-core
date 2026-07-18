@@ -115,18 +115,34 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 }
 
 func TestReleaseRequiresWindowsRouteSecurityIntegrations(t *testing.T) {
-	workflow := readReleaseWorkflow(t)
-	required := []string{
-		"test-windows:",
-		"Test full Windows suite",
-		"-tags=routejournalintegration",
-		"TestWindowsRouteJournalAbandonedPendingRealChildRecovery",
-		"TACHYON_ALLOW_REAL_ROUTE_TEST: \"1\"",
-		"needs: [verify_tag, test, test-windows]",
+	workflows := []struct {
+		name    string
+		content string
+	}{
+		{name: "CI", content: readRepoFile(t, ".github", "workflows", "ci.yml")},
+		{name: "Release", content: readReleaseWorkflow(t)},
 	}
-	for _, text := range required {
-		if !strings.Contains(workflow, text) {
-			t.Fatalf("release workflow is missing Windows route security gate %q", text)
+
+	const protectedJournalGate = `-run '^TestWindowsRouteJournal(RegistryIntegration|InitializesSecretFromProtectedEmptyHKLMKey|MachineMutexMultiProcess|MachineMutexTimeoutAndAbandonment)$'`
+	const realRouteGate = `-run '^TestWindowsRouteJournal(AbandonedPendingRealChildRecovery|RecordFailureRealRouteRollback)$'`
+	for _, workflow := range workflows {
+		for _, gate := range []string{protectedJournalGate, realRouteGate} {
+			if count := strings.Count(workflow.content, gate); count != 1 {
+				t.Fatalf("%s workflow contains Windows route gate %q %d times, want exactly 1", workflow.name, gate, count)
+			}
+		}
+		if count := strings.Count(workflow.content, "RecordFailureRealRouteRollback"); count != 1 {
+			t.Fatalf("%s workflow selects rollback integration %d times, want exactly 1", workflow.name, count)
+		}
+		if !strings.Contains(workflow.content, "TACHYON_ALLOW_REAL_ROUTE_TEST: \"1\"") {
+			t.Fatalf("%s workflow is missing the real-route opt-in gate", workflow.name)
+		}
+	}
+
+	release := workflows[1].content
+	for _, required := range []string{"test-windows:", "Test full Windows suite", "needs: [verify_tag, test, test-windows]"} {
+		if !strings.Contains(release, required) {
+			t.Fatalf("Release workflow is missing Windows route security requirement %q", required)
 		}
 	}
 }

@@ -96,11 +96,11 @@ jobs:
         shell: pwsh
         run: go test -tags=routejournalintegration ./internal/tun -run '^TestWindowsRouteJournal(RegistryIntegration|InitializesSecretFromProtectedEmptyHKLMKey|MachineMutexMultiProcess|MachineMutexTimeoutAndAbandonment)$' -count=1 -v
 
-      - name: Test real route abandoned pending recovery
+      - name: Test real route recovery and rollback
         shell: pwsh
         env:
           TACHYON_ALLOW_REAL_ROUTE_TEST: "1"
-        run: go test -tags=routeintegration ./internal/tun -run '^TestWindowsRouteJournalAbandonedPendingRealChildRecovery$' -count=1 -v
+        run: go test -tags=routeintegration ./internal/tun -run '^TestWindowsRouteJournal(AbandonedPendingRealChildRecovery|RecordFailureRealRouteRollback)$' -count=1 -v
 
   build:
     name: Build ${{ matrix.asset_os }}-${{ matrix.asset_arch }}

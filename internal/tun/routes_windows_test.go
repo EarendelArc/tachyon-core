@@ -128,6 +128,124 @@ func TestWindowsRouteJournalReconcilesOnlyExactStableIdentity(t *testing.T) {
 	}
 }
 
+func TestWindowsRouteJournalKeepsLiveForeignLUIDOwnerFailClosed(t *testing.T) {
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	foreign := &windowsRouteOperator{interfaceLUID: 99, interfaceIdx: 14}
+	journal := newWindowsRouteJournalForTest()
+	entry := testWindowsRouteJournalEntry(t, foreign, prefix, windowsRouteActive)
+	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion, Entries: []windowsRouteJournalEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry:       func(*windows.MibIpForwardRow2) {},
+			interfaceExists: func(luid uint64, index uint32) (bool, error) { return luid == 99 && index == 14, nil },
+			get: func(*windows.MibIpForwardRow2) error {
+				t.Fatal("live foreign owner route must not be inspected or deleted")
+				return nil
+			},
+			delete: func(*windows.MibIpForwardRow2) error {
+				t.Fatal("live foreign owner route must not be deleted")
+				return nil
+			},
+		},
+	}
+	if err := op.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 1 || data.Entries[0].InterfaceLUID != 99 {
+		t.Fatalf("live foreign ownership changed: data=%+v error=%v", data, err)
+	}
+}
+
+func TestWindowsRouteJournalCleansStaleForeignLUIDAndAllowsNewOwner(t *testing.T) {
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	foreign := &windowsRouteOperator{
+		interfaceLUID: 99,
+		interfaceIdx:  14,
+		api:           windowsRouteAPI{initEntry: func(*windows.MibIpForwardRow2) {}},
+	}
+	row := foreign.routeRow(prefix)
+	rows := map[string]windows.MibIpForwardRow2{windowsRouteRowKey(row): row}
+	deleteCalls := 0
+	journal := newWindowsRouteJournalForTest()
+	entry := testWindowsRouteJournalEntry(t, foreign, prefix, windowsRouteActive)
+	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion, Entries: []windowsRouteJournalEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry:       func(*windows.MibIpForwardRow2) {},
+			interfaceExists: func(uint64, uint32) (bool, error) { return false, nil },
+			get: func(got *windows.MibIpForwardRow2) error {
+				stored, ok := rows[windowsRouteRowKey(*got)]
+				if !ok {
+					return windows.ERROR_NOT_FOUND
+				}
+				*got = stored
+				return nil
+			},
+			delete: func(got *windows.MibIpForwardRow2) error {
+				deleteCalls++
+				delete(rows, windowsRouteRowKey(*got))
+				return nil
+			},
+		},
+	}
+	if err := op.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 0 || deleteCalls != 1 {
+		t.Fatalf("stale foreign cleanup data=%+v deleteCalls=%d error=%v", data, deleteCalls, err)
+	}
+	if err := journal.prepare(context.Background(), op, prefix); err != nil {
+		t.Fatalf("new LUID could not claim cleaned stale destination: %v", err)
+	}
+	if err := journal.release(op, prefix); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsRouteJournalForeignLUIDQueryFailureIsFailClosed(t *testing.T) {
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	foreign := &windowsRouteOperator{interfaceLUID: 99, interfaceIdx: 14}
+	journal := newWindowsRouteJournalForTest()
+	entry := testWindowsRouteJournalEntry(t, foreign, prefix, windowsRouteDeleting)
+	if err := journal.save(windowsRouteJournalData{Version: windowsRouteJournalVersion, Entries: []windowsRouteJournalEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	op := &windowsRouteOperator{
+		interfaceLUID: 55,
+		interfaceIdx:  12,
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			interfaceExists: func(uint64, uint32) (bool, error) {
+				return false, windows.ERROR_RETRY
+			},
+			delete: func(*windows.MibIpForwardRow2) error {
+				t.Fatal("uncertain foreign owner must not drive deletion")
+				return nil
+			},
+		},
+	}
+	if err := op.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "query foreign route owner") {
+		t.Fatalf("foreign owner query error = %v", err)
+	}
+	data, err := journal.load()
+	if err != nil || len(data.Entries) != 1 || data.Entries[0].State != windowsRouteDeleting {
+		t.Fatalf("query failure changed fail-closed ownership: data=%+v error=%v", data, err)
+	}
+}
+
 func TestWindowsRouteJournalAbandonsChangedReplacement(t *testing.T) {
 	prefix := netip.MustParsePrefix("203.0.113.0/24")
 	op := &windowsRouteOperator{
@@ -732,6 +850,13 @@ func TestWindowsRouteJournalSecurityDescriptorRequiresProtectedTrustedACL(t *tes
 	}
 	if err := validateWindowsTrustedACL(mutexDescriptor, windows.MUTEX_ALL_ACCESS, "mutex"); err != nil {
 		t.Fatalf("Global mutex creation descriptor is not trusted: %v", err)
+	}
+	namespaceDescriptor, err := newWindowsRouteNamespaceSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsTrustedACL(namespaceDescriptor, windows.GENERIC_ALL, "private namespace"); err != nil {
+		t.Fatalf("private namespace creation descriptor is not trusted: %v", err)
 	}
 
 	tests := []struct {

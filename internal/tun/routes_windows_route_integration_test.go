@@ -9,12 +9,10 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -55,12 +53,15 @@ func TestWindowsRouteJournalAbandonedPendingRealChildRecovery(t *testing.T) {
 		_, _ = op.Delete(ctx, prefix)
 	})
 
-	mutexName, err := storage.machineMutexName()
-	if err != nil {
+	keeper := &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}
+	if err := keeper.Open(); err != nil {
 		t.Fatal(err)
 	}
-	persistentHandle := openRealRouteTestMutex(t, mutexName)
-	defer windows.CloseHandle(persistentHandle)
+	t.Cleanup(func() {
+		if err := keeper.Close(); err != nil {
+			t.Errorf("close real-route private namespace keeper: %v", err)
+		}
+	})
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsRouteJournalRealRouteProcessHelper$", "-test.count=1")
 	cmd.Env = append(os.Environ(),
@@ -74,7 +75,7 @@ func TestWindowsRouteJournalAbandonedPendingRealChildRecovery(t *testing.T) {
 		t.Fatalf("pending route child: %v\n%s", err, wire)
 	}
 
-	observed := &observingWindowsRouteJournalLocker{inner: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
+	observed := &observingWindowsRouteJournalLocker{inner: &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}}
 	journal := &windowsRouteJournal{storage: storage, locker: observed}
 	t.Cleanup(func() {
 		if err := journal.Close(); err != nil {
@@ -120,7 +121,7 @@ func TestWindowsRouteJournalRecordFailureRealRouteRollback(t *testing.T) {
 		failAt:                     2,
 		err:                        errors.New("injected real active persistence failure"),
 	}
-	locker := &protectedWindowsRouteJournalLocker{storage: baseStorage, timeout: windowsRouteLockTimeout}
+	locker := &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}
 	if err := locker.Open(); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestWindowsRouteJournalRealRouteProcessHelper(t *testing.T) {
 	storage := &registryWindowsRouteJournalStorage{
 		root: registry.LOCAL_MACHINE, keyPath: os.Getenv("TACHYON_REAL_ROUTE_TEST_KEY"), valueName: "State",
 	}
-	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
+	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}}
 	op := &windowsRouteOperator{
 		interfaceLUID: luid,
 		interfaceIdx:  uint32(index),
@@ -266,40 +267,12 @@ func unusedRealRouteTestPrefix(op *windowsRouteOperator) (netip.Prefix, error) {
 	return netip.Prefix{}, errors.New("no unused TEST-NET-1 host route was available")
 }
 
-func openRealRouteTestMutex(t *testing.T, mutexName string) windows.Handle {
-	t.Helper()
-	descriptor, err := newWindowsRouteMutexSecurityDescriptor()
-	if err != nil {
-		t.Fatal(err)
-	}
-	name, err := windows.UTF16PtrFromString(mutexName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	security := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: descriptor}
-	handle, err := windows.CreateMutex(&security, false, name)
-	runtime.KeepAlive(descriptor)
-	runtime.KeepAlive(security)
-	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		t.Fatal(err)
-	}
-	if err := validateWindowsRouteMutex(handle); err != nil {
-		windows.CloseHandle(handle)
-		t.Fatal(err)
-	}
-	return handle
-}
-
 func uniqueRealRouteTestKey() string {
 	return fmt.Sprintf(`SOFTWARE\TachyonRouteRealTest-%d-%d`, windows.GetCurrentProcessId(), time.Now().UnixNano())
 }
 
 func cleanupRealRouteTestKey(t *testing.T, keyPath string) {
 	t.Helper()
-	if key, err := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.ALL_ACCESS|registry.WOW64_64KEY); err == nil {
-		_ = registry.DeleteKey(key, windowsRouteCoordinationKey)
-		key.Close()
-	}
 	parent, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE`, registry.ALL_ACCESS|registry.WOW64_64KEY)
 	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
 		return

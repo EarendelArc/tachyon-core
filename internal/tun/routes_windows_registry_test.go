@@ -3,9 +3,11 @@
 package tun
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -22,6 +24,8 @@ import (
 )
 
 const windowsRouteJournalHelperEnv = "TACHYON_ROUTE_JOURNAL_TEST_HELPER"
+
+var procCreateRestrictedToken = advapi32.NewProc("CreateRestrictedToken")
 
 func TestWindowsRouteJournalRegistryIntegration(t *testing.T) {
 	keyPath := uniqueWindowsRouteJournalTestKey("Registry")
@@ -99,30 +103,74 @@ func TestWindowsRouteJournalRegistryIntegration(t *testing.T) {
 	}
 }
 
+// The name is retained because release CI selects this integration test explicitly.
 func TestWindowsRouteJournalInitializesSecretFromProtectedEmptyHKLMKey(t *testing.T) {
-	keyPath := uniqueWindowsRouteJournalTestKey("Empty")
-	cleanupWindowsRouteJournalTestKey(t, keyPath)
-	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
-	key, _, err := createWindowsRouteJournalRegistryKey(registry.LOCAL_MACHINE, keyPath, "")
-	if err != nil {
-		t.Fatalf("create protected empty HKLM key: %v", err)
+	alias := uniqueWindowsRoutePrivateNamespace("LowPreoccupy")
+	boundaryName := alias + ".Administrators"
+	locker := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	if err := locker.Open(); err != nil {
+		t.Fatalf("open protected private namespace (Windows CI must run elevated): %v", err)
 	}
-	key.Close()
+	lock, err := locker.Lock()
+	if err != nil {
+		locker.Close()
+		t.Fatal(err)
+	}
+	if err := lock.unlock(); err != nil {
+		locker.Close()
+		t.Fatal(err)
+	}
 
-	storage := &registryWindowsRouteJournalStorage{root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State"}
-	first, err := storage.machineMutexName()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsRouteJournalProcessHelper$", "-test.count=1")
+	cmd.Env = append(os.Environ(),
+		windowsRouteJournalHelperEnv+"=low-preoccupy-private-namespace",
+		"TACHYON_ROUTE_TEST_NAMESPACE_ALIAS="+alias,
+		"TACHYON_ROUTE_TEST_BOUNDARY_NAME="+boundaryName,
+	)
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		locker.Close()
 		t.Fatal(err)
 	}
-	second, err := storage.machineMutexName()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		locker.Close()
 		t.Fatal(err)
 	}
-	if first != second || !strings.HasPrefix(first, windowsRouteJournalMutexPrefix) {
-		t.Fatalf("derived mutex names first=%q second=%q", first, second)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		locker.Close()
+		t.Fatal(err)
 	}
-	if wire, err := storage.Read(); err != nil || len(wire) != 0 {
-		t.Fatalf("empty journal read=%q error=%v", wire, err)
+	ready := bufio.NewScanner(stdout)
+	if !ready.Scan() || ready.Text() != "READY" {
+		locker.Close()
+		stdin.Close()
+		_ = cmd.Wait()
+		t.Fatalf("low-privilege namespace helper did not become ready: %q error=%v", ready.Text(), ready.Err())
+	}
+
+	if err := locker.Close(); err != nil {
+		stdin.Close()
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	restarted := newPrivateWindowsRouteJournalLocker(alias, boundaryName, windowsRouteNamespaceMutexName, 2*time.Second)
+	if err := restarted.Open(); err != nil {
+		stdin.Close()
+		_ = cmd.Wait()
+		t.Fatalf("low-privilege same-alias namespace preoccupied Core restart: %v", err)
+	}
+	lock, err = restarted.Lock()
+	if err == nil {
+		err = lock.unlock()
+	}
+	err = errors.Join(err, restarted.Close())
+	_, _ = io.WriteString(stdin, "release\n")
+	_ = stdin.Close()
+	err = errors.Join(err, cmd.Wait())
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -131,7 +179,7 @@ func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 	storage := &registryWindowsRouteJournalStorage{root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State"}
 	cleanupWindowsRouteJournalTestKey(t, keyPath)
 	t.Cleanup(func() { cleanupWindowsRouteJournalTestKey(t, keyPath) })
-	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}}
+	journal := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}}
 	t.Cleanup(func() {
 		if err := journal.Close(); err != nil {
 			t.Errorf("close multiprocess journal: %v", err)
@@ -213,6 +261,81 @@ func TestWindowsRouteJournalMachineMutexMultiProcess(t *testing.T) {
 	if wire, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("different-LUID conflict helper: %v\n%s", err, wire)
 	}
+
+	foreignCases := []struct {
+		state  string
+		luid   uint64
+		prefix netip.Prefix
+	}{
+		{state: "stale", luid: 2000, prefix: netip.MustParsePrefix("198.51.101.0/24")},
+		{state: "live", luid: 2001, prefix: netip.MustParsePrefix("198.51.102.0/24")},
+		{state: "error", luid: 2002, prefix: netip.MustParsePrefix("198.51.103.0/24")},
+	}
+	lock, err = journal.locker.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = journal.load()
+	if err == nil {
+		for _, foreign := range foreignCases {
+			owner := &windowsRouteOperator{interfaceLUID: foreign.luid, interfaceIdx: uint32(foreign.luid)}
+			txnID, txnErr := newWindowsRouteTransactionID()
+			if txnErr != nil {
+				err = txnErr
+				break
+			}
+			data.Entries = append(data.Entries, newWindowsRouteJournalEntry(owner, foreign.prefix, txnID, windowsRouteActive))
+		}
+		if err == nil {
+			err = journal.save(data)
+		}
+	}
+	err = errors.Join(err, lock.unlock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, foreign := range foreignCases {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsRouteJournalProcessHelper$", "-test.count=1")
+		cmd.Env = append(os.Environ(),
+			windowsRouteJournalHelperEnv+"=reconcile-foreign",
+			"TACHYON_ROUTE_JOURNAL_TEST_KEY="+keyPath,
+			"TACHYON_ROUTE_JOURNAL_TEST_MARKER=3000",
+			"TACHYON_ROUTE_JOURNAL_TEST_FOREIGN_LUID="+strconv.FormatUint(foreign.luid, 10),
+			"TACHYON_ROUTE_JOURNAL_TEST_PREFIX="+foreign.prefix.String(),
+			"TACHYON_ROUTE_JOURNAL_TEST_FOREIGN_STATE="+foreign.state,
+		)
+		if wire, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s foreign-LUID reconcile helper: %v\n%s", foreign.state, err, wire)
+		}
+	}
+
+	reopened := &windowsRouteJournal{storage: storage, locker: &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}}
+	t.Cleanup(func() { _ = reopened.Close() })
+	lock, err = reopened.locker.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, loadErr = reopened.load()
+	unlockErr = lock.unlock()
+	if err := errors.Join(loadErr, unlockErr); err != nil {
+		t.Fatal(err)
+	}
+	foreignRemaining := make(map[uint64]bool)
+	for _, entry := range data.Entries {
+		if entry.InterfaceLUID == 2000 {
+			t.Fatal("stale foreign owner survived cross-process reconcile")
+		}
+		if entry.InterfaceLUID == 2001 || entry.InterfaceLUID == 2002 {
+			foreignRemaining[entry.InterfaceLUID] = true
+		}
+	}
+	if !foreignRemaining[2001] || !foreignRemaining[2002] {
+		t.Fatalf("live/query-error owners were not retained: %v", foreignRemaining)
+	}
 }
 
 func TestWindowsRouteJournalMachineMutexTimeoutAndAbandonment(t *testing.T) {
@@ -293,11 +416,15 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 	if action == "" {
 		return
 	}
+	if action == "low-preoccupy-private-namespace" {
+		runLowPrivilegePrivateNamespaceHelper(t)
+		return
+	}
 	keyPath := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_KEY")
 	storage := &registryWindowsRouteJournalStorage{
 		root: registry.LOCAL_MACHINE, keyPath: keyPath, valueName: "State",
 	}
-	var locker windowsRouteJournalLocker = &protectedWindowsRouteJournalLocker{storage: storage, timeout: windowsRouteLockTimeout}
+	var locker windowsRouteJournalLocker = &protectedWindowsRouteJournalLocker{timeout: windowsRouteLockTimeout}
 	if mutexName := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MUTEX"); mutexName != "" {
 		locker = &namedWindowsRouteJournalLocker{name: mutexName, timeout: windowsRouteLockTimeout}
 	}
@@ -322,6 +449,10 @@ func TestWindowsRouteJournalProcessHelper(t *testing.T) {
 		if err := journal.prepare(context.Background(), op, prefix); err == nil || !strings.Contains(err.Error(), "already owned") {
 			t.Fatalf("different-LUID destination claim error = %v", err)
 		}
+		return
+	}
+	if action == "reconcile-foreign" {
+		runForeignLUIDReconcileHelper(t, journal)
 		return
 	}
 	lock, err := locker.Lock()
@@ -367,13 +498,181 @@ func uniqueWindowsRouteJournalTestMutex(label string) string {
 	return fmt.Sprintf(`Global\Tachyon.RouteJournal.Test.%s.%d.%d`, label, windows.GetCurrentProcessId(), time.Now().UnixNano())
 }
 
+func uniqueWindowsRoutePrivateNamespace(label string) string {
+	return fmt.Sprintf("TachyonRouteJournalTest%s%d%d", label, windows.GetCurrentProcessId(), time.Now().UnixNano())
+}
+
+func runLowPrivilegePrivateNamespaceHelper(t *testing.T) {
+	t.Helper()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restricted, err := createNonAdminRestrictedToken(admins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restricted.Close()
+	if err := windows.SetThreadToken(nil, restricted); err != nil {
+		t.Fatal(err)
+	}
+	defer windows.RevertToSelf()
+	if member, err := restricted.IsMember(admins); err != nil || member {
+		t.Fatalf("restricted helper still belongs to Administrators: member=%v error=%v", member, err)
+	}
+
+	alias := os.Getenv("TACHYON_ROUTE_TEST_NAMESPACE_ALIAS")
+	adminBoundary := os.Getenv("TACHYON_ROUTE_TEST_BOUNDARY_NAME")
+	descriptor, err := newWindowsRouteNamespaceSecurityDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if namespace, err := openExistingWindowsPrivateNamespace(alias, adminBoundary, admins); err == nil {
+		namespace.Close(false)
+		t.Fatal("restricted helper opened the Administrators private namespace")
+	} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("restricted Administrators namespace open error = %v, want access denied", err)
+	}
+	if namespace, err := openWindowsPrivateNamespace(alias, adminBoundary, admins, descriptor); err == nil {
+		namespace.Close(false)
+		t.Fatal("restricted helper created or opened the Administrators private namespace")
+	} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("restricted Administrators namespace create error = %v, want access denied", err)
+	}
+
+	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowNamespace, err := openWindowsPrivateNamespace(alias, alias+".Users", users, nil)
+	if err != nil {
+		t.Fatalf("create low-privilege same-alias private namespace: %v", err)
+	}
+	defer lowNamespace.Close(false)
+	name, err := windows.UTF16PtrFromString(alias + `\` + windowsRouteNamespaceMutexName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutex, err := windows.CreateMutex(nil, false, name)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(mutex)
+
+	fmt.Println("READY")
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createNonAdminRestrictedToken(admins *windows.SID) (windows.Token, error) {
+	var impersonation windows.Token
+	if err := windows.DuplicateTokenEx(
+		windows.GetCurrentProcessToken(),
+		windows.TOKEN_ALL_ACCESS,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenImpersonation,
+		&impersonation,
+	); err != nil {
+		return 0, err
+	}
+	defer impersonation.Close()
+	type sidAndAttributes struct {
+		SID        *windows.SID
+		Attributes uint32
+	}
+	disabled := sidAndAttributes{SID: admins}
+	var restricted windows.Token
+	result, _, callErr := procCreateRestrictedToken.Call(
+		uintptr(impersonation),
+		1,
+		1,
+		uintptr(unsafe.Pointer(&disabled)),
+		0,
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&restricted)),
+	)
+	runtime.KeepAlive(admins)
+	if result == 0 {
+		return 0, fmt.Errorf("CreateRestrictedToken: %w", windowsCallError(callErr))
+	}
+	return restricted, nil
+}
+
+func runForeignLUIDReconcileHelper(t *testing.T, journal *windowsRouteJournal) {
+	t.Helper()
+	marker, err := strconv.ParseUint(os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_MARKER"), 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignLUID, err := strconv.ParseUint(os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_FOREIGN_LUID"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, err := netip.ParsePrefix(os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_PREFIX"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState := os.Getenv("TACHYON_ROUTE_JOURNAL_TEST_FOREIGN_STATE")
+	op := &windowsRouteOperator{
+		interfaceLUID: marker,
+		interfaceIdx:  uint32(marker),
+		journal:       journal,
+		api: windowsRouteAPI{
+			initEntry: func(*windows.MibIpForwardRow2) {},
+			get:       func(*windows.MibIpForwardRow2) error { return windows.ERROR_NOT_FOUND },
+			interfaceExists: func(luid uint64, _ uint32) (bool, error) {
+				if luid != foreignLUID {
+					return true, nil
+				}
+				switch wantState {
+				case "stale":
+					return false, nil
+				case "live":
+					return true, nil
+				case "error":
+					return false, windows.ERROR_RETRY
+				default:
+					return false, fmt.Errorf("unknown foreign state %q", wantState)
+				}
+			},
+		},
+	}
+	reconcileErr := journal.reconcile(context.Background(), op)
+	switch wantState {
+	case "stale":
+		if reconcileErr != nil {
+			t.Fatal(reconcileErr)
+		}
+		if err := journal.prepare(context.Background(), op, prefix); err != nil {
+			t.Fatalf("claim destination after stale cross-process cleanup: %v", err)
+		}
+		if err := journal.release(op, prefix); err != nil {
+			t.Fatal(err)
+		}
+	case "live":
+		if reconcileErr != nil {
+			t.Fatal(reconcileErr)
+		}
+		if err := journal.prepare(context.Background(), op, prefix); err == nil || !strings.Contains(err.Error(), "already owned") {
+			t.Fatalf("live foreign owner claim error = %v", err)
+		}
+	case "error":
+		if reconcileErr == nil || !strings.Contains(reconcileErr.Error(), "query foreign route owner") {
+			t.Fatalf("foreign query failure = %v", reconcileErr)
+		}
+	}
+}
+
 func cleanupWindowsRouteJournalTestKey(t *testing.T, keyPath string) {
 	t.Helper()
 	parts := strings.Split(keyPath, `\`)
-	if key, openErr := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.ALL_ACCESS|registry.WOW64_64KEY); openErr == nil {
-		_ = registry.DeleteKey(key, windowsRouteCoordinationKey)
-		key.Close()
-	}
 	parentPath := strings.Join(parts[:len(parts)-1], `\`)
 	parent, err := registry.OpenKey(registry.LOCAL_MACHINE, parentPath, registry.ALL_ACCESS|registry.WOW64_64KEY)
 	if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {

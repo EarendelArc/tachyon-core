@@ -28,11 +28,12 @@ var (
 )
 
 type windowsRouteAPI struct {
-	get       func(*windows.MibIpForwardRow2) error
-	create    func(*windows.MibIpForwardRow2) error
-	delete    func(*windows.MibIpForwardRow2) error
-	toIndex   func(uint64) (uint32, error)
-	initEntry func(*windows.MibIpForwardRow2)
+	get             func(*windows.MibIpForwardRow2) error
+	create          func(*windows.MibIpForwardRow2) error
+	delete          func(*windows.MibIpForwardRow2) error
+	toIndex         func(uint64) (uint32, error)
+	interfaceExists func(uint64, uint32) (bool, error)
+	initEntry       func(*windows.MibIpForwardRow2)
 }
 
 type windowsRouteOperator struct {
@@ -80,11 +81,12 @@ func newPlatformRouteOperator(interfaceName string, interfaceLUID uint64) (route
 
 func systemWindowsRouteAPI() windowsRouteAPI {
 	return windowsRouteAPI{
-		get:       windows.GetIpForwardEntry2,
-		create:    createIpForwardEntry2,
-		delete:    deleteIpForwardEntry2,
-		toIndex:   convertInterfaceLUIDToIndex,
-		initEntry: initializeIpForwardEntry,
+		get:             windows.GetIpForwardEntry2,
+		create:          createIpForwardEntry2,
+		delete:          deleteIpForwardEntry2,
+		toIndex:         convertInterfaceLUIDToIndex,
+		interfaceExists: windowsInterfaceExists,
+		initEntry:       initializeIpForwardEntry,
 	}
 }
 
@@ -239,6 +241,30 @@ func convertInterfaceLUIDToIndex(luid uint64) (uint32, error) {
 		return 0, err
 	}
 	return index, nil
+}
+
+func windowsInterfaceExists(luid uint64, expectedIndex uint32) (bool, error) {
+	if luid == 0 || expectedIndex == 0 {
+		return false, errors.New("route journal interface identity is incomplete")
+	}
+	row := windows.MibIfRow2{InterfaceLuid: luid}
+	if err := windows.GetIfEntry2Ex(windows.MibIfEntryNormalWithoutStatistics, &row); err != nil {
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return false, nil
+		}
+		return false, fmt.Errorf("GetIfEntry2Ex for LUID %d: %w", luid, err)
+	}
+	if row.InterfaceLuid != luid || row.InterfaceIndex != expectedIndex {
+		return false, fmt.Errorf("GetIfEntry2Ex identity mismatch for LUID %d: returned LUID=%d index=%d, want index=%d", luid, row.InterfaceLuid, row.InterfaceIndex, expectedIndex)
+	}
+	return true, nil
+}
+
+func (o *windowsRouteOperator) foreignInterfaceExists(luid uint64, index uint32) (bool, error) {
+	if o.api.interfaceExists == nil {
+		return true, nil
+	}
+	return o.api.interfaceExists(luid, index)
 }
 
 func windowsStatus(result uintptr) error {

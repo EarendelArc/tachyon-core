@@ -47,6 +47,26 @@ new draft, then publishes only that draft.
 `SHA256SUMS.txt` 恰好覆盖六个平台 ZIP 和两份 notes。发布流程会在首次写入 GitHub 前校验
 每个条目，将 notes、ZIP 和 manifest 一次性上传到新 draft，最后仅发布该 draft。
 
+CI's Bash generator and Windows-local `scripts/prepare-release.ps1` both render the shared templates
+under `.github/release-notes`. The local `scripts/build-release.ps1` resolves the full current commit,
+requires an existing requested tag to peel to that commit, and derives `SOURCE_DATE_EPOCH`, embedded
+build time, and archive timestamps from the commit time. It does not require Bash or use wall-clock
+metadata.
+
+CI 的 Bash 生成器与 Windows 本地 `scripts/prepare-release.ps1` 都渲染
+`.github/release-notes` 下的共享模板。本地 `scripts/build-release.ps1` 解析当前完整 commit，
+要求已存在的指定 tag 最终指向该 commit，并从 commit time 派生 `SOURCE_DATE_EPOCH`、嵌入式
+构建时间和归档时间戳；它不依赖 Bash，也不使用实时时钟元数据。
+
+Both implementations must match the shared fixture and golden files in
+`.github/testdata/release-metadata`. The manifest contract is exactly eight LF-terminated, BOM-free
+GNU-format lines in this order: English notes, Chinese notes, Windows AMD64/ARM64, macOS
+AMD64/ARM64, and Linux AMD64/ARM64.
+
+两种实现必须匹配 `.github/testdata/release-metadata` 中共享的 fixture 与 golden。manifest
+固定为八行 LF 结尾、无 BOM 的 GNU 格式，顺序为英文 notes、中文 notes、Windows
+AMD64/ARM64、macOS AMD64/ARM64、Linux AMD64/ARM64。
+
 ## Verification modes / 验证模式
 
 - `signature`: `git verify-tag` successfully validates an annotated signed tag. A present but invalid
@@ -80,4 +100,5 @@ bash -n .github/scripts/prepare-release.sh
 bash -n .github/scripts/publish-release.sh
 bash -n .github/scripts/test-release-policy.sh
 bash .github/scripts/test-release-policy.sh
+pwsh -NoProfile -File .github/scripts/test-build-release-policy.ps1
 ```

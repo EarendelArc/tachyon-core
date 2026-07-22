@@ -51,6 +51,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
+      - name: Verify Windows release policy
+        shell: pwsh
+        run: .github/scripts/test-build-release-policy.ps1
+
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
         with:

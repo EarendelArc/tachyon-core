@@ -8,6 +8,7 @@ verify_script="${repo_root}/.github/scripts/verify-release-tag.sh"
 prepare_script="${repo_root}/.github/scripts/prepare-release.sh"
 publish_script="${repo_root}/.github/scripts/publish-release.sh"
 workflow="${repo_root}/.github/workflows/release.yml"
+testdata="${repo_root}/.github/testdata/release-metadata"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -86,6 +87,19 @@ run_gate "${checkout}" v1.2.4 "${second_commit}" "${output_file}"
 grep -Fqx "tag=v1.2.4" "${output_file}" || fail "correct tag output is missing"
 grep -Fqx "commit=${second_commit}" "${output_file}" || fail "correct commit output is missing"
 grep -Fqx "verification=ref-commit" "${output_file}" || fail "unsigned fallback was not explicit"
+
+golden_release="${tmp_dir}/golden-release"
+mkdir -p "${golden_release}"
+cp "${testdata}/fixture/"*.zip "${golden_release}/"
+bash "${prepare_script}" \
+  v9.8.7-alpha.6 \
+  0123456789abcdef0123456789abcdef01234567 \
+  "${golden_release}"
+for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md SHA256SUMS.txt; do
+  cmp "${golden_release}/${golden_name}" "${testdata}/golden/${golden_name}" || \
+    fail "Bash output differs from shared golden ${golden_name}"
+done
+[[ $(wc -l < "${golden_release}/SHA256SUMS.txt") -eq 8 ]] || fail "golden checksum manifest must contain exactly eight entries"
 
 fake_bin="${tmp_dir}/fake-bin"
 fake_state="${tmp_dir}/fake-gh-state"

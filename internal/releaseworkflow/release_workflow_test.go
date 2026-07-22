@@ -34,6 +34,8 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
 	preparation := readRepoFile(t, ".github", "scripts", "prepare-release.sh")
 	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
+	templates := readRepoFile(t, ".github", "release-notes", "RELEASE_NOTES.md.tmpl") + "\n" +
+		readRepoFile(t, ".github", "release-notes", "RELEASE_NOTES.zh-CN.md.tmpl")
 
 	for _, text := range []string{
 		`bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release`,
@@ -48,9 +50,9 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 	}
 
 	for _, text := range []string{
-		"# Tachyon Core ${version}",
-		"Version: \\`${version}\\`",
-		"Source commit: \\`${commit}\\`",
+		"# Tachyon Core {{VERSION}}",
+		"Version: `{{VERSION}}`",
+		"Source commit: `{{COMMIT}}`",
 		"## Compatibility",
 		"## Installation",
 		"## Verification",
@@ -60,15 +62,20 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 		"Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.",
 		"Real VPS, real client, and real game UDP acceleration paths still need field testing.",
 		"RELEASE_NOTES.zh-CN.md",
-		"版本：\\`${version}\\`",
-		"源代码提交：\\`${commit}\\`",
+		"版本：`{{VERSION}}`",
+		"源代码提交：`{{COMMIT}}`",
 		"## 兼容性",
 		"## 安装",
 		"## 校验",
 		"## Alpha 限制",
 	} {
+		if !strings.Contains(templates, text) {
+			t.Fatalf("shared release note templates are missing %q", text)
+		}
+	}
+	for _, text := range []string{"RELEASE_NOTES.md.tmpl", "RELEASE_NOTES.zh-CN.md.tmpl", "{{VERSION}}", "{{COMMIT}}"} {
 		if !strings.Contains(preparation, text) {
-			t.Fatalf("release preparation script is missing %q", text)
+			t.Fatalf("release preparation script is missing shared-template behavior %q", text)
 		}
 	}
 
@@ -144,8 +151,42 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read local release script: %v", err)
 	}
-	if strings.Contains(string(script), `GOARCH = "386"`) {
+	localBuild := string(script)
+	if strings.Contains(localBuild, `GOARCH = "386"`) {
 		t.Fatal("local release script must not publish legacy windows/386 assets")
+	}
+	for _, text := range []string{
+		`show -s --format=%ct $sourceCommit`,
+		`[DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch)`,
+		`$env:SOURCE_DATE_EPOCH = $sourceDateEpochText`,
+		`[switch]$MetadataOnly`,
+		`LastWriteTimeUtc = $commitTime`,
+		`prepare-release.ps1`,
+	} {
+		if !strings.Contains(localBuild, text) {
+			t.Fatalf("local release script is missing deterministic behavior %q", text)
+		}
+	}
+	if strings.Contains(localBuild, "Get-Date") {
+		t.Fatal("local release script must not use wall-clock build metadata")
+	}
+
+	windowsPreparation := readRepoFile(t, "scripts", "prepare-release.ps1")
+	for _, text := range []string{
+		"RELEASE_NOTES.md.tmpl",
+		"RELEASE_NOTES.zh-CN.md.tmpl",
+		`@("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames`,
+		"[System.Text.ASCIIEncoding]::new()",
+		"$checksumLines -join",
+	} {
+		if !strings.Contains(windowsPreparation, text) {
+			t.Fatalf("Windows release preparation is missing contract %q", text)
+		}
+	}
+
+	ci := readRepoFile(t, ".github", "workflows", "ci.yml")
+	if !strings.Contains(ci, ".github/scripts/test-build-release-policy.ps1") {
+		t.Fatal("CI does not run the Windows release golden policy test")
 	}
 }
 

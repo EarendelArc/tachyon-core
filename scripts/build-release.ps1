@@ -1,14 +1,20 @@
 param(
     [string]$Tag = "",
-    [string]$OutputDir = ""
+    [string]$OutputDir = "",
+    [switch]$MetadataOnly
 )
 
 $ErrorActionPreference = "Stop"
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$gitSafeDirectory = "safe.directory=$($root.Replace('\', '/'))"
 
 if ([string]::IsNullOrWhiteSpace($Tag)) {
-    $Tag = (git describe --tags --abbrev=0 2>$null)
+    $Tag = (& git -c $gitSafeDirectory -C $root describe --tags --abbrev=0 2>$null)
     if ([string]::IsNullOrWhiteSpace($Tag)) {
         $Tag = "v0.0.0-local"
+    }
+    else {
+        $Tag = $Tag.Trim()
     }
 }
 
@@ -16,10 +22,41 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path (Get-Location) "dist"
 }
 
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $releaseDir = Join-Path $OutputDir $Tag
 $workDir = Join-Path $releaseDir "work"
-$buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+$sourceCommit = (& git -c $gitSafeDirectory -C $root rev-parse --verify HEAD).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
+    throw "could not resolve the source commit"
+}
+
+$null = & git -c $gitSafeDirectory -C $root show-ref --verify --quiet "refs/tags/$Tag"
+if ($LASTEXITCODE -eq 0) {
+    $tagCommit = (& git -c $gitSafeDirectory -C $root rev-parse --verify "$Tag^{commit}")
+    $tagCommit = $tagCommit.Trim().ToLowerInvariant()
+    if ($tagCommit -ne $sourceCommit) {
+        throw "tag $Tag points to $tagCommit, but the working tree is at $sourceCommit"
+    }
+}
+
+$sourceDateEpochText = (& git -c $gitSafeDirectory -C $root show -s --format=%ct $sourceCommit).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceDateEpochText -notmatch '^[0-9]+$') {
+    throw "could not resolve SOURCE_DATE_EPOCH from commit $sourceCommit"
+}
+$sourceDateEpoch = [long]$sourceDateEpochText
+$commitTime = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch).UtcDateTime
+$buildTime = $commitTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
+$env:SOURCE_DATE_EPOCH = $sourceDateEpochText
+
+if ($MetadataOnly) {
+    [pscustomobject]@{
+        Version = $Tag
+        Commit = $sourceCommit
+        SourceDateEpoch = $sourceDateEpoch
+        BuildTime = $buildTime
+    }
+    return
+}
 
 $goCommand = (Get-Command go -ErrorAction SilentlyContinue)
 if ($goCommand) {
@@ -106,23 +143,30 @@ foreach ($target in $targets) {
     Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $targetDir
     Copy-Item -LiteralPath (Join-Path $root "README.zh-CN.md") -Destination $targetDir
 
+    $archiveInputs = @(Get-ChildItem -LiteralPath $targetDir -File | ForEach-Object { $_.FullName })
+    [Array]::Sort($archiveInputs, [StringComparer]::Ordinal)
+    foreach ($inputPath in $archiveInputs) {
+        (Get-Item -LiteralPath $inputPath).LastWriteTimeUtc = $commitTime
+    }
+
     $assetPath = Join-Path $releaseDir $assetName
     if (Test-Path -LiteralPath $assetPath) {
         Remove-Item -LiteralPath $assetPath -Force
     }
-    Compress-Archive -Path (Join-Path $targetDir "*") -DestinationPath $assetPath -CompressionLevel Optimal
+    Compress-Archive -LiteralPath $archiveInputs -DestinationPath $assetPath -CompressionLevel Optimal
+    (Get-Item -LiteralPath $assetPath).LastWriteTimeUtc = $commitTime
     Write-Host "built $assetName"
 }
 
 Remove-Item -LiteralPath $workDir -Recurse -Force
 
-$checksumPath = Join-Path $releaseDir "SHA256SUMS.txt"
-Get-ChildItem -LiteralPath $releaseDir -Filter "*.zip" |
-    Sort-Object Name |
-    ForEach-Object {
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-        "$hash  $($_.Name)"
-    } |
-    Set-Content -LiteralPath $checksumPath -Encoding ascii
+& (Join-Path $PSScriptRoot "prepare-release.ps1") `
+    -Version $Tag `
+    -Commit $sourceCommit `
+    -ReleaseDirectory $releaseDir
 
-Write-Host "release assets written to $releaseDir"
+foreach ($metadataName in @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md", "SHA256SUMS.txt")) {
+    (Get-Item -LiteralPath (Join-Path $releaseDir $metadataName)).LastWriteTimeUtc = $commitTime
+}
+
+Write-Host "release assets written to $releaseDir (commit $sourceCommit, SOURCE_DATE_EPOCH=$sourceDateEpoch)"

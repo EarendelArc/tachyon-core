@@ -1,0 +1,33 @@
+# Tachyon Core {{VERSION}}
+
+## Release identity
+
+- Version: `{{VERSION}}`
+- Source commit: `{{COMMIT}}`
+- Channel: alpha prerelease
+
+## Compatibility
+
+- Windows, macOS, and Linux on AMD64 or ARM64.
+- Artifacts are intended for Prism-managed downloads and integration testing.
+- Windows TUN requires `wintun.dll` next to `tachyon-core.exe`; the DLL is not bundled.
+
+## Installation
+
+Download the ZIP matching the target OS and architecture. Verify it before extraction, then install
+`tachyon-core` and `tachyonctl` through Prism's managed binary flow. Server deployments should
+pin this exact version when using the repository's server installer.
+
+## Verification
+
+Download `SHA256SUMS.txt` with the selected ZIP and verify before installation. On systems with
+GNU coreutils, `sha256sum --check SHA256SUMS.txt` verifies all six ZIP files plus
+`RELEASE_NOTES.md` and `RELEASE_NOTES.zh-CN.md` when the complete asset set is present.
+
+## Alpha limitations
+
+- Tachyon Core is alpha software and is not stable or complete.
+- System proxy takeover remains disabled by default in Prism-managed alpha flows; Tachyon Core does not modify host proxy settings.
+- Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.
+- Real VPS, real client, and real game UDP acceleration paths still need field testing.
+- Windows TUN uses a dynamic `wintun.dll` backend and still needs elevated-host validation.

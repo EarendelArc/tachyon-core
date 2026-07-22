@@ -38,11 +38,24 @@ workflow 只从已验证 tag 及其完整源代码 commit SHA 派生发布元数
 生成过程不读取 workflow 实时时钟，也不依赖外部文本生成器。输入相同 tag、commit SHA
 和六个 ZIP 时，notes 与 checksum manifest 必须逐字节一致。
 
+CI 与本地 PowerShell 实现共同渲染 `.github/release-notes` 中的模板，并分别使用
+`.github/testdata/release-metadata` 下同一套固定 fixture 与 golden 输出进行测试。模板、
+编码、顺序或 checksum 格式发生漂移时，release policy 测试会失败。
+
 如果只需要在本地验证产物而不发布到 GitHub，可以运行：
 
 ```powershell
 scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-release
 ```
+
+Windows 本地构建不依赖 Bash。脚本解析当前完整 commit，并从该 commit 的 Git commit time
+派生 `SOURCE_DATE_EPOCH`、写入二进制的 `BuildTime`、归档内条目时间和输出文件时间。若指定
+tag 已存在，则该 tag 必须最终指向当前 `HEAD`；不一致时直接失败，避免生成误导性元数据。
+
+六个 ZIP 生成后，本地脚本使用共享模板的 PowerShell 实现，因此输出目录同样满足双语
+元数据契约。`SHA256SUMS.txt` 严格包含八项，顺序依次为英文 notes、简体中文 notes、
+Windows AMD64/ARM64、macOS AMD64/ARM64、Linux AMD64/ARM64 ZIP。manifest 使用小写
+SHA-256、文件名前两个空格、LF 换行且无 BOM。
 
 ## 产物
 

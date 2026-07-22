@@ -49,11 +49,29 @@ Generation uses no workflow wall-clock value or external text generator. Given
 the same tag, commit SHA, and six ZIP files, the notes and checksum manifest are
 byte-for-byte reproducible.
 
+CI and the local PowerShell implementation render the templates in
+`.github/release-notes`. Both are tested against the same fixed fixtures and
+golden outputs under `.github/testdata/release-metadata`; a template, encoding,
+ordering, or checksum-format drift fails release policy tests.
+
 For local verification without publishing to GitHub, run:
 
 ```powershell
 scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-release
 ```
+
+The Windows-local builder does not require Bash. It resolves the full current
+commit and derives `SOURCE_DATE_EPOCH`, embedded `BuildTime`, archive entry
+timestamps, and output timestamps from that commit's Git commit time. If the
+requested tag already exists, it must peel to the current `HEAD`; a mismatch
+fails instead of producing misleading metadata.
+
+After creating the six ZIPs, the builder uses the PowerShell implementation of
+the shared templates. Its output contains the same bilingual metadata contract
+and an eight-entry `SHA256SUMS.txt`, ordered as English notes, Simplified
+Chinese notes, then Windows AMD64/ARM64, macOS AMD64/ARM64, and Linux
+AMD64/ARM64 ZIPs. The manifest uses lowercase SHA-256, two spaces before each
+filename, LF endings, and no BOM.
 
 ## Assets
 

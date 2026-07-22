@@ -44,6 +44,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Race test
+        run: go test -race ./...
+
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest

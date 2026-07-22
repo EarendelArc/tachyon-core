@@ -15,6 +15,10 @@ const (
 	handshakeBaseBodySize = 4 + 1 + 16 + publicKeySize + 2 + 8
 	handshakeAuthTagSize  = sha256.Size
 	handshakeSequence     = 0
+	handshakeInitialRetry = 100 * time.Millisecond
+	handshakeMaxRetry     = 800 * time.Millisecond
+	handshakeReplayWindow = 5 * time.Second
+	handshakeReplayLimit  = 8
 )
 
 var (
@@ -119,70 +123,87 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		_ = transport.Close()
 		return nil, err
 	}
-	helloSentAt := time.Now()
-	if err := transport.WritePacket(ctx, hello, remoteAddr); err != nil {
-		_ = transport.Close()
-		return nil, err
-	}
-
+	retryDelay := handshakeInitialRetry
 	for {
-		wire, from, err := transport.ReadPacket(ctx)
-		ackReceivedAt := time.Now()
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			_ = transport.Close()
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, err)
+			return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, err)
+		}
+		helloSentAt := time.Now()
+		if err := transport.WritePacket(ctx, hello, remoteAddr); err != nil {
+			_ = transport.Close()
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("%w: sending hello: %w", ErrHandshakeTimeout, ctx.Err())
 			}
 			return nil, err
 		}
-		if !sameAddr(from, remoteAddr) {
-			continue
-		}
-		msg, err := parseHandshake(wire)
-		if err != nil {
-			continue
-		}
-		if msg.msgType != handshakeHelloAck || msg.sessionID != sessionID {
-			continue
-		}
-		if err := verifyHandshakeAuth(msg, opts.AuthKey, clientPublic); err != nil {
-			continue
-		}
-		if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > localMaxDatagramSize {
-			continue
-		}
-		clockOffset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, msg.relayUnixMilli)
-		if err != nil {
-			continue
-		}
-		keys, err := keyPair.DeriveTrafficKeysWithAuth(msg.publicKey, sessionID, RoleClient, opts.AuthKey)
-		if err != nil {
-			_ = transport.Close()
-			return nil, err
-		}
-		if !opts.DisableMigration {
-			if pathTransport, ok := transport.(interface {
-				EnablePathAuthentication(SessionID, [trafficKeySize]byte, net.Addr, time.Duration) error
-			}); ok {
-				pathKey := derivePathAuthKey(keys.SendKey, sessionID)
-				if err := pathTransport.EnablePathAuthentication(sessionID, pathKey, from, clockOffset); err != nil {
+
+		attemptCtx, cancel := context.WithTimeout(ctx, retryDelay)
+		for {
+			wire, from, err := transport.ReadPacket(attemptCtx)
+			ackReceivedAt := time.Now()
+			if err != nil {
+				cancel()
+				if ctx.Err() != nil {
 					_ = transport.Close()
-					return nil, fmt.Errorf("enable tgp path authentication: %w", err)
+					return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, ctx.Err())
+				}
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					break
+				}
+				_ = transport.Close()
+				return nil, err
+			}
+			if !sameAddr(from, remoteAddr) {
+				continue
+			}
+			msg, err := parseHandshake(wire)
+			if err != nil || msg.msgType != handshakeHelloAck || msg.sessionID != sessionID {
+				continue
+			}
+			if err := verifyHandshakeAuth(msg, opts.AuthKey, clientPublic); err != nil {
+				continue
+			}
+			if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > localMaxDatagramSize {
+				continue
+			}
+			clockOffset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, msg.relayUnixMilli)
+			if err != nil {
+				continue
+			}
+			keys, err := keyPair.DeriveTrafficKeysWithAuth(msg.publicKey, sessionID, RoleClient, opts.AuthKey)
+			if err != nil {
+				cancel()
+				_ = transport.Close()
+				return nil, err
+			}
+			if !opts.DisableMigration {
+				if pathTransport, ok := transport.(interface {
+					EnablePathAuthentication(SessionID, [trafficKeySize]byte, net.Addr, time.Duration) error
+				}); ok {
+					pathKey := derivePathAuthKey(keys.SendKey, sessionID)
+					if err := pathTransport.EnablePathAuthentication(sessionID, pathKey, from, clockOffset); err != nil {
+						cancel()
+						_ = transport.Close()
+						return nil, fmt.Errorf("enable tgp path authentication: %w", err)
+					}
 				}
 			}
+			cancel()
+			return NewDatagramSession(SessionOptions{
+				ID:               sessionID,
+				Transport:        transport,
+				RemoteAddr:       from,
+				SendKey:          keys.SendKey,
+				RecvKey:          keys.RecvKey,
+				Pacer:            NewTokenBucketPacer(opts.PacerPPS),
+				FEC:              opts.FEC,
+				MaxDatagramSize:  msg.maxDatagramSize,
+				DisableMigration: opts.DisableMigration,
+				ValidateRemote:   opts.ValidateRemote,
+			})
 		}
-		return NewDatagramSession(SessionOptions{
-			ID:               sessionID,
-			Transport:        transport,
-			RemoteAddr:       from,
-			SendKey:          keys.SendKey,
-			RecvKey:          keys.RecvKey,
-			Pacer:            NewTokenBucketPacer(opts.PacerPPS),
-			FEC:              opts.FEC,
-			MaxDatagramSize:  msg.maxDatagramSize,
-			DisableMigration: opts.DisableMigration,
-			ValidateRemote:   opts.ValidateRemote,
-		})
+		retryDelay = min(retryDelay*2, handshakeMaxRetry)
 	}
 }
 
@@ -244,6 +265,13 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 			FEC:              opts.FEC,
 			MaxDatagramSize:  effectiveMaxDatagramSize,
 			DisableMigration: opts.DisableMigration,
+			handshakeReplay: &handshakeReplayState{
+				hello:     append([]byte(nil), wire...),
+				ack:       append([]byte(nil), ack...),
+				peer:      from,
+				expiresAt: time.Now().Add(handshakeReplayWindow),
+				remaining: handshakeReplayLimit,
+			},
 		})
 	}
 }

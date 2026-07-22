@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -156,7 +158,7 @@ func TestClientManagerUsesPinnedRemoteWithoutReconnectDNS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first.(*fakeSession).state = SessionClosed
+	first.(*fakeSession).setState(SessionClosed)
 	if _, err := manager.sessionFor(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -275,26 +277,185 @@ func TestClientManagerReceivesTunnelDatagram(t *testing.T) {
 	}
 }
 
+func TestClientManagerRedialsAfterSessionReadEOF(t *testing.T) {
+	transport := newEOFTransport()
+	first, err := NewDatagramSession(SessionOptions{
+		ID:         SessionID{1},
+		Transport:  transport,
+		RemoteAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443},
+		Pacer:      NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &fakeSession{state: SessionEstablished}
+	dials := 0
+	manager, err := NewClientManager(ClientManagerOptions{
+		RemoteAddr: "127.0.0.1:443",
+		Dial: func(context.Context, string, net.Addr, float64) (Session, error) {
+			dials++
+			if dials == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+		OnDatagram: func(context.Context, TunnelDatagram) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	if err := manager.SendPacket(context.Background(), 1, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	transport.fail(io.EOF)
+	waitForSessionState(t, first, SessionClosed)
+
+	if err := manager.SendPacket(context.Background(), 1, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if dials != 2 {
+		t.Fatalf("dials = %d, want 2", dials)
+	}
+	if got := second.sentPayloads(); len(got) != 1 || !bytes.Equal(got[0], []byte("second")) {
+		t.Fatalf("redial payloads = %#v", got)
+	}
+}
+
+func TestDatagramSessionConcurrentCloseSendAndReadError(t *testing.T) {
+	transport := newEOFTransport()
+	session, err := NewDatagramSession(SessionOptions{
+		ID:         SessionID{2},
+		Transport:  transport,
+		RemoteAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443},
+		Pacer:      NewTokenBucketPacer(100000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = session.SendPacket(context.Background(), 1, []byte("payload"))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = session.Close()
+		}()
+	}
+	transport.fail(io.EOF)
+	wg.Wait()
+	if session.State() != SessionClosed {
+		t.Fatalf("state = %v, want closed", session.State())
+	}
+	if err := session.SendPacket(context.Background(), 1, []byte("late")); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("late send error = %v, want %v", err, ErrSessionClosed)
+	}
+}
+
+func waitForSessionState(t *testing.T, session Session, want SessionState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if session.State() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("session state = %v, want %v", session.State(), want)
+}
+
 type fakeSession struct {
+	mu    sync.Mutex
 	state SessionState
 	sent  [][]byte
 }
 
 func (s *fakeSession) ID() SessionID { return SessionID{} }
 func (s *fakeSession) State() SessionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.state == 0 {
 		return SessionEstablished
 	}
 	return s.state
 }
 func (s *fakeSession) SendPacket(_ context.Context, _ StreamID, payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sent = append(s.sent, append([]byte(nil), payload...))
 	return nil
 }
 func (s *fakeSession) RecvPacket(context.Context, StreamID) ([]byte, error) { return nil, nil }
 func (s *fakeSession) Migrate(context.Context, net.Addr) error              { return nil }
 func (s *fakeSession) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.state = SessionClosed
 	return nil
 }
 func (s *fakeSession) Stats() SessionStats { return SessionStats{} }
+
+func (s *fakeSession) setState(state SessionState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = state
+}
+
+func (s *fakeSession) sentPayloads() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([][]byte, len(s.sent))
+	for i := range s.sent {
+		result[i] = append([]byte(nil), s.sent[i]...)
+	}
+	return result
+}
+
+type eofTransport struct {
+	errCh     chan error
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newEOFTransport() *eofTransport {
+	return &eofTransport{errCh: make(chan error, 1), closed: make(chan struct{})}
+}
+
+func (t *eofTransport) WritePacket(ctx context.Context, _ []byte, _ net.Addr) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.closed:
+		return io.EOF
+	default:
+		return nil
+	}
+}
+
+func (t *eofTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {
+	select {
+	case err := <-t.errCh:
+		return nil, nil, err
+	case <-t.closed:
+		return nil, nil, io.EOF
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (t *eofTransport) LocalAddr() net.Addr { return &net.UDPAddr{} }
+func (t *eofTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+func (t *eofTransport) fail(err error) {
+	select {
+	case t.errCh <- err:
+	case <-t.closed:
+	}
+}

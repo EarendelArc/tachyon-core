@@ -23,8 +23,11 @@ type Decision struct {
 	Action    Action
 	Reason    string
 	RuleIndex int
-	Process   pidtrack.ProcessInfo
-	Flow      pidtrack.FlowKey
+	// ProcessKnown is false when PID tracking could not identify the owner.
+	// Rules that do not require process metadata may still make the decision.
+	ProcessKnown bool
+	Process      pidtrack.ProcessInfo
+	Flow         pidtrack.FlowKey
 }
 
 type Router struct {
@@ -70,10 +73,11 @@ func (r *Router) Decide(flow pidtrack.FlowKey, proc pidtrack.ProcessInfo) Decisi
 		action := actionFromPolicies(flow.Transport, game)
 		if action != "" {
 			return Decision{
-				Action:  action,
-				Reason:  game.Reason,
-				Process: proc,
-				Flow:    flow,
+				Action:       action,
+				Reason:       game.Reason,
+				ProcessKnown: true,
+				Process:      proc,
+				Flow:         flow,
 			}
 		}
 	}
@@ -81,20 +85,22 @@ func (r *Router) Decide(flow pidtrack.FlowKey, proc pidtrack.ProcessInfo) Decisi
 	for _, indexed := range r.rules {
 		if routeRuleMatches(indexed.rule, flow, proc) {
 			return Decision{
-				Action:    normalizeAction(indexed.rule.Action, r.defaultAction),
-				Reason:    "config route rule matched",
-				RuleIndex: indexed.index,
-				Process:   proc,
-				Flow:      flow,
+				Action:       normalizeAction(indexed.rule.Action, r.defaultAction),
+				Reason:       "config route rule matched",
+				RuleIndex:    indexed.index,
+				ProcessKnown: true,
+				Process:      proc,
+				Flow:         flow,
 			}
 		}
 	}
 
 	return Decision{
-		Action:  r.defaultAction,
-		Reason:  "default action",
-		Process: proc,
-		Flow:    flow,
+		Action:       r.defaultAction,
+		Reason:       "default action",
+		ProcessKnown: true,
+		Process:      proc,
+		Flow:         flow,
 	}
 }
 

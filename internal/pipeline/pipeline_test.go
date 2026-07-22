@@ -33,10 +33,11 @@ func (d *fakeDevice) Close() error             { return nil }
 
 type fakeTracker struct {
 	proc pidtrack.ProcessInfo
+	err  error
 }
 
 func (t fakeTracker) LookupFlow(context.Context, pidtrack.FlowKey) (pidtrack.ProcessInfo, error) {
-	return t.proc, nil
+	return t.proc, t.err
 }
 
 func TestPipelineReadsLooksUpAndDecides(t *testing.T) {
@@ -107,4 +108,78 @@ func TestPipelineStopsOnFatalHandlerError(t *testing.T) {
 	if stats := p.Snapshot(); stats.HandlerErrors != 1 || stats.DecidedDirect != 1 {
 		t.Fatalf("unexpected fail-closed stats: %#v", stats)
 	}
+}
+
+func TestPipelinePIDMissStillAppliesCIDRRule(t *testing.T) {
+	packet := testUDPPacket()
+	lookupErr := errors.New("pid table race")
+	var got Decision
+	p := New(Options{
+		Device:  &fakeDevice{packet: packet},
+		Tracker: fakeTracker{err: lookupErr},
+		Router: NewRouter(config.RoutingConfig{
+			DefaultAction: "direct",
+			Rules: []config.RouteRule{{
+				CIDR:     "203.0.113.0/24",
+				Protocol: "udp",
+				Action:   "tgp",
+			}},
+		}, routing.Engine{}),
+		Handler: HandlerFunc(func(_ context.Context, decision Decision, _ []byte) error {
+			got = decision
+			return nil
+		}),
+	})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != ActionTGP || got.ProcessKnown || got.Process.Name != "" {
+		t.Fatalf("decision = %#v, want CIDR TGP with unknown process", got)
+	}
+	if stats := p.Snapshot(); stats.LookupErrors != 1 || stats.DecidedTGP != 1 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func TestPipelinePIDMissDoesNotMatchProcessRuleOrSendDirectToTGP(t *testing.T) {
+	packet := testUDPPacket()
+	var got Decision
+	p := New(Options{
+		Device:  &fakeDevice{packet: packet},
+		Tracker: fakeTracker{err: errors.New("process unknown")},
+		Router: NewRouter(config.RoutingConfig{
+			DefaultAction: "direct",
+			Rules: []config.RouteRule{{
+				ProcessName: "game.exe",
+				Protocol:    "udp",
+				Action:      "tgp",
+			}},
+		}, routing.Engine{}),
+		Handler: HandlerFunc(func(_ context.Context, decision Decision, _ []byte) error {
+			got = decision
+			if decision.Action == ActionTGP {
+				t.Fatal("unknown process traffic was incorrectly sent to TGP")
+			}
+			return nil
+		}),
+	})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != ActionDirect || got.ProcessKnown {
+		t.Fatalf("decision = %#v, want direct with unknown process", got)
+	}
+}
+
+func testUDPPacket() []byte {
+	packet := make([]byte, 28)
+	packet[0] = 0x45
+	packet[9] = 17
+	copy(packet[12:16], []byte{198, 18, 0, 2})
+	copy(packet[16:20], []byte{203, 0, 113, 10})
+	binary.BigEndian.PutUint16(packet[20:22], 40000)
+	binary.BigEndian.PutUint16(packet[22:24], 27015)
+	return packet
 }

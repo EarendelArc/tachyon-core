@@ -150,10 +150,14 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 	proc, err := p.tracker.LookupFlow(ctx, flow)
 	if err != nil {
 		atomic.AddUint64(&p.stats.LookupErrors, 1)
-		return err
+		proc = pidtrack.ProcessInfo{}
 	}
 
 	decision := p.router.Decide(flow, proc)
+	if err != nil {
+		decision.ProcessKnown = false
+		decision.Reason = "process unknown; " + decision.Reason
+	}
 	p.countDecision(decision.Action, len(packet))
 	if p.onDecision != nil {
 		p.onDecision(decision)

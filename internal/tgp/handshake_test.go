@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -203,6 +205,155 @@ func mustParseHandshake(t *testing.T, wire []byte) handshakeMessage {
 		t.Fatal(err)
 	}
 	return msg
+}
+
+func TestHandshakeRetransmitsDroppedFirstHello(t *testing.T) {
+	client, server, clientTransport, serverTransport := establishLossyHandshake(t, 1, 0, false)
+	defer client.Close()
+	defer server.Close()
+	if got := clientTransport.helloWrites.Load(); got != 2 {
+		t.Fatalf("client hello writes = %d, want 2", got)
+	}
+	if got := serverTransport.ackWrites.Load(); got != 1 {
+		t.Fatalf("server ack writes = %d, want 1", got)
+	}
+}
+
+func TestHandshakeRetransmitsAfterDroppedFirstAck(t *testing.T) {
+	client, server, clientTransport, serverTransport := establishLossyHandshake(t, 0, 1, false)
+	defer client.Close()
+	defer server.Close()
+	if got := clientTransport.helloWrites.Load(); got != 2 {
+		t.Fatalf("client hello writes = %d, want 2", got)
+	}
+	if got := serverTransport.ackWrites.Load(); got != 2 {
+		t.Fatalf("server ack writes = %d, want 2", got)
+	}
+}
+
+func TestHandshakeAllHellosLostHonorsDeadline(t *testing.T) {
+	base, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &handshakeTestTransport{Transport: base}
+	transport.dropHello.Store(100)
+	ctx, cancel := context.WithTimeout(context.Background(), 260*time.Millisecond)
+	defer cancel()
+
+	_, err = dialSessionWithTransport(ctx, transport, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}, SessionRuntimeOptions{PacerPPS: 100000})
+	if !errors.Is(err, ErrHandshakeTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dial error = %v, want handshake deadline", err)
+	}
+	if got := transport.helloWrites.Load(); got < 2 || got > 4 {
+		t.Fatalf("hello writes = %d, want bounded retries", got)
+	}
+}
+
+func TestHandshakeNormalPathSendsOnceAndIgnoresDuplicateAck(t *testing.T) {
+	client, server, clientTransport, serverTransport := establishLossyHandshake(t, 0, 0, true)
+	defer client.Close()
+	defer server.Close()
+	if got := clientTransport.helloWrites.Load(); got != 1 {
+		t.Fatalf("client hello writes = %d, want 1", got)
+	}
+	if got := serverTransport.ackWrites.Load(); got != 1 {
+		t.Fatalf("server ack writes = %d, want 1 logical ack", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if client.State() != SessionEstablished {
+		t.Fatalf("client state = %v after duplicate ack", client.State())
+	}
+}
+
+func establishLossyHandshake(t *testing.T, dropHello, dropAck int32, duplicateAck bool) (*DatagramSession, *DatagramSession, *handshakeTestTransport, *handshakeTestTransport) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+	serverBase, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientBase, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		_ = serverBase.Close()
+		t.Fatal(err)
+	}
+	serverTransport := &handshakeTestTransport{Transport: serverBase, duplicateAck: duplicateAck}
+	clientTransport := &handshakeTestTransport{Transport: clientBase}
+	serverTransport.dropAck.Store(dropAck)
+	clientTransport.dropHello.Store(dropHello)
+
+	serverCh := make(chan *DatagramSession, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		session, acceptErr := AcceptSessionWithOptions(ctx, serverTransport, SessionRuntimeOptions{PacerPPS: 100000})
+		if acceptErr != nil {
+			errCh <- acceptErr
+			return
+		}
+		serverCh <- session
+	}()
+	client, err := dialSessionWithTransport(ctx, clientTransport, serverBase.LocalAddr(), SessionRuntimeOptions{PacerPPS: 100000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case server := <-serverCh:
+		return client, server, clientTransport, serverTransport
+	case err := <-errCh:
+		_ = client.Close()
+		t.Fatal(err)
+	case <-ctx.Done():
+		_ = client.Close()
+		t.Fatal(ctx.Err())
+	}
+	return nil, nil, nil, nil
+}
+
+type handshakeTestTransport struct {
+	Transport
+	dropHello    atomic.Int32
+	dropAck      atomic.Int32
+	helloWrites  atomic.Int32
+	ackWrites    atomic.Int32
+	duplicateAck bool
+}
+
+func (t *handshakeTestTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {
+	msg, err := parseHandshake(pkt)
+	if err == nil {
+		switch msg.msgType {
+		case handshakeHello:
+			t.helloWrites.Add(1)
+			if consumeDrop(&t.dropHello) {
+				return nil
+			}
+		case handshakeHelloAck:
+			t.ackWrites.Add(1)
+			if consumeDrop(&t.dropAck) {
+				return nil
+			}
+			if t.duplicateAck {
+				if err := t.Transport.WritePacket(ctx, pkt, addr); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return t.Transport.WritePacket(ctx, pkt, addr)
+}
+
+func consumeDrop(counter *atomic.Int32) bool {
+	for {
+		remaining := counter.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if counter.CompareAndSwap(remaining, remaining-1) {
+			return true
+		}
+	}
 }
 
 func TestHandshakeEstablishesEncryptedSession(t *testing.T) {

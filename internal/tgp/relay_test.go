@@ -77,6 +77,53 @@ func TestRelayReceivesClientManagerPayload(t *testing.T) {
 	}
 }
 
+func TestRelayRetransmitsDroppedFirstHandshakeAck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	base, err := ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &handshakeTestTransport{Transport: base}
+	transport.dropAck.Store(1)
+	gotCh := make(chan RelayPacket, 1)
+	relay, err := NewRelay(RelayOptions{
+		Transport: transport,
+		PacerPPS:  100000,
+		Handler: RelayHandlerFunc(func(_ context.Context, packet RelayPacket) error {
+			gotCh <- packet
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- relay.ListenAndServe(ctx) }()
+
+	manager := newTestClientManager(t, base.LocalAddr().String(), time.Second)
+	defer manager.Close()
+	payload := mustTunnelPayload(t, "after ack retry")
+	if err := manager.SendPacket(ctx, capturedPacketStreamID, payload); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case packet := <-gotCh:
+		if !bytes.Equal(packet.Payload, payload) {
+			t.Fatalf("relay payload = %x, want %x", packet.Payload, payload)
+		}
+	case err := <-errCh:
+		t.Fatalf("relay exited early: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got := transport.ackWrites.Load(); got != 2 {
+		t.Fatalf("relay ack writes = %d, want initial plus retry", got)
+	}
+}
+
 func TestRelayMaxSessionsFailsClosedAndRecoversAfterIdleCleanup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

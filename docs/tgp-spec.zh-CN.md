@@ -186,6 +186,8 @@ TGP 当前不做协议分片或自动 PMTU 探测。运维方必须按已知路�
 
 ## 8. 当前限制
 
+- 公共 `Session.Migrate` 当前只做本地 endpoint 校验和替换，不会等待对端确认路径。Relay 来源重绑定使用另一套已认证路径控制交换，但端到端 Wi-Fi/蜂窝切换仍未经过真实网络验证。
+- 握手重传可在调用方 deadline 内修复丢失的 Hello/HelloAck，但不代表真实网络中的建连零丢失，也不保证固定恢复时间。
 - 尚无显式对端丢包反馈；动态 FEC 目前使用接收侧恢复比例作为本地保守估计。
 - Relay 路径迁移/重绑定在观测来源完成 authenticated rebind 交换前保持 fail-closed。
 - 多路径接口发现和策略选择尚未接入；底层 transport adapter 与接收侧去重已实现。

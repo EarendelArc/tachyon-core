@@ -3,10 +3,10 @@
 //
 // # Design Goals
 //
-//   - Sub-millisecond jitter: Token-Bucket pacing keeps router queues tiny.
-//   - 0-RTT loss recovery: Reed-Solomon FEC eliminates ARQ round-trips.
-//   - Connection migration: UUID-based session IDs survive IP changes.
-//   - Obfuscation: Outer DTLS/WebRTC-like headers defeat DPI/QoS.
+//   - Queue control: token-bucket pacing limits sender-side bursts.
+//   - Local loss repair: Reed-Solomon FEC can recover within its shard budget.
+//   - Path continuity: stable session IDs and authenticated relay path rebinding.
+//   - Camouflage: outer headers resemble DTLS records but are not DTLS.
 //
 // # Packet Layout (wire format, big-endian)
 //
@@ -154,15 +154,16 @@ type Session interface {
 	// the given stream, or ctx is cancelled.
 	RecvPacket(ctx context.Context, streamID StreamID) ([]byte, error)
 
-	// Migrate initiates connection migration to newAddr. The session ID is
-	// preserved; only the underlying UDP socket path changes.
-	// Returns once the migration is confirmed by the peer.
+	// Migrate changes the configured remote endpoint while preserving the
+	// session ID. The current DatagramSession implementation validates the
+	// address locally but does not yet wait for peer path confirmation.
 	Migrate(ctx context.Context, newAddr net.Addr) error
 
-	// Close sends a FlagClose packet and releases session resources.
+	// Close terminates local I/O and releases session resources.
 	Close() error
 
-	// Stats returns a snapshot of per-session telemetry (RTT, jitter, loss, etc.).
+	// Stats returns available per-session counters. Metrics without an active
+	// measurement path remain zero.
 	Stats() SessionStats
 }
 
@@ -175,7 +176,7 @@ type SessionStats struct {
 	BytesReceived      uint64
 	FECRecovered       uint64 // packets recovered via Reed-Solomon
 	OversizedDatagrams uint64 // received datagrams rejected by the negotiated budget
-	Migrations         uint32 // number of successful connection migrations
+	Migrations         uint32 // number of locally accepted endpoint switches
 }
 
 // Pacer defines the token-bucket interface used to control packet send rate.

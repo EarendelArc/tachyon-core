@@ -139,6 +139,7 @@ func (m *ClientManager) SendPacket(ctx context.Context, streamID StreamID, paylo
 	}
 	if err := session.SendPacket(ctx, streamID, payload); err != nil {
 		m.resetSession(session)
+		_ = session.Close()
 		return err
 	}
 	return nil
@@ -231,6 +232,10 @@ func (m *ClientManager) resetSession(session Session) {
 }
 
 func (m *ClientManager) readLoop(session Session) {
+	defer func() {
+		m.resetSession(session)
+		_ = session.Close()
+	}()
 	for {
 		payload, err := session.RecvPacket(m.ctx, capturedPacketStreamID)
 		if err != nil {

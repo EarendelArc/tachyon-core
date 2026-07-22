@@ -1,6 +1,7 @@
 package tgp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,7 +38,8 @@ type SessionOptions struct {
 	DisableMigration bool
 	// ValidateRemote is called before the established or migrated remote
 	// endpoint is committed to session state.
-	ValidateRemote func(net.Addr) error
+	ValidateRemote  func(net.Addr) error
+	handshakeReplay *handshakeReplayState
 }
 
 type sourceAuthorizer interface {
@@ -72,9 +74,11 @@ type DatagramSession struct {
 	recvCodec *Codec
 	pacer     Pacer
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	closeOnce sync.Once
+	workers   sync.WaitGroup
 
 	mu               sync.RWMutex
 	state            SessionState
@@ -86,6 +90,8 @@ type DatagramSession struct {
 	fecAdapt         *FECAdaptiveController
 	disableMigration bool
 	validateRemote   func(net.Addr) error
+	handshakeReplay  *handshakeReplayState
+	closeErr         error
 	fecMu            sync.Mutex
 	fecTx            map[StreamID]*fecSendGroup
 	fecGroup         uint32
@@ -111,6 +117,14 @@ type fecRepairBatch struct {
 type fecRepairShard struct {
 	index   int
 	payload []byte
+}
+
+type handshakeReplayState struct {
+	hello     []byte
+	ack       []byte
+	peer      net.Addr
+	expiresAt time.Time
+	remaining int
 }
 
 type sessionCounters struct {
@@ -185,12 +199,15 @@ func NewDatagramSession(opts SessionOptions) (*DatagramSession, error) {
 		fecAdapt:         fecAdapt,
 		disableMigration: opts.DisableMigration,
 		validateRemote:   opts.ValidateRemote,
+		handshakeReplay:  opts.handshakeReplay,
 		fecTx:            make(map[StreamID]*fecSendGroup),
 	}
 	s.streams[0] = make(chan []byte, queueSize)
 
+	s.workers.Add(1)
 	go s.readLoop(queueSize)
 	if s.fec.enabled() && s.fec.GroupTimeout > 0 {
+		s.workers.Add(1)
 		go s.fecFlushLoop()
 	}
 	return s, nil
@@ -297,6 +314,7 @@ func (s *DatagramSession) nextFECShards(streamID StreamID, payload []byte) ([]by
 }
 
 func (s *DatagramSession) fecFlushLoop() {
+	defer s.workers.Done()
 	interval := s.fec.GroupTimeout / 2
 	if interval <= 0 {
 		interval = s.fec.GroupTimeout
@@ -456,17 +474,27 @@ func (s *DatagramSession) Migrate(ctx context.Context, newAddr net.Addr) error {
 }
 
 func (s *DatagramSession) Close() error {
-	s.mu.Lock()
-	if s.state == SessionClosed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.state = SessionClosed
-	s.mu.Unlock()
+	s.terminate()
+	s.workers.Wait()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closeErr
+}
 
-	s.cancel()
-	<-s.done
-	return s.transport.Close()
+func (s *DatagramSession) terminate() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.state = SessionClosed
+		s.mu.Unlock()
+
+		s.cancel()
+		err := s.transport.Close()
+
+		s.mu.Lock()
+		s.closeErr = err
+		s.mu.Unlock()
+		close(s.done)
+	})
 }
 
 func (s *DatagramSession) Stats() SessionStats {
@@ -481,11 +509,18 @@ func (s *DatagramSession) Stats() SessionStats {
 }
 
 func (s *DatagramSession) readLoop(queueSize int) {
-	defer close(s.done)
+	defer s.workers.Done()
+	defer s.terminate()
 	for {
 		wire, from, err := s.transport.ReadPacket(s.ctx)
 		if err != nil {
 			return
+		}
+		if handled, err := s.replayHandshakeAck(wire, from); handled {
+			if err != nil {
+				return
+			}
+			continue
 		}
 		packet, err := s.recvCodec.Open(wire)
 		if err != nil {
@@ -531,6 +566,18 @@ func (s *DatagramSession) readLoop(queueSize int) {
 			}
 		}
 	}
+}
+
+func (s *DatagramSession) replayHandshakeAck(wire []byte, from net.Addr) (bool, error) {
+	replay := s.handshakeReplay
+	if replay == nil || replay.remaining <= 0 || time.Now().After(replay.expiresAt) {
+		return false, nil
+	}
+	if !sameAddr(from, replay.peer) || !bytes.Equal(wire, replay.hello) {
+		return false, nil
+	}
+	replay.remaining--
+	return true, s.transport.WritePacket(s.ctx, replay.ack, from)
 }
 
 func (s *DatagramSession) sourceEligibleForReplay(from net.Addr) bool {

@@ -11,7 +11,7 @@
 **Implementation status:** Core currently implements X25519/HKDF traffic-key
 derivation with optional PSK authentication, ChaCha20-Poly1305 packet sealing/opening, Reed-Solomon FEC codec
 primitives, receive-side FEC recovery in the live session path, token-bucket
-pacing, UDP session handshake, client/relay session plumbing, authenticated
+pacing, a deadline-bounded UDP handshake with retransmission, client/relay session plumbing, authenticated
 handshake source-address demux for relay sessions, send-side systematic FEC
 parity generation, low-traffic FEC timeout flush, conservative dynamic FEC
 ratio adjustment, and a sliding receive-side packet deduplication window in
@@ -336,6 +336,13 @@ reduced safely, such as a controlled IPv4-only path.
 
 ## 8. Current Limitations
 
+- The public `Session.Migrate` operation currently performs local endpoint
+  validation and replacement only. It does not wait for a peer-confirmed path
+  exchange. Relay-side source rebinding has a separate authenticated path
+  control exchange, but end-to-end Wi-Fi/cellular handoff remains unverified.
+- Handshake retransmission repairs dropped Hello/HelloAck packets within the
+  caller's deadline. It does not make session establishment zero-loss or
+  guarantee a fixed recovery time on real networks.
 - No explicit peer loss feedback yet; dynamic FEC currently uses receive-side
   recovery ratio as a conservative local estimate.
 - Relay path migration/rebind is fail-closed until the authenticated rebind

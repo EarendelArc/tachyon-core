@@ -1,6 +1,7 @@
 package tgp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -205,7 +206,8 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			_ = sessionTransport.Close()
 			return nil, err
 		}
-		return NewDatagramSession(SessionOptions{
+		router.registerHandshakeReplay(msg.sessionID, envelope.packet, ack, envelope.from)
+		session, err := NewDatagramSession(SessionOptions{
 			ID:               msg.sessionID,
 			Transport:        sessionTransport,
 			RemoteAddr:       envelope.from,
@@ -216,6 +218,11 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			MaxDatagramSize:  effectiveMaxDatagramSize,
 			DisableMigration: r.disableMigration,
 		})
+		if err != nil {
+			_ = sessionTransport.Close()
+			return nil, err
+		}
+		return session, nil
 	}
 }
 
@@ -368,6 +375,7 @@ type relayTransportRouter struct {
 	done                  chan struct{}
 	sessions              map[SessionID]*relaySessionTransport
 	sources               map[sourceAddrKey]*relaySessionTransport
+	handshakeReplays      map[SessionID]*handshakeReplayState
 	sessionQueueSize      int
 	droppedHandshakes     atomic.Uint64
 	droppedData           atomic.Uint64
@@ -392,6 +400,7 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 		done:             make(chan struct{}),
 		sessions:         make(map[SessionID]*relaySessionTransport),
 		sources:          make(map[sourceAddrKey]*relaySessionTransport),
+		handshakeReplays: make(map[SessionID]*handshakeReplayState),
 		sessionQueueSize: sessionQueueSize,
 	}
 }
@@ -409,6 +418,9 @@ func (r *relayTransportRouter) readLoop(ctx context.Context) {
 			continue
 		}
 		if msg, err := parseHandshake(packet); err == nil && msg.msgType == handshakeHello {
+			if r.replayHandshakeAck(ctx, msg.sessionID, envelope) {
+				continue
+			}
 			select {
 			case r.handshakes <- envelope:
 			case <-r.done:
@@ -420,6 +432,39 @@ func (r *relayTransportRouter) readLoop(ctx context.Context) {
 		}
 		r.routeData(envelope)
 	}
+}
+
+func (r *relayTransportRouter) registerHandshakeReplay(id SessionID, hello, ack []byte, peer net.Addr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.handshakeReplays[id] = &handshakeReplayState{
+		hello:     append([]byte(nil), hello...),
+		ack:       append([]byte(nil), ack...),
+		peer:      peer,
+		expiresAt: r.now().Add(handshakeReplayWindow),
+		remaining: handshakeReplayLimit,
+	}
+}
+
+func (r *relayTransportRouter) replayHandshakeAck(ctx context.Context, id SessionID, envelope relayPacketEnvelope) bool {
+	r.mu.Lock()
+	replay := r.handshakeReplays[id]
+	if replay == nil || replay.remaining <= 0 || r.now().After(replay.expiresAt) ||
+		!sameAddr(envelope.from, replay.peer) || !bytes.Equal(envelope.packet, replay.hello) {
+		r.mu.Unlock()
+		return false
+	}
+	replay.remaining--
+	ack := append([]byte(nil), replay.ack...)
+	r.mu.Unlock()
+
+	if err := r.transport.WritePacket(ctx, ack, envelope.from); err != nil {
+		r.droppedHandshakes.Add(1)
+	}
+	return true
 }
 
 func (r *relayTransportRouter) nextHandshake(ctx context.Context) (relayPacketEnvelope, error) {
@@ -484,6 +529,7 @@ func (r *relayTransportRouter) unregister(id SessionID, session *relaySessionTra
 	defer r.mu.Unlock()
 	if r.sessions[id] == session {
 		delete(r.sessions, id)
+		delete(r.handshakeReplays, id)
 	}
 	for source := range session.paths {
 		if r.sources[source] == session {

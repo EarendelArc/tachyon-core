@@ -498,6 +498,9 @@ func (c *Config) Validate() error {
 	if c.TGP.Pacing.MaxRatePPS < 0 {
 		return fmt.Errorf("tgp.pacing.max_rate_pps must be >= 0")
 	}
+	if c.TGP.HandshakeTimeout < 0 || c.TGP.HandshakeTimeout > tgp.MaxHandshakeTimeout {
+		return fmt.Errorf("tgp.handshake_timeout must be between 0 and %s", tgp.MaxHandshakeTimeout)
+	}
 	psk := strings.TrimSpace(c.TGP.Auth.PSK)
 	if strings.EqualFold(psk, placeholderTGPPSK) {
 		return fmt.Errorf("tgp.auth.psk must be replaced with a unique secret")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -72,7 +73,7 @@ func TestHandshakeAuthenticatesDatagramBudget(t *testing.T) {
 	var sessionID SessionID
 	var publicKey PublicKey
 	authKey := []byte("authenticated-budget-test-key")
-	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, 0, authKey, PublicKey{})
+	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, time.Now().Add(time.Second).UnixMilli(), testHandshakeNonce(), authKey, PublicKey{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +91,7 @@ func TestHandshakeAuthenticatesRelayClock(t *testing.T) {
 	var sessionID SessionID
 	var publicKey PublicKey
 	authKey := []byte("authenticated-relay-clock-key")
-	wire, err := marshalHandshake(handshakeHelloAck, sessionID, publicKey, DefaultTGPDatagramSize, time.Now().UnixMilli(), authKey, PublicKey{})
+	wire, err := marshalHandshake(handshakeHelloAck, sessionID, publicKey, DefaultTGPDatagramSize, time.Now().UnixMilli(), testHandshakeNonce(), authKey, PublicKey{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +102,24 @@ func TestHandshakeAuthenticatesRelayClock(t *testing.T) {
 	}
 	if err := verifyHandshakeAuth(msg, authKey, PublicKey{}); !errors.Is(err, ErrInvalidHandshake) {
 		t.Fatalf("tampered relay clock auth error = %v, want %v", err, ErrInvalidHandshake)
+	}
+}
+
+func TestHandshakeAuthenticatesNonce(t *testing.T) {
+	var sessionID SessionID
+	var publicKey PublicKey
+	authKey := []byte("authenticated-nonce-test-key")
+	wire, err := marshalHandshake(handshakeHello, sessionID, publicKey, DefaultTGPDatagramSize, time.Now().Add(time.Second).UnixMilli(), testHandshakeNonce(), authKey, PublicKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire[outerHeaderSize+63] ^= 0x01
+	msg, err := parseHandshake(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyHandshakeAuth(msg, authKey, PublicKey{}); !errors.Is(err, ErrInvalidHandshake) {
+		t.Fatalf("tampered nonce auth error = %v, want %v", err, ErrInvalidHandshake)
 	}
 }
 
@@ -129,7 +148,7 @@ func TestHandshakeRejectsOlderPeers(t *testing.T) {
 	for _, version := range []struct {
 		value    byte
 		bodySize int
-	}{{value: 1, bodySize: 4 + 1 + 16 + publicKeySize}, {value: 2, bodySize: 4 + 1 + 16 + publicKeySize + 2}} {
+	}{{value: 1, bodySize: 4 + 1 + 16 + publicKeySize}, {value: 2, bodySize: 4 + 1 + 16 + publicKeySize + 2}, {value: 3, bodySize: 4 + 1 + 16 + publicKeySize + 2 + 8}} {
 		body := make([]byte, version.bodySize)
 		copy(body[:4], []byte{'T', 'G', 'H', version.value})
 		body[4] = byte(handshakeHello)
@@ -141,6 +160,61 @@ func TestHandshakeRejectsOlderPeers(t *testing.T) {
 		if _, err := parseHandshake(wire); !errors.Is(err, ErrInvalidHandshake) {
 			t.Fatalf("version-%d handshake error = %v, want %v", version.value, err, ErrInvalidHandshake)
 		}
+	}
+}
+
+func TestHandshakeV4GoldenHello(t *testing.T) {
+	var sessionID SessionID
+	var publicKey PublicKey
+	var nonce [handshakeNonceSize]byte
+	for index := range sessionID {
+		sessionID[index] = byte(index)
+	}
+	for index := range publicKey {
+		publicKey[index] = byte(0x20 + index)
+	}
+	for index := range nonce {
+		nonce[index] = byte(0xa0 + index)
+	}
+	wire, err := marshalHandshake(
+		handshakeHello,
+		sessionID,
+		publicKey,
+		DefaultTGPDatagramSize,
+		1_700_000_000_123,
+		nonce,
+		[]byte("golden-handshake-auth-key"),
+		PublicKey{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "17feff0000000000000000006f5447480401000102030405060708090a0b0c0d0e0f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f05480000018bcfe5687ba0a1a2a3a4a5a6a7a8a9aaabacadaeaf3360fe3fc692103dddf37475c7652acc48cd2e07fb36a69f0960766aba86b3c0"
+	if got := hex.EncodeToString(wire); got != want {
+		t.Fatalf("golden hello = %s", got)
+	}
+}
+
+func TestHandshakeHelloFreshnessRejectsExpiredAndFuture(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_000)
+	tests := []struct {
+		name      string
+		expiresAt time.Time
+		wantErr   bool
+	}{
+		{name: "fresh", expiresAt: now.Add(time.Second)},
+		{name: "expired", expiresAt: now, wantErr: true},
+		{name: "old", expiresAt: now.Add(-time.Second), wantErr: true},
+		{name: "too far future", expiresAt: now.Add(MaxHandshakeTimeout + time.Millisecond), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := handshakeMessage{msgType: handshakeHello, unixMilli: tt.expiresAt.UnixMilli(), nonce: testHandshakeNonce()}
+			err := validateHandshakeHelloFreshness(msg, now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("freshness error = %v, wantErr=%v", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -172,7 +246,7 @@ func TestHandshakeRejectsAuthenticatedAckForwardedFromUnknownSource(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := marshalHandshake(handshakeHelloAck, hello.sessionID, serverKeys.PublicKey(), hello.maxDatagramSize, time.Now().UnixMilli(), authKey, hello.publicKey)
+	ack, err := marshalHandshake(handshakeHelloAck, hello.sessionID, serverKeys.PublicKey(), hello.maxDatagramSize, time.Now().UnixMilli(), hello.nonce, authKey, hello.publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +428,14 @@ func consumeDrop(counter *atomic.Int32) bool {
 			return true
 		}
 	}
+}
+
+func testHandshakeNonce() [handshakeNonceSize]byte {
+	var nonce [handshakeNonceSize]byte
+	for index := range nonce {
+		nonce[index] = byte(index + 1)
+	}
+	return nonce
 }
 
 func TestHandshakeEstablishesEncryptedSession(t *testing.T) {

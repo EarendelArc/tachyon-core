@@ -732,6 +732,21 @@ func TestValidateClientDatagramBudgetFailsClosed(t *testing.T) {
 	}
 }
 
+func TestValidateHandshakeTimeoutBounds(t *testing.T) {
+	for _, timeout := range []time.Duration{-time.Millisecond, tgp.MaxHandshakeTimeout + time.Millisecond} {
+		cfg := validClientDataPathConfig()
+		cfg.TGP.HandshakeTimeout = timeout
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "tgp.handshake_timeout") {
+			t.Fatalf("handshake timeout %s error = %v", timeout, err)
+		}
+	}
+	cfg := validClientDataPathConfig()
+	cfg.TGP.HandshakeTimeout = tgp.MaxHandshakeTimeout
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("maximum handshake timeout rejected: %v", err)
+	}
+}
+
 func validClientDataPathConfig() Config {
 	return Config{
 		Mode: ModeClient,

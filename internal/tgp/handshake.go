@@ -3,6 +3,7 @@ package tgp
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -12,17 +13,18 @@ import (
 )
 
 const (
-	handshakeBaseBodySize = 4 + 1 + 16 + publicKeySize + 2 + 8
+	handshakeNonceSize    = 16
+	handshakeBaseBodySize = 4 + 1 + 16 + publicKeySize + 2 + 8 + handshakeNonceSize
 	handshakeAuthTagSize  = sha256.Size
 	handshakeSequence     = 0
 	handshakeInitialRetry = 100 * time.Millisecond
 	handshakeMaxRetry     = 800 * time.Millisecond
-	handshakeReplayWindow = 5 * time.Second
 	handshakeReplayLimit  = 8
+	MaxHandshakeTimeout   = 30 * time.Second
 )
 
 var (
-	handshakeMagic       = [4]byte{0x54, 0x47, 0x48, 0x03} // "TGH\x03"
+	handshakeMagic       = [4]byte{0x54, 0x47, 0x48, 0x04} // "TGH\x04"
 	ErrInvalidHandshake  = errors.New("invalid tgp handshake")
 	ErrUnexpectedMessage = errors.New("unexpected tgp handshake message")
 	ErrHandshakeTimeout  = errors.New("tgp handshake timeout")
@@ -49,7 +51,8 @@ type handshakeMessage struct {
 	sessionID       SessionID
 	publicKey       PublicKey
 	maxDatagramSize int
-	relayUnixMilli  int64
+	unixMilli       int64
+	nonce           [handshakeNonceSize]byte
 	authTag         []byte
 }
 
@@ -102,6 +105,9 @@ func DialSessionMultipathWithOptions(ctx context.Context, localAddrs []string, r
 }
 
 func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAddr net.Addr, opts SessionRuntimeOptions) (*DatagramSession, error) {
+	handshakeCtx, cancelHandshake := handshakeDeadlineContext(ctx)
+	defer cancelHandshake()
+	handshakeDeadline, _ := handshakeCtx.Deadline()
 	localMaxDatagramSize, err := normalizeMaxDatagramSize(opts.MaxDatagramSize)
 	if err != nil {
 		_ = transport.Close()
@@ -118,35 +124,40 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		return nil, err
 	}
 	clientPublic := keyPair.PublicKey()
-	hello, err := marshalHandshake(handshakeHello, sessionID, clientPublic, localMaxDatagramSize, 0, opts.AuthKey, PublicKey{})
+	var nonce [handshakeNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		_ = transport.Close()
+		return nil, fmt.Errorf("generate tgp handshake nonce: %w", err)
+	}
+	hello, err := marshalHandshake(handshakeHello, sessionID, clientPublic, localMaxDatagramSize, handshakeDeadline.UnixMilli(), nonce, opts.AuthKey, PublicKey{})
 	if err != nil {
 		_ = transport.Close()
 		return nil, err
 	}
 	retryDelay := handshakeInitialRetry
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := handshakeCtx.Err(); err != nil {
 			_ = transport.Close()
 			return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, err)
 		}
 		helloSentAt := time.Now()
-		if err := transport.WritePacket(ctx, hello, remoteAddr); err != nil {
+		if err := transport.WritePacket(handshakeCtx, hello, remoteAddr); err != nil {
 			_ = transport.Close()
-			if ctx.Err() != nil {
-				return nil, fmt.Errorf("%w: sending hello: %w", ErrHandshakeTimeout, ctx.Err())
+			if handshakeCtx.Err() != nil {
+				return nil, fmt.Errorf("%w: sending hello: %w", ErrHandshakeTimeout, handshakeCtx.Err())
 			}
 			return nil, err
 		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, retryDelay)
+		attemptCtx, cancel := context.WithTimeout(handshakeCtx, retryDelay)
 		for {
 			wire, from, err := transport.ReadPacket(attemptCtx)
 			ackReceivedAt := time.Now()
 			if err != nil {
 				cancel()
-				if ctx.Err() != nil {
+				if handshakeCtx.Err() != nil {
 					_ = transport.Close()
-					return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, ctx.Err())
+					return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, handshakeCtx.Err())
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 					break
@@ -161,13 +172,16 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 			if err != nil || msg.msgType != handshakeHelloAck || msg.sessionID != sessionID {
 				continue
 			}
+			if msg.nonce != nonce {
+				continue
+			}
 			if err := verifyHandshakeAuth(msg, opts.AuthKey, clientPublic); err != nil {
 				continue
 			}
 			if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > localMaxDatagramSize {
 				continue
 			}
-			clockOffset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, msg.relayUnixMilli)
+			clockOffset, err := estimateRelayClockOffset(helloSentAt, ackReceivedAt, msg.unixMilli)
 			if err != nil {
 				continue
 			}
@@ -233,7 +247,7 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 		if err != nil {
 			continue
 		}
-		if msg.msgType != handshakeHello || msg.relayUnixMilli != 0 {
+		if msg.msgType != handshakeHello || validateHandshakeHelloFreshness(msg, time.Now()) != nil {
 			continue
 		}
 		if err := verifyHandshakeAuth(msg, opts.AuthKey, PublicKey{}); err != nil {
@@ -248,7 +262,7 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 		if err != nil {
 			return nil, err
 		}
-		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), opts.AuthKey, msg.publicKey)
+		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), msg.nonce, opts.AuthKey, msg.publicKey)
 		if err != nil {
 			return nil, err
 		}
@@ -269,19 +283,19 @@ func AcceptSessionWithOptions(ctx context.Context, transport Transport, opts Ses
 				hello:     append([]byte(nil), wire...),
 				ack:       append([]byte(nil), ack...),
 				peer:      from,
-				expiresAt: time.Now().Add(handshakeReplayWindow),
+				expiresAt: time.UnixMilli(msg.unixMilli),
 				remaining: handshakeReplayLimit,
 			},
 		})
 	}
 }
 
-func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, relayUnixMilli int64, authKey []byte, peerPublic PublicKey) ([]byte, error) {
+func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, unixMilli int64, nonce [handshakeNonceSize]byte, authKey []byte, peerPublic PublicKey) ([]byte, error) {
 	maxDatagramSize, err := normalizeMaxDatagramSize(maxDatagramSize)
 	if err != nil {
 		return nil, err
 	}
-	if (msgType == handshakeHello && relayUnixMilli != 0) || (msgType == handshakeHelloAck && relayUnixMilli <= 0) {
+	if unixMilli <= 0 || nonce == ([handshakeNonceSize]byte{}) {
 		return nil, ErrInvalidHandshake
 	}
 	bodySize := handshakeBaseBodySize
@@ -294,9 +308,10 @@ func marshalHandshake(msgType handshakeType, sessionID SessionID, publicKey Publ
 	copy(body[5:21], sessionID[:])
 	copy(body[21:53], publicKey[:])
 	binary.BigEndian.PutUint16(body[53:55], uint16(maxDatagramSize))
-	binary.BigEndian.PutUint64(body[55:63], uint64(relayUnixMilli))
+	binary.BigEndian.PutUint64(body[55:63], uint64(unixMilli))
+	copy(body[63:63+handshakeNonceSize], nonce[:])
 	if len(authKey) > 0 {
-		tag := handshakeAuthTag(authKey, msgType, sessionID, publicKey, maxDatagramSize, relayUnixMilli, peerPublic)
+		tag := handshakeAuthTag(authKey, msgType, sessionID, publicKey, maxDatagramSize, unixMilli, nonce, peerPublic)
 		copy(body[handshakeBaseBodySize:], tag)
 	}
 
@@ -334,13 +349,16 @@ func parseHandshake(wire []byte) (handshakeMessage, error) {
 	copy(sessionID[:], body[5:21])
 	copy(publicKey[:], body[21:53])
 	maxDatagramSize := int(binary.BigEndian.Uint16(body[53:55]))
-	relayUnixMilli := int64(binary.BigEndian.Uint64(body[55:63]))
+	unixMilli := int64(binary.BigEndian.Uint64(body[55:63]))
+	var nonce [handshakeNonceSize]byte
+	copy(nonce[:], body[63:63+handshakeNonceSize])
 	msg := handshakeMessage{
 		msgType:         msgType,
 		sessionID:       sessionID,
 		publicKey:       publicKey,
 		maxDatagramSize: maxDatagramSize,
-		relayUnixMilli:  relayUnixMilli,
+		unixMilli:       unixMilli,
+		nonce:           nonce,
 	}
 	if len(body) == handshakeBaseBodySize+handshakeAuthTagSize {
 		msg.authTag = append([]byte(nil), body[handshakeBaseBodySize:]...)
@@ -358,14 +376,14 @@ func verifyHandshakeAuth(msg handshakeMessage, authKey []byte, peerPublic Public
 	if len(msg.authTag) != handshakeAuthTagSize {
 		return ErrInvalidHandshake
 	}
-	want := handshakeAuthTag(authKey, msg.msgType, msg.sessionID, msg.publicKey, msg.maxDatagramSize, msg.relayUnixMilli, peerPublic)
+	want := handshakeAuthTag(authKey, msg.msgType, msg.sessionID, msg.publicKey, msg.maxDatagramSize, msg.unixMilli, msg.nonce, peerPublic)
 	if !hmac.Equal(msg.authTag, want) {
 		return ErrInvalidHandshake
 	}
 	return nil
 }
 
-func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, relayUnixMilli int64, peerPublic PublicKey) []byte {
+func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID, publicKey PublicKey, maxDatagramSize int, unixMilli int64, nonce [handshakeNonceSize]byte, peerPublic PublicKey) []byte {
 	mac := hmac.New(sha256.New, authKey)
 	_, _ = mac.Write(handshakeMagic[:])
 	_, _ = mac.Write([]byte{byte(msgType)})
@@ -375,8 +393,9 @@ func handshakeAuthTag(authKey []byte, msgType handshakeType, sessionID SessionID
 	binary.BigEndian.PutUint16(encodedMax[:], uint16(maxDatagramSize))
 	_, _ = mac.Write(encodedMax[:])
 	var encodedRelayTime [8]byte
-	binary.BigEndian.PutUint64(encodedRelayTime[:], uint64(relayUnixMilli))
+	binary.BigEndian.PutUint64(encodedRelayTime[:], uint64(unixMilli))
 	_, _ = mac.Write(encodedRelayTime[:])
+	_, _ = mac.Write(nonce[:])
 	_, _ = mac.Write(peerPublic[:])
 	return mac.Sum(nil)
 }
@@ -388,4 +407,23 @@ func estimateRelayClockOffset(helloSentAt, ackReceivedAt time.Time, relayUnixMil
 	// Bias the estimate into the past by the ACK's downstream latency. This
 	// avoids creating future-dated requests on asymmetric paths.
 	return time.UnixMilli(relayUnixMilli).Sub(ackReceivedAt), nil
+}
+
+func handshakeDeadlineContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	maxDeadline := time.Now().Add(MaxHandshakeTimeout)
+	if deadline, ok := ctx.Deadline(); ok && !deadline.After(maxDeadline) {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, maxDeadline)
+}
+
+func validateHandshakeHelloFreshness(msg handshakeMessage, now time.Time) error {
+	if msg.msgType != handshakeHello || msg.nonce == ([handshakeNonceSize]byte{}) || msg.unixMilli <= 0 {
+		return ErrInvalidHandshake
+	}
+	expiresAt := time.UnixMilli(msg.unixMilli)
+	if !expiresAt.After(now) || expiresAt.After(now.Add(MaxHandshakeTimeout)) {
+		return ErrInvalidHandshake
+	}
+	return nil
 }

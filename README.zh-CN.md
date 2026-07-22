@@ -11,6 +11,7 @@ Core 在创建 TUN 和安装路由前只解析一次 Relay，并 pin 获批的 `
 - Windows 客户端只会把 `client.tun.game_routes` 中显式填写的目标 CIDR 事务性地指向 Tachyon TUN；初始化失败、正常停止或安装超时都会按逆序回滚。Core 永远不会退化为全局默认路由。
 - Linux 与 macOS 当前会在创建 TUN 之前拒绝非空 `game_routes`，直到对应平台具备同等安全的事务路由实现。
 - `game_routes` 是目标 CIDR 路由，不是进程路由。同一 CIDR 上的游戏与非游戏程序都会先进入 TUN；PID 和游戏规则只能在接管后决定 TGP 或 fail-closed，无法把非游戏包重新送回原生路径。因此 Prism 必须使用尽可能窄的游戏服务器 CIDR，界面也不得宣称真正的按进程隔离。
+- PID 查询失败时，只要存在依赖进程身份的 TGP 游戏配置或规则，Core 就会阻止较低优先级 CIDR/default TGP 兜底。纯 CIDR-only TGP 模式仍可显式工作，但访问目标的所有进程都可能进入 TGP；被接管后的 `direct` 决策不会重新注入原生路径。
 - Core 会在 TUN 和路由变更前一次解析 Relay；任何获批 endpoint 落入游戏 CIDR 都会导致启动失败。后续重连与迁移只使用启动时 pin 的 endpoint 集合，不再重新查询系统 DNS。
 
 Tachyon Core 是 Tachyon 游戏协议的无头传输核心。它的角色类似 `xray-core`：它是一个独立网络核心，使用显式 JSON 配置，但协议目标是低延迟、低丢包的游戏 UDP 流量，而不是通用 TCP 代理。
@@ -31,7 +32,7 @@ tachyonctl health --addr 127.0.0.1:55123
 ## 设计边界
 
 - Prism 负责订阅获取、订阅解析、节点选择、Xray 生命周期、Xray JSON 生成、游戏配置管理、启动器扫描和桌面端总控编排。
-- Core 负责 Tachyon 协议传输：数据包接管、基于进程的游戏路由、TGP 客户端传输和 TGP 服务端 Relay 行为。
+- Core 负责 Tachyon 协议传输：legacy 选择性数据包接管与分类、TGP 客户端传输和 TGP 服务端 Relay 行为。
 - Tachyon Core 内部没有 Xray 的运行时或编译期依赖。
 - TCP 代理流量属于 Prism/Xray；UDP 游戏流量属于 Tachyon Core/TGP。
 - 客户端 TUN 当前只支持 TGP-only：`auto_route=true`、`dns_hijack=true` 或
@@ -68,7 +69,7 @@ Tachyon Core 还不是 stable 或生产完成版本。协议和管道已经可�
 | 统一 client/server CLI | 完成 |
 | JSON 配置加载和生成 | 完成 |
 | Core JSON 内嵌 Prism 游戏配置 | 完成 |
-| 基于进程的路由配置 | 完成 |
+| Legacy PID 感知路由配置 | Preview；生产接管仍为 Proposed |
 | 本地 HTTP 路由桥兼容层 | 完成 |
 | tachyonctl health CLI | 完成 |
 | tachyon-core validate 干运行 | 完成 |
@@ -150,8 +151,9 @@ PathRequest 使用严格报文长度并携带认证的 10 秒时间窗。未知 
 每秒恢复 2 的迁移配额。
 
 生成的客户端默认使用 `client.tun.mtu=1280` 和
-`tgp.max_datagram_size=1352`，使最坏外层 IPv6/UDP 包为 1396 字节。认证的 TGP v3
-握手协商客户端与 relay 的较小预算并传递时钟对齐信息，v1/v2 peer 会 fail-closed。已知低 PMTU 路径可把
+`tgp.max_datagram_size=1352`，使最坏外层 IPv6/UDP 包为 1396 字节。认证的 TGP v4
+握手协商客户端与 relay 的较小预算，认证有界过期时间和随机 nonce，并传递时钟对齐
+信息；v1-v3 peer 会 fail-closed。已知低 PMTU 路径可把
 数据报上限降到 1232，并同步降低 TUN MTU。Core 会拒绝不一致的预算，对发送超限
 返回明确错误并记录接收超限遥测；TGP 当前尚无协议分片或自动 PMTU 探测。
 

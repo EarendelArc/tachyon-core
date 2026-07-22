@@ -71,6 +71,17 @@ type Engine struct {
 	Launchers LauncherPolicy `json:"launchers"`
 }
 
+func (e Engine) RequiresProcessAttributionForTGP() bool {
+	for _, profile := range e.Profiles {
+		if profile.Enabled && defaultUDPPolicy(profile.UDPPolicy) == UDPPolicyTGP {
+			return true
+		}
+	}
+	return e.Launchers.Steam.Enabled &&
+		e.Launchers.Steam.TrackChildProcesses &&
+		e.Launchers.Steam.AccelerateGameUDP
+}
+
 type Decision struct {
 	Kind      DecisionKind `json:"kind"`
 	UDPPolicy UDPPolicy    `json:"udpPolicy"`

@@ -104,6 +104,57 @@ func (r *Router) Decide(flow pidtrack.FlowKey, proc pidtrack.ProcessInfo) Decisi
 	}
 }
 
+func (r *Router) DecideUnknownProcess(flow pidtrack.FlowKey) Decision {
+	r.mu.RLock()
+	gameEngine := r.gameEngine
+	r.mu.RUnlock()
+
+	requiresProcess := gameEngine.RequiresProcessAttributionForTGP()
+	for _, indexed := range r.rules {
+		if strings.TrimSpace(indexed.rule.ProcessName) != "" && normalizeAction(indexed.rule.Action, r.defaultAction) == ActionTGP {
+			requiresProcess = true
+			break
+		}
+	}
+	for _, indexed := range r.rules {
+		if strings.TrimSpace(indexed.rule.ProcessName) != "" {
+			continue
+		}
+		if !routeRuleMatches(indexed.rule, flow, pidtrack.ProcessInfo{}) {
+			continue
+		}
+		action := normalizeAction(indexed.rule.Action, r.defaultAction)
+		if action == ActionTGP && requiresProcess {
+			action = ActionDrop
+		}
+		return Decision{
+			Action:       action,
+			Reason:       unknownProcessReason(action, requiresProcess),
+			RuleIndex:    indexed.index,
+			ProcessKnown: false,
+			Flow:         flow,
+		}
+	}
+
+	action := r.defaultAction
+	if action == ActionTGP && requiresProcess {
+		action = ActionDrop
+	}
+	return Decision{
+		Action:       action,
+		Reason:       unknownProcessReason(action, requiresProcess),
+		ProcessKnown: false,
+		Flow:         flow,
+	}
+}
+
+func unknownProcessReason(action Action, processSensitiveTGP bool) string {
+	if action == ActionDrop && processSensitiveTGP {
+		return "process unknown; process-sensitive TGP policy blocks fallback"
+	}
+	return "process unknown; process-independent route decision"
+}
+
 func routeRuleMatches(rule config.RouteRule, flow pidtrack.FlowKey, proc pidtrack.ProcessInfo) bool {
 	if rule.Protocol != "" && !strings.EqualFold(rule.Protocol, string(flow.Transport)) {
 		return false

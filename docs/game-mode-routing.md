@@ -2,9 +2,8 @@
 
 [中文说明](game-mode-routing.zh-CN.md)
 
-Manual program entries are first-class routing profiles. They prevent games with
-unusual launchers, anti-cheat wrappers, or missing process metadata from falling
-back to generic routing.
+Manual program entries are first-class routing profiles. They cover games with
+unusual launchers and anti-cheat wrappers when process attribution succeeds.
 
 ## Policy
 
@@ -17,6 +16,17 @@ back to generic routing.
 - Game UDP defaults to TGP.
 - Game TCP defaults to `auto`; Core does not proxy TCP traffic. Prism/Xray owns
   login, store, download, and other TCP proxy flows.
+
+## Legacy Selective-Route Safety
+
+The current destination-CIDR TUN path is a legacy preview, not process-isolated
+capture. When PID lookup fails and any enabled game profile, Steam child policy,
+or process-name TGP rule depends on process identity, Core blocks lower-priority
+CIDR/default TGP fallback. It does not guess that the unknown packet belongs to
+the selected game. A configuration containing only process-independent CIDR
+TGP rules may explicitly accelerate an unknown-process packet, but every process
+contacting that destination can then enter TGP. A `direct` decision is not
+re-injected by Core and therefore remains fail-closed after capture.
 
 ## Core JSON Example
 

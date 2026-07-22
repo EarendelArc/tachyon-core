@@ -22,6 +22,7 @@ const (
 	pathRequestTokensPerSecond     = 2
 	pathChallengeLifetime          = 5 * time.Second
 	pathAuthorizationLifetime      = 45 * time.Second
+	maxHandshakeTombstones         = 4096
 )
 
 var ErrRelayResourceLimit = errors.New("tgp relay resource limit reached")
@@ -172,10 +173,13 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			return nil, err
 		}
 		msg, err := parseHandshake(envelope.packet)
-		if err != nil || msg.msgType != handshakeHello || msg.relayUnixMilli != 0 {
+		if err != nil || msg.msgType != handshakeHello || validateHandshakeHelloFreshness(msg, time.Now()) != nil {
 			continue
 		}
 		if err := verifyHandshakeAuth(msg, r.authKey, PublicKey{}); err != nil {
+			continue
+		}
+		if router.handshakeTombstoned(msg.sessionID) {
 			continue
 		}
 		if msg.maxDatagramSize < MinTGPDatagramSize || msg.maxDatagramSize > MaxTGPDatagramSize {
@@ -197,7 +201,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 		if err != nil {
 			return nil, err
 		}
-		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), r.authKey, msg.publicKey)
+		ack, err := marshalHandshake(handshakeHelloAck, msg.sessionID, keyPair.PublicKey(), effectiveMaxDatagramSize, time.Now().UnixMilli(), msg.nonce, r.authKey, msg.publicKey)
 		if err != nil {
 			_ = sessionTransport.Close()
 			return nil, err
@@ -206,7 +210,7 @@ func (r *Relay) acceptSession(ctx context.Context, router *relayTransportRouter)
 			_ = sessionTransport.Close()
 			return nil, err
 		}
-		router.registerHandshakeReplay(msg.sessionID, envelope.packet, ack, envelope.from)
+		router.registerHandshakeReplay(msg.sessionID, envelope.packet, ack, envelope.from, time.UnixMilli(msg.unixMilli))
 		session, err := NewDatagramSession(SessionOptions{
 			ID:               msg.sessionID,
 			Transport:        sessionTransport,
@@ -376,6 +380,7 @@ type relayTransportRouter struct {
 	sessions              map[SessionID]*relaySessionTransport
 	sources               map[sourceAddrKey]*relaySessionTransport
 	handshakeReplays      map[SessionID]*handshakeReplayState
+	handshakeTombstones   map[SessionID]time.Time
 	sessionQueueSize      int
 	droppedHandshakes     atomic.Uint64
 	droppedData           atomic.Uint64
@@ -394,14 +399,15 @@ func newRelayTransportRouter(transport Transport, sessionQueueSize int, handshak
 		handshakeQueueSize = defaultRelayHandshakeQueueSize
 	}
 	return &relayTransportRouter{
-		transport:        transport,
-		now:              time.Now,
-		handshakes:       make(chan relayPacketEnvelope, handshakeQueueSize),
-		done:             make(chan struct{}),
-		sessions:         make(map[SessionID]*relaySessionTransport),
-		sources:          make(map[sourceAddrKey]*relaySessionTransport),
-		handshakeReplays: make(map[SessionID]*handshakeReplayState),
-		sessionQueueSize: sessionQueueSize,
+		transport:           transport,
+		now:                 time.Now,
+		handshakes:          make(chan relayPacketEnvelope, handshakeQueueSize),
+		done:                make(chan struct{}),
+		sessions:            make(map[SessionID]*relaySessionTransport),
+		sources:             make(map[sourceAddrKey]*relaySessionTransport),
+		handshakeReplays:    make(map[SessionID]*handshakeReplayState),
+		handshakeTombstones: make(map[SessionID]time.Time),
+		sessionQueueSize:    sessionQueueSize,
 	}
 }
 
@@ -434,7 +440,7 @@ func (r *relayTransportRouter) readLoop(ctx context.Context) {
 	}
 }
 
-func (r *relayTransportRouter) registerHandshakeReplay(id SessionID, hello, ack []byte, peer net.Addr) {
+func (r *relayTransportRouter) registerHandshakeReplay(id SessionID, hello, ack []byte, peer net.Addr, expiresAt time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -444,7 +450,7 @@ func (r *relayTransportRouter) registerHandshakeReplay(id SessionID, hello, ack 
 		hello:     append([]byte(nil), hello...),
 		ack:       append([]byte(nil), ack...),
 		peer:      peer,
-		expiresAt: r.now().Add(handshakeReplayWindow),
+		expiresAt: expiresAt,
 		remaining: handshakeReplayLimit,
 	}
 }
@@ -452,7 +458,11 @@ func (r *relayTransportRouter) registerHandshakeReplay(id SessionID, hello, ack 
 func (r *relayTransportRouter) replayHandshakeAck(ctx context.Context, id SessionID, envelope relayPacketEnvelope) bool {
 	r.mu.Lock()
 	replay := r.handshakeReplays[id]
-	if replay == nil || replay.remaining <= 0 || r.now().After(replay.expiresAt) ||
+	if replay != nil && (replay.remaining <= 0 || !r.now().Before(replay.expiresAt)) {
+		delete(r.handshakeReplays, id)
+		replay = nil
+	}
+	if replay == nil ||
 		!sameAddr(envelope.from, replay.peer) || !bytes.Equal(envelope.packet, replay.hello) {
 		r.mu.Unlock()
 		return false
@@ -491,6 +501,11 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 	if r.closed {
 		return nil, ErrSessionClosed
 	}
+	now := r.now()
+	r.pruneHandshakeTombstonesLocked(now)
+	if expiresAt, ok := r.handshakeTombstones[id]; ok && now.Before(expiresAt) {
+		return nil, ErrInvalidHandshake
+	}
 	if _, ok := r.sessions[id]; ok {
 		return nil, ErrInvalidHandshake
 	}
@@ -501,7 +516,6 @@ func (r *relayTransportRouter) registerWithPathAuth(id SessionID, addr net.Addr,
 	if _, ok := r.sources[addrKey]; ok {
 		return nil, ErrInvalidHandshake
 	}
-	now := r.now()
 	session := &relaySessionTransport{
 		id:     id,
 		router: r,
@@ -530,10 +544,44 @@ func (r *relayTransportRouter) unregister(id SessionID, session *relaySessionTra
 	if r.sessions[id] == session {
 		delete(r.sessions, id)
 		delete(r.handshakeReplays, id)
+		r.addHandshakeTombstoneLocked(id, r.now().Add(MaxHandshakeTimeout))
 	}
 	for source := range session.paths {
 		if r.sources[source] == session {
 			delete(r.sources, source)
+		}
+	}
+}
+
+func (r *relayTransportRouter) handshakeTombstoned(id SessionID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	r.pruneHandshakeTombstonesLocked(now)
+	expiresAt, ok := r.handshakeTombstones[id]
+	return ok && now.Before(expiresAt)
+}
+
+func (r *relayTransportRouter) addHandshakeTombstoneLocked(id SessionID, expiresAt time.Time) {
+	r.pruneHandshakeTombstonesLocked(r.now())
+	if len(r.handshakeTombstones) >= maxHandshakeTombstones {
+		var oldestID SessionID
+		var oldestExpiry time.Time
+		for candidate, expiry := range r.handshakeTombstones {
+			if oldestExpiry.IsZero() || expiry.Before(oldestExpiry) {
+				oldestID = candidate
+				oldestExpiry = expiry
+			}
+		}
+		delete(r.handshakeTombstones, oldestID)
+	}
+	r.handshakeTombstones[id] = expiresAt
+}
+
+func (r *relayTransportRouter) pruneHandshakeTombstonesLocked(now time.Time) {
+	for id, expiresAt := range r.handshakeTombstones {
+		if !now.Before(expiresAt) {
+			delete(r.handshakeTombstones, id)
 		}
 	}
 }

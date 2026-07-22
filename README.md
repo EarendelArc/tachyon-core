@@ -29,8 +29,8 @@ tachyonctl health --addr 127.0.0.1:55123
 - Prism owns subscription retrieval, subscription parsing, node selection,
   Xray lifecycle, Xray JSON generation, game profile management, launcher
   scanning, and desktop orchestration.
-- Core owns Tachyon protocol transport: packet capture, process-aware game
-  routing, TGP client transport, and TGP server relay behavior.
+- Core owns Tachyon protocol transport: legacy selective packet capture and
+  classification, TGP client transport, and TGP server relay behavior.
 - Xray has no runtime or build-time dependency inside Tachyon Core.
 - TCP proxy traffic belongs to Prism/Xray. UDP game traffic belongs to
   Tachyon Core/TGP.
@@ -44,6 +44,10 @@ tachyonctl health --addr 127.0.0.1:55123
   contacts one of those CIDRs enters the TUN. PID/game-profile decisions still
   decide whether a captured UDP packet may use TGP, but they cannot make the OS
   route distinguish two processes contacting the same destination CIDR.
+- On a PID miss, any configured process-sensitive TGP profile/rule blocks
+  lower-priority CIDR/default TGP fallback. Pure CIDR-only TGP mode remains
+  explicit and process-independent, so all processes contacting that CIDR may
+  enter TGP. Captured `direct` decisions are not re-injected.
 - Before TUN or route setup, Core resolves the TGP Relay once and pins the
   approved `IP:port` set. Every dial, reconnect, and migration validates against
   that set and the game CIDRs, so installed game routes never make reconnects
@@ -111,7 +115,7 @@ Windows hosts.
 | Unified client/server CLI | Done |
 | JSON config loading and generation | Done |
 | Embedded Prism game profiles in Core JSON | Done |
-| Process-aware routing profiles | Done |
+| Legacy PID-aware routing profiles | Preview; production capture proposed |
 | Local HTTP routing bridge compatibility | Done |
 | tachyonctl health CLI | Done |
 | tachyon-core validate (dry-run) | Done |
@@ -221,9 +225,10 @@ Only valid HMACs reach the per-session burst-8, 2-per-second migration quota.
 
 The generated client uses `client.tun.mtu=1280` and
 `tgp.max_datagram_size=1352`, bounding its worst-case outer IPv6/UDP packet to
-1396 bytes. The authenticated TGP v3 handshake negotiates the lower client and
-relay budget, carries relay time for path-request clock alignment, and rejects
-version 1/2 peers instead of guessing missing fields.
+1396 bytes. The authenticated TGP v4 handshake negotiates the lower client and
+relay budget, authenticates a bounded expiry and random nonce, carries relay
+time for path-request clock alignment, and rejects version 1-3 peers instead of
+guessing missing fields.
 Known lower-PMTU paths can reduce the datagram limit to 1232 with a matching
 TUN MTU. Core rejects inconsistent budgets, reports oversized receive drops,
 and returns explicit errors for oversized sends. TGP does not yet provide

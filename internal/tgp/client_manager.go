@@ -12,6 +12,8 @@ import (
 
 const defaultHandshakeTimeout = 5 * time.Second
 
+var ErrClientManagerClosed = errors.New("tgp client manager closed")
+
 type DialFunc func(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (Session, error)
 type MultipathDialFunc func(ctx context.Context, localAddrs []string, remoteAddr net.Addr, pacerPPS float64) (Session, error)
 
@@ -45,10 +47,17 @@ type ClientManager struct {
 	validateRemote   func(net.Addr) error
 	onDatagram       func(ctx context.Context, datagram TunnelDatagram) error
 
-	mu      sync.Mutex
-	session Session
-	ctx     context.Context
-	cancel  context.CancelFunc
+	mu         sync.Mutex
+	session    Session
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closed     bool
+	dialing    bool
+	dialDone   chan struct{}
+	dialCancel context.CancelFunc
+	closeOnce  sync.Once
+	closeErr   error
+	readWG     sync.WaitGroup
 }
 
 func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
@@ -81,6 +90,9 @@ func NewClientManager(opts ClientManagerOptions) (*ClientManager, error) {
 	timeout := opts.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
+	}
+	if timeout > MaxHandshakeTimeout {
+		return nil, fmt.Errorf("tgp handshake timeout %s exceeds maximum %s", timeout, MaxHandshakeTimeout)
 	}
 	dial := opts.Dial
 	if dial == nil {
@@ -145,68 +157,157 @@ func (m *ClientManager) SendPacket(ctx context.Context, streamID StreamID, paylo
 	return nil
 }
 
+func (m *ClientManager) EnsureSession(ctx context.Context) error {
+	_, err := m.sessionFor(ctx)
+	return err
+}
+
 func (m *ClientManager) Close() error {
-	if m.cancel != nil {
+	m.closeOnce.Do(func() {
 		m.cancel()
-	}
-	m.mu.Lock()
-	session := m.session
-	m.session = nil
-	m.mu.Unlock()
-	if session == nil {
-		return nil
-	}
-	return session.Close()
+		m.mu.Lock()
+		m.closed = true
+		if m.dialCancel != nil {
+			m.dialCancel()
+		}
+		dialDone := m.dialDone
+		session := m.session
+		m.session = nil
+		m.mu.Unlock()
+
+		if dialDone != nil {
+			<-dialDone
+		}
+		if session != nil {
+			m.closeErr = session.Close()
+		}
+		m.readWG.Wait()
+	})
+	return m.closeErr
 }
 
 func (m *ClientManager) sessionFor(ctx context.Context) (Session, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, ErrClientManagerClosed
+		}
+		if m.session != nil && m.session.State() != SessionClosed {
+			session := m.session
+			m.mu.Unlock()
+			return session, nil
+		}
+		if m.dialing {
+			done := m.dialDone
+			m.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-m.ctx.Done():
+				return nil, ErrClientManagerClosed
+			}
+		}
 
-	if m.session != nil && m.session.State() != SessionClosed {
-		return m.session, nil
+		dialCtx, cancel := context.WithTimeout(ctx, m.handshakeTimeout)
+		stopManager := context.AfterFunc(m.ctx, cancel)
+		done := make(chan struct{})
+		m.dialing = true
+		m.dialDone = done
+		m.dialCancel = cancel
+		m.mu.Unlock()
+
+		session, remoteAddr, err := m.dialSession(dialCtx)
+		stopManager()
+		cancel()
+
+		m.mu.Lock()
+		m.dialing = false
+		m.dialDone = nil
+		m.dialCancel = nil
+		if m.closed {
+			m.mu.Unlock()
+			if session != nil {
+				_ = session.Close()
+			}
+			close(done)
+			return nil, ErrClientManagerClosed
+		}
+		if err != nil {
+			m.mu.Unlock()
+			close(done)
+			return nil, fmt.Errorf("dial tgp session %s: %w", remoteAddr, err)
+		}
+		m.session = session
+		startReadLoop := m.onDatagram != nil
+		if startReadLoop {
+			m.readWG.Add(1)
+		}
+		m.mu.Unlock()
+		close(done)
+		if startReadLoop {
+			go func() {
+				defer m.readWG.Done()
+				m.readLoop(session)
+			}()
+		}
+		return session, nil
 	}
+}
 
+func (m *ClientManager) dialSession(ctx context.Context) (Session, net.Addr, error) {
 	var remoteAddr net.Addr
 	var err error
 	if len(m.pinnedRemotes) > 0 {
 		remoteAddr = m.pinnedRemotes[0]
 	} else {
-		remoteAddr, err = net.ResolveUDPAddr("udp", m.remoteAddr)
+		remoteAddr, err = resolveUDPAddrContext(ctx, m.remoteAddr)
 		if err != nil {
-			return nil, fmt.Errorf("resolve tgp remote %q: %w", m.remoteAddr, err)
+			return nil, nil, fmt.Errorf("resolve tgp remote %q: %w", m.remoteAddr, err)
 		}
 	}
 	if m.validateRemote != nil {
 		if err := m.validateRemote(remoteAddr); err != nil {
-			return nil, fmt.Errorf("validate tgp remote %s: %w", remoteAddr, err)
+			return nil, remoteAddr, fmt.Errorf("validate tgp remote %s: %w", remoteAddr, err)
 		}
 	}
-	dialCtx := ctx
-	cancel := func() {}
-	if _, ok := ctx.Deadline(); !ok {
-		dialCtx, cancel = context.WithTimeout(ctx, m.handshakeTimeout)
-	}
-	defer cancel()
-
-	var session Session
 	if len(m.localAddrs) > 1 {
-		session, err = m.dialMultipath(dialCtx, m.localAddrs, remoteAddr, m.pacerPPS)
-	} else {
-		localAddr := m.localAddr
-		if len(m.localAddrs) == 1 {
-			localAddr = m.localAddrs[0]
-		}
-		session, err = m.dial(dialCtx, localAddr, remoteAddr, m.pacerPPS)
+		session, err := m.dialMultipath(ctx, m.localAddrs, remoteAddr, m.pacerPPS)
+		return session, remoteAddr, err
 	}
+	localAddr := m.localAddr
+	if len(m.localAddrs) == 1 {
+		localAddr = m.localAddrs[0]
+	}
+	session, err := m.dial(ctx, localAddr, remoteAddr, m.pacerPPS)
+	return session, remoteAddr, err
+}
+
+func resolveUDPAddrContext(ctx context.Context, address string) (*net.UDPAddr, error) {
+	host, portText, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("dial tgp session %s: %w", remoteAddr, err)
+		return nil, err
 	}
-	m.session = session
-	if m.onDatagram != nil {
-		go m.readLoop(session)
+	port, err := net.LookupPort("udp", portText)
+	if err != nil {
+		return nil, err
 	}
-	return session, nil
+	if host == "" {
+		return &net.UDPAddr{Port: port}, nil
+	}
+	if parsed := net.ParseIP(host); parsed != nil {
+		return &net.UDPAddr{IP: parsed, Port: port}, nil
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("resolver returned no addresses")
+	}
+	return &net.UDPAddr{IP: addresses[0].IP, Port: port, Zone: addresses[0].Zone}, nil
 }
 
 func normalizeLocalAddrs(addrs []string, fallback string) []string {

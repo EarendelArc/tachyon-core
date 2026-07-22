@@ -3,6 +3,7 @@ package tgp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -122,6 +123,102 @@ func TestRelayRetransmitsDroppedFirstHandshakeAck(t *testing.T) {
 	if got := transport.ackWrites.Load(); got != 2 {
 		t.Fatalf("relay ack writes = %d, want initial plus retry", got)
 	}
+}
+
+func TestRelayRejectsEndedSessionHelloReplay(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 2, 2)
+	var sessionID SessionID
+	copy(sessionID[:], []byte("ended-replay-cid"))
+	peer := mustRelayUDPAddr(t, "127.0.0.1:10443")
+	session, err := router.register(sessionID, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !router.handshakeTombstoned(sessionID) {
+		t.Fatal("ended session CID was not tombstoned")
+	}
+
+	keyPair, err := NewKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello, err := marshalHandshake(
+		handshakeHello,
+		sessionID,
+		keyPair.PublicKey(),
+		DefaultTGPDatagramSize,
+		time.Now().Add(time.Second).UnixMilli(),
+		testHandshakeNonce(),
+		nil,
+		PublicKey{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.handshakes <- relayPacketEnvelope{packet: hello, from: peer}
+	relay, err := NewRelay(RelayOptions{Transport: transport, PacerPPS: 100000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, err := relay.acceptSession(ctx, router); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ended Hello replay result = %v, want timeout rejection", err)
+	}
+}
+
+func TestRelayHandshakeTombstonesAreBoundedAndExpire(t *testing.T) {
+	router := newRelayTransportRouter(newPathControlCaptureTransport(), 1, 1)
+	now := time.Unix(1_700_000_000, 0)
+	router.now = func() time.Time { return now }
+	router.mu.Lock()
+	for index := 0; index < maxHandshakeTombstones+128; index++ {
+		var id SessionID
+		binary.BigEndian.PutUint64(id[8:], uint64(index+1))
+		router.addHandshakeTombstoneLocked(id, now.Add(time.Minute))
+	}
+	got := len(router.handshakeTombstones)
+	router.mu.Unlock()
+	if got != maxHandshakeTombstones {
+		t.Fatalf("tombstones = %d, want %d", got, maxHandshakeTombstones)
+	}
+	now = now.Add(2 * time.Minute)
+	var unknown SessionID
+	if router.handshakeTombstoned(unknown) {
+		t.Fatal("expired tombstone matched")
+	}
+	router.mu.Lock()
+	remaining := len(router.handshakeTombstones)
+	router.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expired tombstones retained = %d", remaining)
+	}
+}
+
+func TestRelayRegistrationAtomicallyRejectsTombstonedSession(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 8, 8)
+	defer router.close()
+	now := time.Unix(1_700_000_000, 0)
+	router.now = func() time.Time { return now }
+	id := SessionID{9, 8, 7}
+	router.mu.Lock()
+	router.addHandshakeTombstoneLocked(id, now.Add(time.Second))
+	router.mu.Unlock()
+
+	if _, err := router.register(id, mustRelayUDPAddr(t, "127.0.0.1:10001")); !errors.Is(err, ErrInvalidHandshake) {
+		t.Fatalf("register tombstoned session = %v, want %v", err, ErrInvalidHandshake)
+	}
+	now = now.Add(2 * time.Second)
+	session, err := router.register(id, mustRelayUDPAddr(t, "127.0.0.1:10001"))
+	if err != nil {
+		t.Fatalf("register after tombstone expiry: %v", err)
+	}
+	_ = session.Close()
 }
 
 func TestRelayMaxSessionsFailsClosedAndRecoversAfterIdleCleanup(t *testing.T) {

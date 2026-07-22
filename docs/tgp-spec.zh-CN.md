@@ -2,7 +2,7 @@
 
 [English](tgp-spec.md)
 
-**版本:** TGP/1.0
+**版本:** TGP/1.1
 
 **状态:** 草案
 
@@ -30,7 +30,26 @@ TGP 是面向低延迟游戏 UDP 流量设计的传输协议。它的目标不�
 
 所有整数在线缆上均为 big-endian。
 
-### 2.1 外层头
+### 2.1 握手
+
+TGP 使用两报文 UDP 握手：
+
+```text
+Client -> Relay: Hello(SessionID, ClientPublicKey, MaxDatagramSize, Expiry, ClientNonce, AuthTag)
+Relay -> Client: HelloAck(SessionID, RelayPublicKey, MaxDatagramSize, RelayTime, ClientNonce, AuthTag)
+```
+
+握手体魔数为 `TGH\x04`。`Hello` 的毫秒时间字段是调用方 deadline 与
+`tgp.handshake_timeout` 中较早者，且最长不超过 30 秒；`HelloAck` 的同一字段是
+Relay 发包时间。ACK 必须原样回显 16 字节随机 `ClientNonce`。PSK HMAC 覆盖魔数、
+类型、SessionID、发送方公钥、数据报上限、毫秒时间、nonce 和对端公钥，因此这些
+字段不能被未认证修改。
+
+Relay 拒绝已过期或超过未来 30 秒的 Hello。相同认证 Hello 最多重放 8 次缓存 ACK，
+且缓存严格在 Hello 签名的过期时间失效。结束会话的 SessionID 进入最多 4096 条、
+保留 30 秒的有界墓碑集合，旧 Hello 不能重建已结束会话。握手 v1-v3 均 fail-closed。
+
+### 2.2 外层头
 
 明文外层头模拟 DTLS 1.0 application-data record：
 
@@ -44,7 +63,7 @@ TGP 是面向低延迟游戏 UDP 流量设计的传输协议。它的目标不�
 
 外层头作为 AEAD additional authenticated data 参与认证，任何篡改都会导致解包失败。
 
-### 2.2 内层头
+### 2.3 内层头
 
 内层头和游戏 payload 使用 ChaCha20-Poly1305 加密。流量密钥派生方式：
 
@@ -67,7 +86,7 @@ HKDF-SHA256(shared_secret, salt=session_id, info="tachyon-tgp-v1 traffic keys")
 | Reserved | 1 byte | 当前写 0 |
 | PayloadLength | 2 bytes | 游戏 payload 长度 |
 
-### 2.3 Flags
+### 2.4 Flags
 
 | Bit | 名称 | 含义 |
 | --- | --- | --- |
@@ -92,7 +111,7 @@ Client                                      Server
   | ---- CLOSE -----------------------------> |
 ```
 
-当前握手使用临时 X25519 密钥。双方基于 shared secret 和 SessionID 派生双向流量密钥。认证的 `TGH\x03` ACK 携带毫秒级 Relay 发送时间；客户端据此对齐 PathRequest 时间戳，并保守地把 ACK 下行时延计为过去偏差。10 秒 replay 时间窗和 1 秒未来容差均未扩大。
+当前握手使用临时 X25519 密钥。双方基于 shared secret 和 SessionID 派生双向流量密钥。认证的 `TGH\x04` ACK 回显 Hello nonce 并携带毫秒级 Relay 发送时间；客户端据此对齐 PathRequest 时间戳，并保守地把 ACK 下行时延计为过去偏差。路径控制的 10 秒 replay 时间窗和 1 秒未来容差均未扩大。
 
 ---
 
@@ -157,14 +176,18 @@ PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可
 
 剩余集成工作是系统网络接口发现和策略选择，例如在移动端选择 Wi-Fi + 蜂窝链路。当前 adapter 依靠 PacketNumber 去重；显式 `FlagMultipath` 标记仍预留给未来控制面集成。
 
+单条路径读失败只移除该路径；最后一条可读路径失效后，adapter 返回明确的聚合终止
+错误并关闭会话，ClientManager 会在下一次发送时建立新会话。Manager 关闭是不可逆
+状态，会取消正在进行的握手，且不会安装关闭后才返回的会话。
+
 ### 6.1 数据报大小与 PMTU
 
 `tgp.max_datagram_size` 限制完整加密 TGP UDP payload。默认值为 1352，协议最大值为
 1452；配合默认 1280 TUN MTU，审计后的最坏外层 IPv6/UDP 包为 1396 字节。最低可配置
 值是 1232，对应已知 1280 字节路径的外层 IPv6/UDP 预算。客户端配置必须满足
 `client.tun.mtu + 68 <= tgp.max_datagram_size`，发送超限返回明确协议错误，接收超限
-fail-closed 并增加 `OversizedDatagrams` 遥测。认证的 `TGH\x03` 握手把上限纳入认证
-字段，双方存储客户端与 Relay 的较小值；无法证明完整当前字段的 v1/v2 peer 会被拒绝。
+fail-closed 并增加 `OversizedDatagrams` 遥测。认证的 `TGH\x04` 握手把上限纳入认证
+字段，双方存储客户端与 Relay 的较小值；无法证明完整当前字段的 v1-v3 peer 会被拒绝。
 
 TGP 当前不做协议分片或自动 PMTU 探测。运维方必须按已知路径配置较低预算和匹配
 的 TUN MTU。1280 字节外层路径无法在不做协议分片时承载最小 1280 字节内层 IPv6

@@ -2,7 +2,7 @@
 
 [Chinese](tgp-spec.zh-CN.md)
 
-**Version:** TGP/1.0
+**Version:** TGP/1.1
 
 **Status:** Draft
 
@@ -48,8 +48,8 @@ All integer fields are encoded in big-endian order.
 TGP session setup is a two-message UDP handshake:
 
 ```text
-Client -> Server: Hello(session_id, client_x25519_public, optional_auth_tag)
-Server -> Client: HelloAck(session_id, server_x25519_public, optional_auth_tag)
+Client -> Server: Hello(session_id, client_x25519_public, expiry, nonce, optional_auth_tag)
+Server -> Client: HelloAck(session_id, server_x25519_public, relay_time, nonce, optional_auth_tag)
 ```
 
 Both messages are wrapped in the DTLS-like outer header with sequence number
@@ -57,9 +57,13 @@ Both messages are wrapped in the DTLS-like outer header with sequence number
 
 ```text
 +----------------+----------------+-------------------------------+
-| Magic "TGH\1"  | Type           | SessionID (16 bytes)          |
+| Magic "TGH\4"  | Type           | SessionID (16 bytes)          |
 +----------------+----------------+-------------------------------+
 | X25519 public key (32 bytes)                                    |
++-------------------------------+-------------------------------+
+| MaxDatagramSize (2 bytes)     | UnixMilliseconds (8 bytes)    |
++---------------------------------------------------------------+
+| ClientNonce (16 bytes)                                        |
 +---------------------------------------------------------------+
 | Optional HMAC-SHA256 auth tag (32 bytes)                       |
 +---------------------------------------------------------------+
@@ -68,12 +72,24 @@ Both messages are wrapped in the DTLS-like outer header with sequence number
 When `tgp.auth.psk` is configured, the auth tag is mandatory:
 
 ```text
-HMAC-SHA256(psk, magic || type || session_id || sender_public || peer_public)
+HMAC-SHA256(psk, magic || type || session_id || sender_public ||
+            max_datagram_size || unix_milliseconds || client_nonce ||
+            peer_public)
 ```
 
 `peer_public` is all zeroes in `Hello` and the client public key in
 `HelloAck`. A server without a PSK rejects handshakes that include an auth tag,
 and a server with a PSK rejects handshakes without a valid tag.
+
+For `Hello`, `UnixMilliseconds` is the caller/config handshake expiry; for
+`HelloAck`, it is the relay send time. The ACK must echo the 16-byte random
+client nonce. The effective client timeout is the earlier of the caller
+deadline and `tgp.handshake_timeout`, and is capped at 30 seconds. The relay
+rejects expired Hellos and expiry values more than 30 seconds in the future.
+Duplicate authenticated Hellos receive the cached ACK only until the signed
+Hello expiry and for at most eight replays. Ended Session IDs enter a bounded
+4096-entry, 30-second tombstone set so an old valid Hello cannot recreate an
+ended session. Handshake wire versions 1 through 3 are rejected.
 
 In server mode, Core requires `tgp.auth.psk` by default. Operators must set
 `tgp.auth.allow_unauthenticated=true` explicitly to run an unauthenticated relay
@@ -180,10 +196,10 @@ Client                                      Server
 
 The implemented handshake uses X25519 ephemeral keys. Both sides derive
 directional traffic keys from the shared secret and SessionID. The authenticated
-`TGH\x03` acknowledgement carries the relay's send time in milliseconds. The
-client aligns path-request timestamps to that time, conservatively biased into
-the past by ACK downstream latency; the 10-second replay window and 1-second
-future allowance are unchanged.
+`TGH\x04` acknowledgement echoes the Hello nonce and carries the relay's send
+time in milliseconds. The client aligns path-request timestamps to that time,
+conservatively biased into the past by ACK downstream latency; the path-control
+10-second replay window and 1-second future allowance are unchanged.
 
 ---
 
@@ -300,6 +316,12 @@ system-interface discovery and policy selection, for example choosing Wi-Fi
 plus cellular paths on mobile. Explicit `FlagMultipath` marking remains
 reserved for a future control-plane integration.
 
+A single path read failure removes only that path. When the last readable path
+fails, the adapter returns a terminal aggregate error, closes the session, and
+allows the client manager to create a fresh session on the next send. Closing
+the manager is irreversible and cancels an in-flight handshake; it never
+installs a session returned after closure.
+
 ### 6.1 Datagram Size and PMTU
 
 `tgp.max_datagram_size` caps the complete encrypted TGP UDP payload. The
@@ -309,9 +331,9 @@ minimum configurable value is 1232, matching an outer IPv6/UDP budget on a
 known 1280-byte path. Client validation requires
 `client.tun.mtu + 68 <= tgp.max_datagram_size`; oversized sends and receives
 fail closed. Sends return an explicit protocol error and receive drops increment
-`OversizedDatagrams` telemetry. The authenticated `TGH\x03` handshake carries
+`OversizedDatagrams` telemetry. The authenticated `TGH\x04` handshake carries
 the offered limit in its authenticated fields, and both peers store the lower
-client/relay value. Version 1 and 2 peers are rejected because they cannot prove
+client/relay value. Version 1 through 3 peers are rejected because they cannot prove
 the complete current handshake fields.
 
 TGP does not currently fragment protocol datagrams or discover PMTU. Operators

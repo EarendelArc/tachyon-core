@@ -173,6 +173,69 @@ func TestPipelinePIDMissDoesNotMatchProcessRuleOrSendDirectToTGP(t *testing.T) {
 	}
 }
 
+func TestPipelinePIDMissBlocksCIDRFallbackWhenProcessTGPProfileExists(t *testing.T) {
+	packet := testUDPPacket()
+	var got Decision
+	p := New(Options{
+		Device:  &fakeDevice{packet: packet},
+		Tracker: fakeTracker{err: errors.New("process unknown")},
+		Router: NewRouter(config.RoutingConfig{
+			DefaultAction: "direct",
+			Rules: []config.RouteRule{{
+				Priority: 10,
+				CIDR:     "203.0.113.0/24",
+				Protocol: "udp",
+				Action:   "tgp",
+			}},
+		}, routing.Engine{Profiles: []routing.GameProfile{{
+			ID:        "selected-game",
+			Enabled:   true,
+			Manual:    true,
+			Priority:  100,
+			Match:     routing.MatchRule{ProcessNames: []string{"game.exe"}},
+			UDPPolicy: routing.UDPPolicyTGP,
+		}}}),
+		Handler: HandlerFunc(func(_ context.Context, decision Decision, _ []byte) error {
+			got = decision
+			return nil
+		}),
+	})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != ActionDrop || got.ProcessKnown {
+		t.Fatalf("decision = %#v, want fail-safe drop", got)
+	}
+}
+
+func TestPipelinePIDMissBlocksCIDRFallbackWhenProcessTGPRuleExists(t *testing.T) {
+	packet := testUDPPacket()
+	var got Decision
+	p := New(Options{
+		Device:  &fakeDevice{packet: packet},
+		Tracker: fakeTracker{err: errors.New("process unknown")},
+		Router: NewRouter(config.RoutingConfig{
+			DefaultAction: "direct",
+			Rules: []config.RouteRule{
+				{Priority: 100, ProcessName: "game.exe", Protocol: "udp", Action: "tgp"},
+				{Priority: 10, CIDR: "203.0.113.0/24", Protocol: "udp", Action: "tgp"},
+			},
+		}, routing.Engine{}),
+		Handler: HandlerFunc(func(_ context.Context, decision Decision, _ []byte) error {
+			got = decision
+			return nil
+		}),
+	})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != ActionDrop || got.ProcessKnown {
+		t.Fatalf("decision = %#v, want fail-safe drop", got)
+	}
+}
+
 func testUDPPacket() []byte {
 	packet := make([]byte, 28)
 	packet[0] = 0x45

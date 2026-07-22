@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -126,8 +130,94 @@ func TestMultipathTransportClosesAllPaths(t *testing.T) {
 	if err := transport.Close(); err != nil {
 		t.Fatalf("close multipath transport: %v", err)
 	}
-	if !left.closed || !right.closed {
-		t.Fatalf("paths not closed: left=%v right=%v", left.closed, right.closed)
+	if !left.isClosed() || !right.isClosed() {
+		t.Fatalf("paths not closed: left=%v right=%v", left.isClosed(), right.isClosed())
+	}
+	if left.closeCount.Load() != 1 || right.closeCount.Load() != 1 {
+		t.Fatalf("path close counts = %d/%d, want 1/1", left.closeCount.Load(), right.closeCount.Load())
+	}
+}
+
+func TestMultipathTransportContinuesUntilLastReadPathFails(t *testing.T) {
+	left := newFakeMultipathPath("127.0.0.1:10001")
+	right := newFakeMultipathPath("127.0.0.1:10002")
+	transport, err := NewMultipathTransport(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	left.failRead(io.EOF)
+	from := mustMultipathUDPAddr(t, "127.0.0.1:443")
+	right.reads <- fakeMultipathRead{packet: []byte("surviving path"), from: from}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	packet, _, err := transport.ReadPacket(ctx)
+	if err != nil || string(packet) != "surviving path" {
+		t.Fatalf("surviving read = %q, %v", packet, err)
+	}
+
+	right.failRead(errors.New("right path failed"))
+	_, _, err = transport.ReadPacket(ctx)
+	if err == nil || !strings.Contains(err.Error(), "all multipath read paths failed") {
+		t.Fatalf("terminal read error = %v", err)
+	}
+	if left.closeCount.Load() != 1 || right.closeCount.Load() != 1 {
+		t.Fatalf("path close counts = %d/%d, want 1/1", left.closeCount.Load(), right.closeCount.Load())
+	}
+}
+
+func TestMultipathTransportCloseCancelsInflightWrite(t *testing.T) {
+	path := newFakeMultipathPath("127.0.0.1:10001")
+	path.blockWrites = true
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- transport.WritePacket(context.Background(), []byte("blocked"), mustMultipathUDPAddrMust("127.0.0.1:443"))
+	}()
+	select {
+	case <-path.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("write did not start")
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("in-flight write succeeded after close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight write did not return after close")
+	}
+}
+
+func TestMultipathTransportReturnsAfterFirstSuccessfulWrite(t *testing.T) {
+	slow := newFakeMultipathPath("127.0.0.1:10001")
+	slow.blockWrites = true
+	fast := newFakeMultipathPath("127.0.0.1:10002")
+	transport, err := NewMultipathTransport(slow, fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- transport.WritePacket(context.Background(), []byte("paced"), mustMultipathUDPAddrMust("127.0.0.1:443"))
+	}()
+	_ = fast.nextWrite(t)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successful path was held up by a blocked path")
 	}
 }
 
@@ -178,11 +268,17 @@ func TestMultipathTransportRejectsForwardedChallengeFromUnknownSource(t *testing
 }
 
 type fakeMultipathPath struct {
-	local    net.Addr
-	writes   chan fakeMultipathWrite
-	reads    chan fakeMultipathRead
-	writeErr error
-	closed   bool
+	local          net.Addr
+	writes         chan fakeMultipathWrite
+	reads          chan fakeMultipathRead
+	readErrs       chan error
+	writeErr       error
+	blockWrites    bool
+	writeStarted   chan struct{}
+	writeStartOnce sync.Once
+	closed         chan struct{}
+	closeOnce      sync.Once
+	closeCount     atomic.Int32
 }
 
 type fakeMultipathWrite struct {
@@ -197,9 +293,12 @@ type fakeMultipathRead struct {
 
 func newFakeMultipathPath(local string) *fakeMultipathPath {
 	return &fakeMultipathPath{
-		local:  mustMultipathUDPAddrMust(local),
-		writes: make(chan fakeMultipathWrite, 4),
-		reads:  make(chan fakeMultipathRead, 4),
+		local:        mustMultipathUDPAddrMust(local),
+		writes:       make(chan fakeMultipathWrite, 4),
+		reads:        make(chan fakeMultipathRead, 4),
+		readErrs:     make(chan error, 1),
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
 	}
 }
 
@@ -207,9 +306,20 @@ func (p *fakeMultipathPath) WritePacket(ctx context.Context, packet []byte, addr
 	if p.writeErr != nil {
 		return p.writeErr
 	}
+	if p.blockWrites {
+		p.writeStartOnce.Do(func() { close(p.writeStarted) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.closed:
+			return io.EOF
+		}
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-p.closed:
+		return io.EOF
 	case p.writes <- fakeMultipathWrite{packet: append([]byte(nil), packet...), addr: addr}:
 		return nil
 	}
@@ -219,6 +329,10 @@ func (p *fakeMultipathPath) ReadPacket(ctx context.Context) ([]byte, net.Addr, e
 	select {
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
+	case <-p.closed:
+		return nil, nil, io.EOF
+	case err := <-p.readErrs:
+		return nil, nil, err
 	case read := <-p.reads:
 		return append([]byte(nil), read.packet...), read.from, nil
 	}
@@ -229,8 +343,21 @@ func (p *fakeMultipathPath) LocalAddr() net.Addr {
 }
 
 func (p *fakeMultipathPath) Close() error {
-	p.closed = true
+	p.closeOnce.Do(func() {
+		p.closeCount.Add(1)
+		close(p.closed)
+	})
 	return nil
+}
+
+func (p *fakeMultipathPath) failRead(err error) { p.readErrs <- err }
+func (p *fakeMultipathPath) isClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *fakeMultipathPath) nextWrite(t *testing.T) fakeMultipathWrite {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,11 +15,22 @@ var ErrMultipathTransportClosed = errors.New("multipath transport closed")
 const pathAuthenticationRefreshInterval = 10 * time.Second
 
 type MultipathTransport struct {
-	paths  []Transport
-	ctx    context.Context
-	cancel context.CancelFunc
-	reads  chan multipathRead
-	once   sync.Once
+	paths         []Transport
+	pathCloseOnce []sync.Once
+	ctx           context.Context
+	cancel        context.CancelFunc
+	reads         chan multipathRead
+	readDone      chan struct{}
+	readWG        sync.WaitGroup
+	closeOnce     sync.Once
+
+	stateMu      sync.Mutex
+	pathAlive    []bool
+	pathErrors   []error
+	pathCloseErr []error
+	terminalErr  error
+	closeErr     error
+	closing      bool
 
 	pathAuthMu   sync.RWMutex
 	pathAuth     *clientPathAuthentication
@@ -52,14 +64,24 @@ func NewMultipathTransport(paths ...Transport) (*MultipathTransport, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &MultipathTransport{
-		paths:  filtered,
-		ctx:    ctx,
-		cancel: cancel,
-		reads:  make(chan multipathRead, len(filtered)),
+		paths:         filtered,
+		pathCloseOnce: make([]sync.Once, len(filtered)),
+		ctx:           ctx,
+		cancel:        cancel,
+		reads:         make(chan multipathRead, len(filtered)),
+		readDone:      make(chan struct{}),
+		pathAlive:     make([]bool, len(filtered)),
+		pathErrors:    make([]error, len(filtered)),
+		pathCloseErr:  make([]error, len(filtered)),
 	}
+	for index := range t.pathAlive {
+		t.pathAlive[index] = true
+	}
+	t.readWG.Add(len(filtered))
 	for index, path := range filtered {
 		go t.readLoop(index, path)
 	}
+	go t.finishReads()
 	return t, nil
 }
 
@@ -114,31 +136,44 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 		return err
 	}
 
-	results := make(chan error, len(t.paths))
-	for _, path := range t.paths {
-		path := path
+	indexes, terminalErr := t.activePathIndexes()
+	if len(indexes) == 0 {
+		return terminalErr
+	}
+	writeCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(t.ctx, cancel)
+	var pending atomic.Int32
+	pending.Store(int32(len(indexes)))
+
+	results := make(chan error, len(indexes))
+	for _, index := range indexes {
+		path := t.paths[index]
 		packet := append([]byte(nil), pkt...)
 		go func() {
-			results <- path.WritePacket(ctx, packet, addr)
+			defer func() {
+				if pending.Add(-1) == 0 {
+					stop()
+					cancel()
+				}
+			}()
+			results <- path.WritePacket(writeCtx, packet, addr)
 		}()
 	}
 
 	var failures []error
-	successes := 0
-	for range t.paths {
+	for range indexes {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-writeCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return t.readTerminalError()
 		case err := <-results:
 			if err == nil {
-				successes++
-				continue
+				return nil
 			}
 			failures = append(failures, err)
 		}
-	}
-	if successes > 0 {
-		return nil
 	}
 	return fmt.Errorf("write multipath packet: %w", errors.Join(failures...))
 }
@@ -150,9 +185,10 @@ func (t *MultipathTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, 
 	select {
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
-	case <-t.ctx.Done():
-		return nil, nil, ErrMultipathTransportClosed
-	case read := <-t.reads:
+	case read, ok := <-t.reads:
+		if !ok {
+			return nil, nil, t.readTerminalError()
+		}
 		return read.packet, read.from, nil
 	}
 }
@@ -168,20 +204,35 @@ func (t *MultipathTransport) Close() error {
 	if t == nil {
 		return nil
 	}
-	t.once.Do(t.cancel)
-	var failures []error
-	for _, path := range t.paths {
-		if err := path.Close(); err != nil {
-			failures = append(failures, err)
+	t.closeOnce.Do(func() {
+		t.stateMu.Lock()
+		t.closing = true
+		if t.terminalErr == nil {
+			t.terminalErr = ErrMultipathTransportClosed
 		}
-	}
-	return errors.Join(failures...)
+		t.stateMu.Unlock()
+		t.cancel()
+		for index := range t.paths {
+			t.closePath(index)
+		}
+		<-t.readDone
+
+		t.stateMu.Lock()
+		t.closeErr = errors.Join(t.pathCloseErr...)
+		t.stateMu.Unlock()
+	})
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	return t.closeErr
 }
 
 func (t *MultipathTransport) readLoop(index int, path Transport) {
+	defer t.readWG.Done()
+	defer t.closePath(index)
 	for {
 		packet, from, err := path.ReadPacket(t.ctx)
 		if err != nil {
+			t.pathTerminated(index, err)
 			return
 		}
 		if t.handlePathControl(index, path, packet, from) {
@@ -194,6 +245,76 @@ func (t *MultipathTransport) readLoop(index int, path Transport) {
 		case t.reads <- multipathRead{packet: copied, from: from}:
 		}
 	}
+}
+
+func (t *MultipathTransport) pathTerminated(index int, err error) {
+	t.stateMu.Lock()
+	if index < 0 || index >= len(t.pathAlive) || !t.pathAlive[index] {
+		t.stateMu.Unlock()
+		return
+	}
+	t.pathAlive[index] = false
+	t.pathErrors[index] = err
+	remaining := 0
+	for _, alive := range t.pathAlive {
+		if alive {
+			remaining++
+		}
+	}
+	if remaining == 0 && !t.closing && t.terminalErr == nil {
+		t.terminalErr = fmt.Errorf("all multipath read paths failed: %w", errors.Join(t.pathErrors...))
+	}
+	t.stateMu.Unlock()
+	if remaining == 0 {
+		t.cancel()
+	}
+}
+
+func (t *MultipathTransport) closePath(index int) {
+	if index < 0 || index >= len(t.paths) {
+		return
+	}
+	t.pathCloseOnce[index].Do(func() {
+		err := t.paths[index].Close()
+		t.stateMu.Lock()
+		t.pathCloseErr[index] = err
+		t.stateMu.Unlock()
+	})
+}
+
+func (t *MultipathTransport) finishReads() {
+	t.readWG.Wait()
+	t.stateMu.Lock()
+	if t.terminalErr == nil {
+		t.terminalErr = ErrMultipathTransportClosed
+	}
+	t.stateMu.Unlock()
+	close(t.reads)
+	close(t.readDone)
+}
+
+func (t *MultipathTransport) activePathIndexes() ([]int, error) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	indexes := make([]int, 0, len(t.pathAlive))
+	for index, alive := range t.pathAlive {
+		if alive {
+			indexes = append(indexes, index)
+		}
+	}
+	if len(indexes) == 0 {
+		return nil, t.terminalErr
+	}
+	return indexes, nil
+}
+
+func (t *MultipathTransport) readTerminalError() error {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	if t.terminalErr != nil {
+		return t.terminalErr
+	}
+	return ErrMultipathTransportClosed
 }
 
 func (t *MultipathTransport) handlePathControl(index int, path Transport, packet []byte, from net.Addr) bool {

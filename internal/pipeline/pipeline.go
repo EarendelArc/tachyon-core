@@ -153,10 +153,11 @@ func (p *Pipeline) handlePacket(ctx context.Context, packet []byte) error {
 		proc = pidtrack.ProcessInfo{}
 	}
 
-	decision := p.router.Decide(flow, proc)
+	var decision Decision
 	if err != nil {
-		decision.ProcessKnown = false
-		decision.Reason = "process unknown; " + decision.Reason
+		decision = p.router.DecideUnknownProcess(flow)
+	} else {
+		decision = p.router.Decide(flow, proc)
 	}
 	p.countDecision(decision.Action, len(packet))
 	if p.onDecision != nil {

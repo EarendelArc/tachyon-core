@@ -229,6 +229,7 @@ jobs:
         shell: bash
         env:
           VERIFIED_TAG: ${{ needs.verify_tag.outputs.tag }}
+          VERIFIED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -239,27 +240,7 @@ jobs:
           version="${VERIFIED_TAG}"
           mkdir -p release
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
-          (cd release && sha256sum *.zip > SHA256SUMS.txt)
-          {
-            echo "Tachyon Core ${version}"
-            echo
-            echo "This is an automated Tachyon Core release for Prism-managed downloads."
-            echo
-            echo "Alpha limitations:"
-            echo "- Tachyon Core is alpha software and is not stable or complete."
-            echo "- System proxy takeover remains disabled by default in Prism-managed alpha flows; Tachyon Core does not modify host proxy settings."
-            echo "- Client TUN auto-route and DNS hijack are unsupported and rejected by config validation."
-            echo "- Real VPS, real client, and real game UDP acceleration paths still need field testing."
-            echo "- Windows TUN uses a dynamic wintun.dll backend and still needs elevated-host validation."
-            echo "Windows users must place wintun.dll next to tachyon-core.exe."
-            echo
-            echo "Artifacts:"
-            for file in release/*.zip; do
-              echo "- $(basename "${file}")"
-            done
-            echo
-            echo "Verify downloads with SHA256SUMS.txt."
-          } > release/RELEASE_NOTES.md
+          bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 

@@ -30,24 +30,59 @@ func readReleaseWorkflow(t *testing.T) string {
 	return readRepoFile(t, ".github", "workflows", "release.yml")
 }
 
-func TestGitHubReleaseNotesPublishAlphaLimitations(t *testing.T) {
+func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
+	preparation := readRepoFile(t, ".github", "scripts", "prepare-release.sh")
+	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
 
-	required := []string{
+	for _, text := range []string{
+		`bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release`,
+		"VERIFIED_COMMIT: ${{ needs.verify_tag.outputs.commit }}",
+	} {
+		if !strings.Contains(workflow, text) {
+			t.Fatalf("release workflow is missing deterministic metadata contract %q", text)
+		}
+	}
+	if strings.Contains(workflow, "generate-notes") {
+		t.Fatal("release workflow must not depend on GitHub-generated release notes")
+	}
+
+	for _, text := range []string{
+		"# Tachyon Core ${version}",
+		"Version: \\`${version}\\`",
+		"Source commit: \\`${commit}\\`",
+		"## Compatibility",
+		"## Installation",
+		"## Verification",
+		"## Alpha limitations",
 		"Tachyon Core is alpha software and is not stable or complete.",
 		"System proxy takeover remains disabled by default in Prism-managed alpha flows",
 		"Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.",
 		"Real VPS, real client, and real game UDP acceleration paths still need field testing.",
-	}
-	for _, text := range required {
-		if !strings.Contains(workflow, text) {
-			t.Fatalf("release workflow is missing %q", text)
+		"RELEASE_NOTES.zh-CN.md",
+		"版本：\\`${version}\\`",
+		"源代码提交：\\`${commit}\\`",
+		"## 兼容性",
+		"## 安装",
+		"## 校验",
+		"## Alpha 限制",
+	} {
+		if !strings.Contains(preparation, text) {
+			t.Fatalf("release preparation script is missing %q", text)
 		}
 	}
 
-	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
-	if !strings.Contains(publication, `--notes-file "${release_dir}/RELEASE_NOTES.md"`) {
-		t.Fatal("release publication script does not use generated release notes")
+	for _, text := range []string{
+		`"${release_dir}/RELEASE_NOTES.md"`,
+		`"${release_dir}/RELEASE_NOTES.zh-CN.md"`,
+		"sha256sum --check --strict SHA256SUMS.txt",
+		`cat "${release_dir}/RELEASE_NOTES.md"`,
+		`cat "${release_dir}/RELEASE_NOTES.zh-CN.md"`,
+		`--notes-file "${body_file}"`,
+	} {
+		if !strings.Contains(publication, text) {
+			t.Fatalf("release publication script is missing bilingual publication behavior %q", text)
+		}
 	}
 }
 

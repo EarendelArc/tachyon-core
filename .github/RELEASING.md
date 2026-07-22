@@ -27,6 +27,26 @@ rebuild of the same commit does not embed the workflow wall clock in binaries or
 构建元数据和 ZIP 文件时间戳均来自已验证 commit 的 `SOURCE_DATE_EPOCH`，因此同一 commit 重构时不会把
 workflow 的实时钟表时间写入二进制或归档。
 
+## Bilingual metadata contract / 双语元数据契约
+
+`v0.1.0-alpha.20` is a historical exception with an English-only automated body and no release-note
+assets; it remains immutable. Later releases use `.github/scripts/prepare-release.sh` to generate
+`RELEASE_NOTES.md` and `RELEASE_NOTES.zh-CN.md` deterministically from the verified tag and full
+commit SHA. The GitHub Release body contains both files in English-then-Chinese order and never uses
+GitHub automatic release-note generation.
+
+`v0.1.0-alpha.20` 是历史例外，只有英文自动正文且没有 release notes 资产，并将保持不可变。
+后续 release 使用 `.github/scripts/prepare-release.sh`，根据已验证 tag 和完整 commit SHA
+确定性生成 `RELEASE_NOTES.md` 与 `RELEASE_NOTES.zh-CN.md`。GitHub Release 正文按先英文、
+后中文的顺序包含两份内容，且不使用 GitHub 自动生成 release notes。
+
+`SHA256SUMS.txt` covers exactly the six platform ZIPs and both note files. Publication verifies every
+entry before the first GitHub write, uploads both notes, the ZIPs, and the manifest exactly once to a
+new draft, then publishes only that draft.
+
+`SHA256SUMS.txt` 恰好覆盖六个平台 ZIP 和两份 notes。发布流程会在首次写入 GitHub 前校验
+每个条目，将 notes、ZIP 和 manifest 一次性上传到新 draft，最后仅发布该 draft。
+
 ## Verification modes / 验证模式
 
 - `signature`: `git verify-tag` successfully validates an annotated signed tag. A present but invalid
@@ -56,6 +76,7 @@ Run the policy checks locally with:
 
 ```bash
 bash -n .github/scripts/verify-release-tag.sh
+bash -n .github/scripts/prepare-release.sh
 bash -n .github/scripts/publish-release.sh
 bash -n .github/scripts/test-release-policy.sh
 bash .github/scripts/test-release-policy.sh

@@ -8,25 +8,15 @@ Prism-managed downloads and integration testing.
 
 ## Current Preview
 
-The current preview release is
-`v0.1.0-alpha.14` (preview tag preparation). It keeps the alpha.13
-PSK-authenticated, deny-all-by-default relay posture and adds
-`scripts/smoke-tgp-relay.sh` as a local TGP relay smoke verification entry
-point. The smoke test binds only temporary `127.0.0.1` UDP ports and covers
-PSK-authenticated handshakes, missing/wrong PSK rejection, config-driven
-client/server relay wiring, ACL allow/deny behavior, deny-all defaults,
-wildcard target rejection, and an echo-like UDP relay round trip. It does not
-start TUN, invoke Prism/Xray, enable system proxy, or change routes, firewall
-rules, systemd, Docker, or real VPS state.
+The current published preview tag is `v0.1.0-alpha.20`. That release is a
+historical exception: it has an English-only automated GitHub Release body and
+does not include release-note assets. It remains immutable and will not be
+edited or backfilled.
 
-Known limitations for this preview: local smoke is not a replacement for real
-VPS, real client, carrier/network, or target-game UDP validation; deployed
-servers should still be checked with `scripts/verify-server.sh`; relay path
-rebind/migration is fail-closed until an authenticated rebind control path
-exists; Windows TUN still needs elevated validation on real Windows hosts; and
-domain ACLs are resolved at Core startup rather than dynamically tracked. Do
-not publish or paste `tgp.auth.psk`; share only redacted diagnostics and the
-shape of `allowed_targets`.
+The deterministic bilingual contract documented below applies to releases
+after `v0.1.0-alpha.20`. Alpha limitations remain explicit in both languages;
+real VPS, real client, carrier/network, target-game UDP, and elevated Windows
+TUN validation are still required before treating Core as production-ready.
 
 The `main` branch may contain newer unreleased changes after this tag. Create a
 new release tag only after `go test ./...` and the cross-platform build matrix
@@ -43,6 +33,21 @@ git push origin v0.1.0-alpha.1
 
 The `Release` workflow can also be started manually from GitHub Actions with a
 tag input.
+
+## Bilingual Release Contract
+
+The workflow derives all release metadata from the verified tag and its full
+source commit SHA. It generates, without GitHub automatic release notes:
+
+- `RELEASE_NOTES.md`, containing the English release identity, compatibility,
+  installation, verification, and alpha limitations;
+- `RELEASE_NOTES.zh-CN.md`, containing the matching Simplified Chinese content;
+- a GitHub Release body composed from those two files, with English followed by
+  Simplified Chinese.
+
+Generation uses no workflow wall-clock value or external text generator. Given
+the same tag, commit SHA, and six ZIP files, the notes and checksum manifest are
+byte-for-byte reproducible.
 
 For local verification without publishing to GitHub, run:
 
@@ -72,7 +77,12 @@ Windows archives do not bundle `wintun.dll` yet. Prism must verify that
 `wintun.dll` exists next to the configured `tachyon-core.exe` before starting
 Core on Windows.
 
-The release also includes `SHA256SUMS.txt` for Prism-side verification.
+The release also includes `RELEASE_NOTES.md`, `RELEASE_NOTES.zh-CN.md`, and
+`SHA256SUMS.txt`. The checksum manifest covers all six ZIP files and both note
+files. The publisher verifies the complete manifest before any GitHub write,
+then uploads the complete asset set exactly once while the release is a draft.
+Only that newly created draft is published; an existing draft or published
+release causes the run to fail instead of editing or replacing it.
 
 ## Prism Contract
 
@@ -87,8 +97,10 @@ Prism should select assets by normalized platform:
 | Linux x64 | `linux_amd64` |
 | Linux ARM64 | `linux_arm64` |
 
-Prism must download `SHA256SUMS.txt`, verify the selected archive, extract the
-binary, and install it into its managed `bin` directory.
+Prism must download `SHA256SUMS.txt`, require exactly one checksum entry for the
+selected archive, verify that archive, extract the binary, and install it into
+its managed `bin` directory. Operators downloading the complete release can run
+`sha256sum --check SHA256SUMS.txt` to verify all archives and both note files.
 
 ## Server Installer Contract
 

@@ -22,13 +22,42 @@ repository=${GITHUB_REPOSITORY:-}
 [[ "${commit}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] || die "commit must be a full Git object ID"
 [[ "${prerelease}" == "true" || "${prerelease}" == "false" ]] || die "prerelease must be true or false"
 [[ "${repository}" == */* ]] || die "GITHUB_REPOSITORY must identify owner/repository"
-[[ -f "${release_dir}/RELEASE_NOTES.md" ]] || die "release notes are missing"
+[[ -f "${release_dir}/RELEASE_NOTES.md" ]] || die "English release notes are missing"
+[[ -f "${release_dir}/RELEASE_NOTES.zh-CN.md" ]] || die "Simplified Chinese release notes are missing"
 [[ -f "${release_dir}/SHA256SUMS.txt" ]] || die "checksum file is missing"
 
 shopt -s nullglob
 zip_assets=("${release_dir}"/*.zip)
 [[ ${#zip_assets[@]} -gt 0 ]] || die "release ZIP assets are missing"
-assets=("${zip_assets[@]}" "${release_dir}/SHA256SUMS.txt")
+assets=(
+  "${zip_assets[@]}"
+  "${release_dir}/RELEASE_NOTES.md"
+  "${release_dir}/RELEASE_NOTES.zh-CN.md"
+  "${release_dir}/SHA256SUMS.txt"
+)
+
+expected_checksum_entries=(RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md)
+for asset in "${zip_assets[@]}"; do
+  expected_checksum_entries+=("$(basename "${asset}")")
+done
+
+for entry in "${expected_checksum_entries[@]}"; do
+  [[ $(grep -Ec "^[0-9a-f]{64}  ${entry//./\\.}$" "${release_dir}/SHA256SUMS.txt") -eq 1 ]] || \
+    die "checksum manifest must contain exactly one entry for ${entry}"
+done
+[[ $(wc -l < "${release_dir}/SHA256SUMS.txt") -eq ${#expected_checksum_entries[@]} ]] || \
+  die "checksum manifest contains an unexpected asset set"
+(
+  cd "${release_dir}"
+  sha256sum --check --strict SHA256SUMS.txt
+) || die "release asset checksum verification failed"
+
+body_file=$(mktemp)
+{
+  cat "${release_dir}/RELEASE_NOTES.md"
+  printf '\n\n---\n\n'
+  cat "${release_dir}/RELEASE_NOTES.zh-CN.md"
+} > "${body_file}"
 
 # Only a definite not-found result permits creation. Authentication, transport,
 # and API failures must not be mistaken for release absence.
@@ -49,6 +78,8 @@ draft_id=""
 cleanup_draft() {
   local status=$?
   trap - EXIT
+
+  rm -f "${body_file}"
 
   if [[ ${status} -ne 0 && "${draft_created}" == "true" ]]; then
     if [[ -z "${draft_id}" ]]; then
@@ -86,7 +117,7 @@ gh release create "${version}" \
   --verify-tag \
   --target "${commit}" \
   --title "Tachyon Core ${version}" \
-  --notes-file "${release_dir}/RELEASE_NOTES.md" \
+  --notes-file "${body_file}" \
   "${prerelease_flag[@]}"
 draft_created=true
 

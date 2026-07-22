@@ -6,20 +6,12 @@ Windows TUN 仍需要真实管理员环境验证。这些产物主要用于 Pris
 
 ## 当前预览版本
 
-当前预览版是
-`v0.1.0-alpha.14`（预发布 tag 准备）。该版本延续 alpha.13 中
-PSK 认证、服务端 relay 默认 deny-all 的安全口径，并新增
-`scripts/smoke-tgp-relay.sh` 作为本地 TGP relay smoke 验证入口。smoke 只绑定
-临时 `127.0.0.1` UDP 端口，覆盖带 PSK 的握手、缺失/错误 PSK 拒绝、ACL
-allow/deny、client/server 配置到 relay 的运行时接线、默认 deny-all、通配全网
-目标拒绝，以及 echo-like UDP relay 往返。它不会启动 TUN、调用 Prism/Xray、启用
-系统代理，也不会修改路由、防火墙、systemd、Docker 或真实 VPS 状态。
+当前已发布的预览标签是 `v0.1.0-alpha.20`。该 release 属于历史例外：GitHub Release
+只有英文自动正文，且没有 release notes 资产。该 release 保持不可变，不会编辑或回填。
 
-该预览版的已知限制：本地 smoke 不能替代真实 VPS、真实客户端、运营商/网络和目标
-游戏 UDP 验证；部署后仍应运行 `scripts/verify-server.sh`；relay 路径迁移/重绑定在
-加入 authenticated rebind 控制路径前仍为 fail-closed；Windows TUN 仍需真实
-Windows 管理员环境验证；domain ACL 在 Core 启动时解析，暂不动态追踪。不要公开或
-粘贴 `tgp.auth.psk`，只分享脱敏诊断和 `allowed_targets` 结构。
+下述确定性双语契约从 `v0.1.0-alpha.20` 之后的 release 开始适用。中英文正文都会明确
+alpha 限制；在将 Core 视为可用于生产前，仍需完成真实 VPS、真实客户端、运营商/网络、
+目标游戏 UDP 以及具备管理员权限的 Windows TUN 验证。
 
 `main` 分支可能包含比该 tag 更新的未发布提交。只有在 `go test ./...` 和跨平台构建矩阵通过后，才应该创建新的 release tag。
 
@@ -33,6 +25,18 @@ git push origin v0.1.0-alpha.1
 ```
 
 也可以在 GitHub Actions 页面手动运行 `Release` workflow，并输入 tag。
+
+## 双语发布契约
+
+workflow 只从已验证 tag 及其完整源代码 commit SHA 派生发布元数据，不使用 GitHub
+自动生成 release notes，并生成：
+
+- `RELEASE_NOTES.md`：包含英文的发布标识、兼容性、安装、校验和 alpha 限制；
+- `RELEASE_NOTES.zh-CN.md`：包含对应的简体中文内容；
+- GitHub Release 正文：先英文、后简体中文，由上述两份文件组合而成。
+
+生成过程不读取 workflow 实时时钟，也不依赖外部文本生成器。输入相同 tag、commit SHA
+和六个 ZIP 时，notes 与 checksum manifest 必须逐字节一致。
 
 如果只需要在本地验证产物而不发布到 GitHub，可以运行：
 
@@ -61,7 +65,11 @@ workflow 会构建以下 ZIP 资产：
 Windows 压缩包暂不内置 `wintun.dll`。Prism 在 Windows 上启动 Core 前，必须检查
 配置的 `tachyon-core.exe` 同目录是否存在 `wintun.dll`。
 
-release 还会包含 `SHA256SUMS.txt`，供 Prism 下载后校验。
+release 还会包含 `RELEASE_NOTES.md`、`RELEASE_NOTES.zh-CN.md` 和
+`SHA256SUMS.txt`。checksum manifest 同时覆盖六个 ZIP 与两份 notes。publisher 在任何
+GitHub 写操作前校验完整 manifest，随后在 release 仍为 draft 时一次上传完整资产集，
+最后只发布本次新建的 draft。若已存在同标签的 draft 或正式 release，流程会失败，不会
+编辑或替换已有内容。
 
 ## Prism 下载约定
 
@@ -76,8 +84,9 @@ Prism 应按规范化平台选择资产：
 | Linux x64 | `linux_amd64` |
 | Linux ARM64 | `linux_arm64` |
 
-Prism 必须下载 `SHA256SUMS.txt`，校验选中的压缩包，解压二进制文件，并安装到
-自己的托管 `bin` 目录。
+Prism 必须下载 `SHA256SUMS.txt`，要求所选压缩包恰好有一条 checksum 记录，校验后再
+解压二进制文件并安装到自己的托管 `bin` 目录。下载完整 release 的操作者可运行
+`sha256sum --check SHA256SUMS.txt`，一次校验全部压缩包与两份 notes。
 
 ## 服务端安装脚本约定
 

@@ -43,6 +43,8 @@ tachyonctl health --addr 127.0.0.1:55123
 - JSON 是 Core 的标准配置格式。早期 YAML 文件仅作为开发兼容格式保留。
 - Core JSON 中的相对文件路径会以当前加载的配置文件所在目录为基准解析。
 
+应用感知流量接管当前状态为 **Proposed**。Windows WFP MVP 尚未实现，现有 TUN selective-route 路径属于 legacy preview。详见 [ADR-0001：应用感知流量接管](docs/adr/0001-application-aware-capture.zh-CN.md)。
+
 ## 架构
 
 ```text

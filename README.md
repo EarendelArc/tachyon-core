@@ -82,6 +82,10 @@ tachyonctl health --addr 127.0.0.1:55123
 - Relative file paths in Core JSON are resolved from the directory that contains
   the loaded config file.
 
+Application-aware capture is **Proposed**. The Windows WFP MVP is not yet
+implemented, and the current TUN selective-route path is a legacy preview. See
+[ADR-0001: Application-Aware Capture](docs/adr/0001-application-aware-capture.md).
+
 ## Architecture
 
 ```text

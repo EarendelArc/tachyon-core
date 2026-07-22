@@ -64,6 +64,59 @@ func TestRunClientGameRoutesFailClosedWhenPlatformUnsupported(t *testing.T) {
 	}
 }
 
+func TestRunClientRouteInstallerErrorStopsStartupAndClosesTUN(t *testing.T) {
+	app := newRouteTestApp(t, []string{"203.0.113.42/24"})
+	app.client.selectiveRoutesSupported = func() bool { return true }
+
+	var events []string
+	device := &routeTestDevice{
+		name: "Tachyon",
+		onClose: func() {
+			events = append(events, "tun-close")
+		},
+	}
+	app.client.newTUN = func(tun.Options) (tun.Device, error) {
+		events = append(events, "tun-created")
+		return device, nil
+	}
+	app.client.stableInterfaceLUID = func(tun.Device) uint64 { return 41 }
+
+	installErr := errors.New("route installer denied")
+	var installerTxn tun.RouteTransaction
+	app.client.installSelectiveRoutes = func(context.Context, tun.SelectiveRouteOptions) (tun.RouteTransaction, error) {
+		events = append(events, "route-installer")
+		return installerTxn, installErr
+	}
+	pidTrackerCalls := 0
+	app.client.newPIDTracker = func() (*pidtrack.Tracker, error) {
+		pidTrackerCalls++
+		return nil, errors.New("unexpected PID tracker startup")
+	}
+
+	err := app.runClient(context.Background())
+	if !errors.Is(err, installErr) {
+		t.Fatalf("runClient() error = %v, want wrapped installer error %v", err, installErr)
+	}
+	if got, want := err.Error(), "install selective game routes: route installer denied"; got != want {
+		t.Fatalf("runClient() error = %q, want %q", got, want)
+	}
+	if installerTxn != nil {
+		t.Fatalf("installer transaction = %T, want nil on installation error", installerTxn)
+	}
+	if pidTrackerCalls != 0 {
+		t.Fatalf("PID tracker startup calls = %d, want 0", pidTrackerCalls)
+	}
+	if device.readCalls != 0 || device.writeCalls != 0 {
+		t.Fatalf("TUN packet I/O calls = read %d, write %d; want no packet pipeline startup", device.readCalls, device.writeCalls)
+	}
+	if device.closeCalls != 1 {
+		t.Fatalf("TUN Close calls = %d, want 1", device.closeCalls)
+	}
+	if want := []string{"tun-created", "route-installer", "tun-close"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("resource events = %v, want %v", events, want)
+	}
+}
+
 func TestRunClientPassesCanonicalGameRoutePlanAndRollsBack(t *testing.T) {
 	app := newRouteTestApp(t, []string{
 		" 203.0.113.42/24 ",
@@ -166,15 +219,27 @@ func cloneSelectiveRouteOptions(opts tun.SelectiveRouteOptions) *tun.SelectiveRo
 type routeTestDevice struct {
 	name       string
 	closeCalls int
+	readCalls  int
+	writeCalls int
+	onClose    func()
 }
 
-func (d *routeTestDevice) Name() string                 { return d.name }
-func (*routeTestDevice) Addresses() []netip.Prefix      { return nil }
-func (*routeTestDevice) MTU() int                       { return tun.DefaultMTU }
-func (*routeTestDevice) ReadPacket([]byte) (int, error) { return 0, errors.New("unexpected TUN read") }
-func (*routeTestDevice) WritePacket([]byte) error       { return errors.New("unexpected TUN write") }
+func (d *routeTestDevice) Name() string            { return d.name }
+func (*routeTestDevice) Addresses() []netip.Prefix { return nil }
+func (*routeTestDevice) MTU() int                  { return tun.DefaultMTU }
+func (d *routeTestDevice) ReadPacket([]byte) (int, error) {
+	d.readCalls++
+	return 0, errors.New("unexpected TUN read")
+}
+func (d *routeTestDevice) WritePacket([]byte) error {
+	d.writeCalls++
+	return errors.New("unexpected TUN write")
+}
 func (d *routeTestDevice) Close() error {
 	d.closeCalls++
+	if d.onClose != nil {
+		d.onClose()
+	}
 	return nil
 }
 

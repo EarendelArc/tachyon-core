@@ -47,6 +47,15 @@ type App struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	mode   config.Mode
+	client clientRuntime
+}
+
+type clientRuntime struct {
+	selectiveRoutesSupported func() bool
+	newTUN                   func(tun.Options) (tun.Device, error)
+	stableInterfaceLUID      func(tun.Device) uint64
+	installSelectiveRoutes   func(context.Context, tun.SelectiveRouteOptions) (tun.RouteTransaction, error)
+	newPIDTracker            func() (*pidtrack.Tracker, error)
 }
 
 // New constructs and validates the application without starting any I/O.
@@ -62,6 +71,13 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		cfg:    cfg,
 		logger: logger,
 		mode:   cfg.Mode,
+		client: clientRuntime{
+			selectiveRoutesSupported: tun.SelectiveRoutesSupported,
+			newTUN:                   tun.New,
+			stableInterfaceLUID:      tun.StableInterfaceLUID,
+			installSelectiveRoutes:   tun.InstallSelectiveRoutes,
+			newPIDTracker:            pidtrack.New,
+		},
 	}, nil
 }
 
@@ -93,7 +109,7 @@ func (a *App) runClient(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(gameRoutes) > 0 && !tun.SelectiveRoutesSupported() {
+	if len(gameRoutes) > 0 && !a.client.selectiveRoutesSupported() {
 		return fmt.Errorf("install client.tun.game_routes: %w", tun.ErrSelectiveRoutesUnsupported)
 	}
 	remoteAddr := clientTGPRemoteAddr(a.cfg.Client.Proxy)
@@ -105,11 +121,12 @@ func (a *App) runClient(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tun.PlanSelectiveRoutes(gameRoutes, relayAddrs); err != nil {
+	plannedRoutes, err := tun.PlanSelectiveRoutes(gameRoutes, relayAddrs)
+	if err != nil {
 		return fmt.Errorf("validate client.tun.game_routes: %w", err)
 	}
 
-	tunDevice, err := tun.New(tun.Options{
+	tunDevice, err := a.client.newTUN(tun.Options{
 		Name:      a.cfg.Client.TUN.Name,
 		Addresses: tunPrefixes,
 		MTU:       a.cfg.Client.TUN.MTU,
@@ -128,10 +145,10 @@ func (a *App) runClient(ctx context.Context) error {
 		"addresses", tunDevice.Addresses(),
 		"mtu", tunDevice.MTU(),
 	)
-	routeTxn, err := tun.InstallSelectiveRoutes(ctx, tun.SelectiveRouteOptions{
+	routeTxn, err := a.client.installSelectiveRoutes(ctx, tun.SelectiveRouteOptions{
 		InterfaceName: tunDevice.Name(),
-		InterfaceLUID: tun.StableInterfaceLUID(tunDevice),
-		Destinations:  gameRoutes,
+		InterfaceLUID: a.client.stableInterfaceLUID(tunDevice),
+		Destinations:  plannedRoutes,
 		Excluded:      relayAddrs,
 	})
 	if err != nil {
@@ -147,7 +164,7 @@ func (a *App) runClient(ctx context.Context) error {
 		"relay_exclusions", relayAddrs,
 	)
 
-	tracker, err := pidtrack.New()
+	tracker, err := a.client.newPIDTracker()
 	if err != nil {
 		return fmt.Errorf("create PID tracker: %w", err)
 	}

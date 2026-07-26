@@ -114,7 +114,7 @@ func TestMultipathTransportSuccessfulResultWinsConcurrentClose(t *testing.T) {
 			paths:       make([]Transport, 2),
 			terminalErr: ErrMultipathTransportClosed,
 		}
-		writeCtx, writeCancel := context.WithCancel(context.Background())
+		_, writeCancel := context.WithCancel(context.Background())
 		results := make(chan multipathWriteResult, 2)
 		results <- multipathWriteResult{index: 0, err: errors.New("path down")}
 		results <- multipathWriteResult{index: 1}
@@ -125,7 +125,6 @@ func TestMultipathTransportSuccessfulResultWinsConcurrentClose(t *testing.T) {
 		transportCancel()
 		err := transport.awaitWriteResults(
 			context.Background(),
-			writeCtx,
 			writeCancel,
 			[]int{0, 1},
 			results,
@@ -133,6 +132,56 @@ func TestMultipathTransportSuccessfulResultWinsConcurrentClose(t *testing.T) {
 		if err != nil {
 			t.Fatalf("iteration %d: concurrent success lost to close: %v", iteration, err)
 		}
+	}
+}
+
+func TestMultipathTransportCallerCancelDoesNotWaitForNonCooperativeWrite(t *testing.T) {
+	path := newNonCooperativeWritePath()
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- transport.WritePacket(ctx, []byte("blocked"), mustMultipathUDPAddrMust("127.0.0.1:443"))
+	}()
+	path.waitStarted(t)
+	cancel()
+	assertMultipathWriteReturns(t, done, context.Canceled)
+	close(path.releaseWrite)
+}
+
+func TestMultipathTransportCloseDoesNotWaitForNonCooperativeWrite(t *testing.T) {
+	path := newNonCooperativeWritePath()
+	transport, err := NewMultipathTransport(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- transport.WritePacket(context.Background(), []byte("blocked"), mustMultipathUDPAddrMust("127.0.0.1:443"))
+	}()
+	path.waitStarted(t)
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertMultipathWriteReturns(t, done, ErrMultipathTransportClosed)
+	close(path.releaseWrite)
+}
+
+func assertMultipathWriteReturns(t *testing.T, done <-chan error, want error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) {
+			t.Fatalf("write error = %v, want %v", err, want)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("write did not return within cancellation bound")
 	}
 }
 
@@ -329,6 +378,55 @@ type fakeMultipathWrite struct {
 type fakeMultipathRead struct {
 	packet []byte
 	from   net.Addr
+}
+
+type nonCooperativeWritePath struct {
+	started      chan struct{}
+	releaseWrite chan struct{}
+	closed       chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newNonCooperativeWritePath() *nonCooperativeWritePath {
+	return &nonCooperativeWritePath{
+		started:      make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (p *nonCooperativeWritePath) WritePacket(context.Context, []byte, net.Addr) error {
+	p.startOnce.Do(func() { close(p.started) })
+	<-p.releaseWrite
+	return errors.New("released contract-violating write")
+}
+
+func (p *nonCooperativeWritePath) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-p.closed:
+		return nil, nil, io.EOF
+	}
+}
+
+func (p *nonCooperativeWritePath) LocalAddr() net.Addr {
+	return mustMultipathUDPAddrMust("127.0.0.1:10003")
+}
+
+func (p *nonCooperativeWritePath) Close() error {
+	p.closeOnce.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (p *nonCooperativeWritePath) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.started:
+	case <-time.After(time.Second):
+		t.Fatal("non-cooperative write did not start")
+	}
 }
 
 func newFakeMultipathPath(local string) *fakeMultipathPath {

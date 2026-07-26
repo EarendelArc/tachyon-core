@@ -5,13 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
-const defaultReadPollInterval = 100 * time.Millisecond
-
 type UDPTransport struct {
-	conn net.PacketConn
+	conn    net.PacketConn
+	readMu  sync.Mutex
+	writeMu sync.Mutex
 }
 
 func ListenUDP(addr string) (*UDPTransport, error) {
@@ -36,41 +37,84 @@ func (t *UDPTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Add
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = t.conn.SetWriteDeadline(deadline)
-		defer t.conn.SetWriteDeadline(time.Time{})
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if _, err := t.conn.WriteTo(pkt, addr); err != nil {
-		return fmt.Errorf("write udp packet: %w", err)
+	deadline, _ := ctx.Deadline()
+	if err := t.conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("set udp write deadline: %w", err)
+	}
+	stop, interrupted := interruptPacketConnOnCancel(ctx, func(deadline time.Time) error {
+		return t.conn.SetWriteDeadline(deadline)
+	})
+	_, writeErr := t.conn.WriteTo(pkt, addr)
+	stop()
+	<-interrupted
+	clearErr := t.conn.SetWriteDeadline(time.Time{})
+	if writeErr != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("write udp packet: %w", writeErr)
+	}
+	if clearErr != nil {
+		return fmt.Errorf("clear udp write deadline: %w", clearErr)
 	}
 	return nil
+}
+
+func interruptPacketConnOnCancel(ctx context.Context, setDeadline func(time.Time) error) (func(), <-chan struct{}) {
+	done := make(chan struct{})
+	stopAfterFunc := context.AfterFunc(ctx, func() {
+		_ = setDeadline(time.Now())
+		close(done)
+	})
+	stop := func() {
+		if stopAfterFunc() {
+			close(done)
+		}
+	}
+	return stop, done
 }
 
 func (t *UDPTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {
 	if t == nil || t.conn == nil {
 		return nil, nil, errors.New("nil udp transport")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	t.readMu.Lock()
+	defer t.readMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	deadline, _ := ctx.Deadline()
+	if err := t.conn.SetReadDeadline(deadline); err != nil {
+		return nil, nil, fmt.Errorf("set udp read deadline: %w", err)
+	}
+	stop, interrupted := interruptPacketConnOnCancel(ctx, func(deadline time.Time) error {
+		return t.conn.SetReadDeadline(deadline)
+	})
 	buf := make([]byte, 65535)
-	for {
+	n, from, readErr := t.conn.ReadFrom(buf)
+	stop()
+	<-interrupted
+	clearErr := t.conn.SetReadDeadline(time.Time{})
+	if readErr != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		_ = t.conn.SetReadDeadline(time.Now().Add(defaultReadPollInterval))
-		n, from, err := t.conn.ReadFrom(buf)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue
-			}
-			if ctx.Err() != nil {
-				return nil, nil, ctx.Err()
-			}
-			return nil, nil, fmt.Errorf("read udp packet: %w", err)
-		}
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		return pkt, from, nil
+		return nil, nil, fmt.Errorf("read udp packet: %w", readErr)
 	}
+	if clearErr != nil {
+		return nil, nil, fmt.Errorf("clear udp read deadline: %w", clearErr)
+	}
+	pkt := make([]byte, n)
+	copy(pkt, buf[:n])
+	return pkt, from, nil
 }
 
 func (t *UDPTransport) LocalAddr() net.Addr {

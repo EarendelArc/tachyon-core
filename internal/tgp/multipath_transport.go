@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -147,8 +146,8 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 	}
 	writeCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(t.ctx, cancel)
-	var pending atomic.Int32
-	pending.Store(int32(len(indexes)))
+	defer stop()
+	defer cancel()
 
 	results := make(chan multipathWriteResult, len(indexes))
 	for _, index := range indexes {
@@ -159,29 +158,20 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 				index: index,
 				err:   path.WritePacket(writeCtx, packet, addr),
 			}
-			// Publishing the result before canceling the shared context is the
-			// critical ordering guarantee. Once Done is observable, every worker
-			// result is already available in the buffered channel.
 			results <- result
-			if pending.Add(-1) == 0 {
-				stop()
-				cancel()
-			}
 		}(index)
 	}
-	return t.awaitWriteResults(ctx, writeCtx, cancel, indexes, results)
+	return t.awaitWriteResults(ctx, cancel, indexes, results)
 }
 
 func (t *MultipathTransport) awaitWriteResults(
 	callerCtx context.Context,
-	writeCtx context.Context,
 	cancel context.CancelFunc,
 	indexes []int,
 	results <-chan multipathWriteResult,
 ) error {
 	failures := make([]error, len(t.paths))
 	completed := 0
-	canceled := false
 	consume := func(result multipathWriteResult) bool {
 		completed++
 		if result.err == nil {
@@ -190,28 +180,26 @@ func (t *MultipathTransport) awaitWriteResults(
 		failures[result.index] = result.err
 		return false
 	}
+	drainPublished := func() bool {
+		for completed < len(indexes) {
+			select {
+			case result := <-results:
+				if consume(result) {
+					return true
+				}
+			default:
+				return false
+			}
+		}
+		return false
+	}
 
 	for completed < len(indexes) {
-		if canceled {
-			// Every started worker publishes exactly one buffered result. Once
-			// cancellation is visible, collecting the remaining publications
-			// prevents a concurrent success from being hidden by ctx.Done().
-			if consume(<-results) {
-				return nil
-			}
-			continue
+		if drainPublished() {
+			return nil
 		}
-
-		// A worker publishes its result before any lifecycle signal is
-		// interpreted. Draining that buffered result first establishes the
-		// success-before-return ordering even when Close races the last write.
-		select {
-		case result := <-results:
-			if consume(result) {
-				return nil
-			}
-			continue
-		default:
+		if completed == len(indexes) {
+			break
 		}
 
 		select {
@@ -219,12 +207,18 @@ func (t *MultipathTransport) awaitWriteResults(
 			if consume(result) {
 				return nil
 			}
-		case <-writeCtx.Done():
+		case <-callerCtx.Done():
 			cancel()
-			canceled = true
+			if drainPublished() {
+				return nil
+			}
+			return callerCtx.Err()
 		case <-t.ctx.Done():
 			cancel()
-			canceled = true
+			if drainPublished() {
+				return nil
+			}
+			return t.readTerminalError()
 		}
 	}
 	if err := callerCtx.Err(); err != nil {

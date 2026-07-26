@@ -180,6 +180,13 @@ PacketNumber 使用有界滑动 anti-replay 窗口。已授权路径的数据可
 错误并关闭会话，ClientManager 会在下一次发送时建立新会话。Manager 关闭是不可逆
 状态，会取消正在进行的握手，且不会安装关闭后才返回的会话。
 
+每个 `Transport` 实现都必须在 context 取消或调用 `Close` 时，让
+`ReadPacket` 与 `WritePacket` 及时返回。内置 UDP transport 会用临时 deadline
+打断阻塞 socket 操作，并在下一次操作前清除 deadline。Multipath adapter 在取消或
+关闭后不会等待不合规路径，但仍优先采用已经发布的成功结果；它不会启动额外的 drain
+goroutine。Go 无法强制终止同时忽略 context 和 close 的方法，因此这类实现内部残留的
+goroutine 属于 transport 合同违规，adapter 无法安全回收。
+
 ### 6.1 数据报大小与 PMTU
 
 `tgp.max_datagram_size` 限制完整加密 TGP UDP payload。默认值为 1352，协议最大值为

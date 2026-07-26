@@ -322,6 +322,17 @@ allows the client manager to create a fresh session on the next send. Closing
 the manager is irreversible and cancels an in-flight handshake; it never
 installs a session returned after closure.
 
+Every `Transport` implementation must make both `ReadPacket` and `WritePacket`
+return promptly when its context is canceled or `Close` is called. The built-in
+UDP transport interrupts blocking socket operations with temporary deadlines
+and clears those deadlines before the next operation. The multipath adapter
+returns to its caller without waiting for a non-compliant path after
+cancellation or close, while still preferring any success already published.
+It does not start a drain goroutine. Go cannot forcibly terminate a method that
+ignores both context and close, so any goroutine retained inside such an
+implementation is a transport contract violation rather than a lifecycle the
+adapter can safely reclaim.
+
 ### 6.1 Datagram Size and PMTU
 
 `tgp.max_datagram_size` caps the complete encrypted TGP UDP payload. The

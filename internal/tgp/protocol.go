@@ -206,10 +206,13 @@ type FECCodec interface {
 // On multipath configurations, multiple Transports may be composed behind a
 // MultipathTransport adapter that fans out writes to all paths simultaneously.
 type Transport interface {
-	// WritePacket sends a single encoded TGP packet to addr.
+	// WritePacket sends a single encoded TGP packet to addr. Implementations
+	// must return promptly when ctx is canceled or Close is called.
 	WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error
 	// ReadPacket blocks until a packet arrives. The returned slice is owned by
 	// the caller; Transport may reuse the buffer on the next call.
+	// Implementations must return promptly when ctx is canceled or Close is
+	// called.
 	ReadPacket(ctx context.Context) (pkt []byte, from net.Addr, err error)
 	// LocalAddr returns the local UDP address.
 	LocalAddr() net.Addr

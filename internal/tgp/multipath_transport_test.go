@@ -83,16 +83,56 @@ func TestMultipathTransportSucceedsWhenOnePathWrites(t *testing.T) {
 func TestMultipathTransportFailsWhenAllPathsFail(t *testing.T) {
 	left := newFakeMultipathPath("127.0.0.1:10001")
 	right := newFakeMultipathPath("127.0.0.1:10002")
-	left.writeErr = errors.New("left path down")
-	right.writeErr = errors.New("right path down")
+	leftErr := errors.New("left path down")
+	rightErr := errors.New("right path down")
+	left.writeErr = leftErr
+	right.writeErr = rightErr
 	transport, err := NewMultipathTransport(left, right)
 	if err != nil {
 		t.Fatalf("new multipath transport: %v", err)
 	}
 	defer transport.Close()
 
-	if err := transport.WritePacket(context.Background(), []byte("payload"), mustMultipathUDPAddr(t, "127.0.0.1:443")); err == nil {
+	err = transport.WritePacket(context.Background(), []byte("payload"), mustMultipathUDPAddr(t, "127.0.0.1:443"))
+	if err == nil {
 		t.Fatal("all path failure should fail")
+	}
+	if !errors.Is(err, leftErr) || !errors.Is(err, rightErr) {
+		t.Fatalf("aggregate error = %v, want both path failures", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "path 0: left path down\npath 1: right path down") {
+		t.Fatalf("aggregate error order = %q, want stable path order", got)
+	}
+}
+
+func TestMultipathTransportSuccessfulResultWinsConcurrentClose(t *testing.T) {
+	for iteration := 0; iteration < 5000; iteration++ {
+		transportCtx, transportCancel := context.WithCancel(context.Background())
+		transport := &MultipathTransport{
+			ctx:         transportCtx,
+			cancel:      transportCancel,
+			paths:       make([]Transport, 2),
+			terminalErr: ErrMultipathTransportClosed,
+		}
+		writeCtx, writeCancel := context.WithCancel(context.Background())
+		results := make(chan multipathWriteResult, 2)
+		results <- multipathWriteResult{index: 0, err: errors.New("path down")}
+		results <- multipathWriteResult{index: 1}
+
+		// Both the final successful worker publication and transport close are
+		// ready before aggregation starts. The result publication must win
+		// deterministically rather than depending on select case selection.
+		transportCancel()
+		err := transport.awaitWriteResults(
+			context.Background(),
+			writeCtx,
+			writeCancel,
+			[]int{0, 1},
+			results,
+		)
+		if err != nil {
+			t.Fatalf("iteration %d: concurrent success lost to close: %v", iteration, err)
+		}
 	}
 }
 

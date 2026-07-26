@@ -51,6 +51,11 @@ type multipathRead struct {
 	from   net.Addr
 }
 
+type multipathWriteResult struct {
+	index int
+	err   error
+}
+
 func NewMultipathTransport(paths ...Transport) (*MultipathTransport, error) {
 	filtered := make([]Transport, 0, len(paths))
 	for _, path := range paths {
@@ -145,37 +150,97 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 	var pending atomic.Int32
 	pending.Store(int32(len(indexes)))
 
-	results := make(chan error, len(indexes))
+	results := make(chan multipathWriteResult, len(indexes))
 	for _, index := range indexes {
 		path := t.paths[index]
 		packet := append([]byte(nil), pkt...)
-		go func() {
-			defer func() {
-				if pending.Add(-1) == 0 {
-					stop()
-					cancel()
-				}
-			}()
-			results <- path.WritePacket(writeCtx, packet, addr)
-		}()
+		go func(index int) {
+			result := multipathWriteResult{
+				index: index,
+				err:   path.WritePacket(writeCtx, packet, addr),
+			}
+			// Publishing the result before canceling the shared context is the
+			// critical ordering guarantee. Once Done is observable, every worker
+			// result is already available in the buffered channel.
+			results <- result
+			if pending.Add(-1) == 0 {
+				stop()
+				cancel()
+			}
+		}(index)
+	}
+	return t.awaitWriteResults(ctx, writeCtx, cancel, indexes, results)
+}
+
+func (t *MultipathTransport) awaitWriteResults(
+	callerCtx context.Context,
+	writeCtx context.Context,
+	cancel context.CancelFunc,
+	indexes []int,
+	results <-chan multipathWriteResult,
+) error {
+	failures := make([]error, len(t.paths))
+	completed := 0
+	canceled := false
+	consume := func(result multipathWriteResult) bool {
+		completed++
+		if result.err == nil {
+			return true
+		}
+		failures[result.index] = result.err
+		return false
 	}
 
-	var failures []error
-	for range indexes {
-		select {
-		case <-writeCtx.Done():
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return t.readTerminalError()
-		case err := <-results:
-			if err == nil {
+	for completed < len(indexes) {
+		if canceled {
+			// Every started worker publishes exactly one buffered result. Once
+			// cancellation is visible, collecting the remaining publications
+			// prevents a concurrent success from being hidden by ctx.Done().
+			if consume(<-results) {
 				return nil
 			}
-			failures = append(failures, err)
+			continue
+		}
+
+		// A worker publishes its result before any lifecycle signal is
+		// interpreted. Draining that buffered result first establishes the
+		// success-before-return ordering even when Close races the last write.
+		select {
+		case result := <-results:
+			if consume(result) {
+				return nil
+			}
+			continue
+		default:
+		}
+
+		select {
+		case result := <-results:
+			if consume(result) {
+				return nil
+			}
+		case <-writeCtx.Done():
+			cancel()
+			canceled = true
+		case <-t.ctx.Done():
+			cancel()
+			canceled = true
 		}
 	}
-	return fmt.Errorf("write multipath packet: %w", errors.Join(failures...))
+	if err := callerCtx.Err(); err != nil {
+		return err
+	}
+	if t.ctx.Err() != nil {
+		return t.readTerminalError()
+	}
+
+	ordered := make([]error, 0, len(indexes))
+	for _, index := range indexes {
+		if failures[index] != nil {
+			ordered = append(ordered, fmt.Errorf("path %d: %w", index, failures[index]))
+		}
+	}
+	return fmt.Errorf("write multipath packet: %w", errors.Join(ordered...))
 }
 
 func (t *MultipathTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error) {

@@ -86,8 +86,13 @@ For `Hello`, `UnixMilliseconds` is the caller/config handshake expiry; for
 client nonce. The effective client timeout is the earlier of the caller
 deadline and `tgp.handshake_timeout`, and is capped at 30 seconds. The relay
 rejects expired Hellos and expiry values more than 30 seconds in the future.
-Duplicate authenticated Hellos receive the cached ACK only until the signed
-Hello expiry and for at most eight replays. Ended Session IDs enter a bounded
+The client sends at most four copies of one authenticated Hello: the initial
+attempt plus three loss-recovery attempts using 100 ms, 200 ms, 400 ms, and
+800 ms receive windows. Every send and backoff is bounded by the earlier
+caller/config deadline; reaching that absolute deadline terminates immediately
+without waiting for asynchronous context timer state. Duplicate authenticated
+Hellos receive the cached ACK only until the signed Hello expiry and for at
+most three replays, matching the client's remaining attempts. Ended Session IDs enter a bounded
 4096-entry, 30-second tombstone set so an old valid Hello cannot recreate an
 ended session. Handshake wire versions 1 through 3 are rejected.
 

@@ -306,21 +306,63 @@ func TestHandshakeRetransmitsAfterDroppedFirstAck(t *testing.T) {
 }
 
 func TestHandshakeAllHellosLostHonorsDeadline(t *testing.T) {
-	base, err := ListenUDP("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	transport := &handshakeTestTransport{Transport: base}
-	transport.dropHello.Store(100)
-	ctx, cancel := context.WithTimeout(context.Background(), 260*time.Millisecond)
+	startedAt := time.Now()
+	deadline := startedAt.Add(250 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
+	clock := newAdvancingHandshakeClock(startedAt)
+	transport := &immediateHandshakeTimeoutTransport{}
 
-	_, err = dialSessionWithTransport(ctx, transport, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}, SessionRuntimeOptions{PacerPPS: 100000})
+	_, err := dialSessionWithTransportClock(ctx, transport, handshakeTestRemoteAddr(), SessionRuntimeOptions{PacerPPS: 100000}, clock.runtime())
 	if !errors.Is(err, ErrHandshakeTimeout) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("dial error = %v, want handshake deadline", err)
 	}
-	if got := transport.helloWrites.Load(); got < 2 || got > 4 {
-		t.Fatalf("hello writes = %d, want bounded retries", got)
+	if got := transport.helloWrites.Load(); got != 2 {
+		t.Fatalf("hello writes = %d, want 2 before caller deadline", got)
+	}
+	if got := clock.current(); !got.Equal(deadline) {
+		t.Fatalf("clock = %s, want caller deadline %s", got, deadline)
+	}
+	if !transport.closed.Load() {
+		t.Fatal("timed-out handshake did not close transport")
+	}
+}
+
+func TestHandshakeAllHellosLostStopsAtMaximumAttempts(t *testing.T) {
+	startedAt := time.Now()
+	ctx, cancel := context.WithDeadline(context.Background(), startedAt.Add(10*time.Second))
+	defer cancel()
+	clock := newAdvancingHandshakeClock(startedAt)
+	transport := &immediateHandshakeTimeoutTransport{}
+
+	_, err := dialSessionWithTransportClock(ctx, transport, handshakeTestRemoteAddr(), SessionRuntimeOptions{PacerPPS: 100000}, clock.runtime())
+	if !errors.Is(err, ErrHandshakeTimeout) {
+		t.Fatalf("dial error = %v, want handshake timeout", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("maximum-attempt error unexpectedly reported caller deadline: %v", err)
+	}
+	if got := transport.helloWrites.Load(); got != MaxHandshakeAttempts {
+		t.Fatalf("hello writes = %d, want %d", got, MaxHandshakeAttempts)
+	}
+	wantElapsed := handshakeInitialRetry + 2*handshakeInitialRetry + 4*handshakeInitialRetry + handshakeMaxRetry
+	if got := clock.current().Sub(startedAt); got != wantElapsed {
+		t.Fatalf("retry schedule elapsed = %s, want %s", got, wantElapsed)
+	}
+	if !transport.closed.Load() {
+		t.Fatal("attempt-exhausted handshake did not close transport")
+	}
+}
+
+func TestHandshakeDeadlineComparisonDoesNotWaitForContextTimer(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("context timer fired before boundary check: %v", err)
+	}
+	if err := handshakeDeadlineError(ctx, deadline, deadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline boundary error = %v, want %v", err, context.DeadlineExceeded)
 	}
 }
 
@@ -392,6 +434,62 @@ type handshakeTestTransport struct {
 	helloWrites  atomic.Int32
 	ackWrites    atomic.Int32
 	duplicateAck bool
+}
+
+type advancingHandshakeClock struct {
+	now time.Time
+}
+
+func newAdvancingHandshakeClock(now time.Time) *advancingHandshakeClock {
+	return &advancingHandshakeClock{now: now}
+}
+
+func (c *advancingHandshakeClock) runtime() handshakeClock {
+	return handshakeClock{
+		now: c.current,
+		waitUntil: func(ctx context.Context, deadline time.Time) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if deadline.After(c.now) {
+				c.now = deadline
+			}
+			return nil
+		},
+	}
+}
+
+func (c *advancingHandshakeClock) current() time.Time {
+	return c.now
+}
+
+type immediateHandshakeTimeoutTransport struct {
+	helloWrites atomic.Int32
+	closed      atomic.Bool
+}
+
+func (t *immediateHandshakeTimeoutTransport) WritePacket(_ context.Context, packet []byte, _ net.Addr) error {
+	if msg, err := parseHandshake(packet); err == nil && msg.msgType == handshakeHello {
+		t.helloWrites.Add(1)
+	}
+	return nil
+}
+
+func (t *immediateHandshakeTimeoutTransport) ReadPacket(context.Context) ([]byte, net.Addr, error) {
+	return nil, nil, context.DeadlineExceeded
+}
+
+func (t *immediateHandshakeTimeoutTransport) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39001}
+}
+
+func (t *immediateHandshakeTimeoutTransport) Close() error {
+	t.closed.Store(true)
+	return nil
+}
+
+func handshakeTestRemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39002}
 }
 
 func (t *handshakeTestTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Addr) error {

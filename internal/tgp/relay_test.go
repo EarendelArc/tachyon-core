@@ -125,6 +125,33 @@ func TestRelayRetransmitsDroppedFirstHandshakeAck(t *testing.T) {
 	}
 }
 
+func TestRelayHandshakeAckReplayMatchesClientAttemptBudget(t *testing.T) {
+	transport := newPathControlCaptureTransport()
+	router := newRelayTransportRouter(transport, 1, 1)
+	now := time.Now()
+	router.now = func() time.Time { return now }
+	peer := mustRelayUDPAddr(t, "127.0.0.1:10444")
+	var sessionID SessionID
+	copy(sessionID[:], []byte("ack-replay-budget"))
+	hello := []byte("authenticated hello")
+	ack := []byte("authenticated ack")
+	router.registerHandshakeReplay(sessionID, hello, ack, peer, now.Add(time.Second))
+
+	envelope := relayPacketEnvelope{packet: hello, from: peer}
+	for replay := 0; replay < MaxHandshakeAttempts-1; replay++ {
+		if !router.replayHandshakeAck(context.Background(), sessionID, envelope) {
+			t.Fatalf("replay %d was rejected inside client attempt budget", replay+1)
+		}
+		write := transport.nextWrite(t)
+		if !bytes.Equal(write.packet, ack) || !sameAddr(write.addr, peer) {
+			t.Fatalf("replay %d = %#v, want cached ACK to original peer", replay+1, write)
+		}
+	}
+	if router.replayHandshakeAck(context.Background(), sessionID, envelope) {
+		t.Fatalf("relay accepted more than %d duplicate Hellos", MaxHandshakeAttempts-1)
+	}
+}
+
 func TestRelayRejectsEndedSessionHelloReplay(t *testing.T) {
 	transport := newPathControlCaptureTransport()
 	router := newRelayTransportRouter(transport, 2, 2)

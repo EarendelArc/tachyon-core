@@ -19,7 +19,8 @@ const (
 	handshakeSequence     = 0
 	handshakeInitialRetry = 100 * time.Millisecond
 	handshakeMaxRetry     = 800 * time.Millisecond
-	handshakeReplayLimit  = 8
+	MaxHandshakeAttempts  = 4
+	handshakeReplayLimit  = MaxHandshakeAttempts - 1
 	MaxHandshakeTimeout   = 30 * time.Second
 )
 
@@ -54,6 +55,29 @@ type handshakeMessage struct {
 	unixMilli       int64
 	nonce           [handshakeNonceSize]byte
 	authTag         []byte
+}
+
+type handshakeClock struct {
+	now       func() time.Time
+	waitUntil func(context.Context, time.Time) error
+}
+
+var systemHandshakeClock = handshakeClock{
+	now: time.Now,
+	waitUntil: func(ctx context.Context, deadline time.Time) error {
+		delay := time.Until(deadline)
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	},
 }
 
 func DialSession(ctx context.Context, localAddr string, remoteAddr net.Addr, pacerPPS float64) (*DatagramSession, error) {
@@ -105,7 +129,15 @@ func DialSessionMultipathWithOptions(ctx context.Context, localAddrs []string, r
 }
 
 func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAddr net.Addr, opts SessionRuntimeOptions) (*DatagramSession, error) {
-	handshakeCtx, cancelHandshake := handshakeDeadlineContext(ctx)
+	return dialSessionWithTransportClock(ctx, transport, remoteAddr, opts, systemHandshakeClock)
+}
+
+func dialSessionWithTransportClock(ctx context.Context, transport Transport, remoteAddr net.Addr, opts SessionRuntimeOptions, clock handshakeClock) (*DatagramSession, error) {
+	if clock.now == nil || clock.waitUntil == nil {
+		_ = transport.Close()
+		return nil, errors.New("tgp handshake clock is required")
+	}
+	handshakeCtx, cancelHandshake := handshakeDeadlineContext(ctx, clock.now())
 	defer cancelHandshake()
 	handshakeDeadline, _ := handshakeCtx.Deadline()
 	localMaxDatagramSize, err := normalizeMaxDatagramSize(opts.MaxDatagramSize)
@@ -135,31 +167,56 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		return nil, err
 	}
 	retryDelay := handshakeInitialRetry
-	for {
-		if err := handshakeCtx.Err(); err != nil {
+	for attempt := 1; attempt <= MaxHandshakeAttempts; attempt++ {
+		if err := handshakeDeadlineError(handshakeCtx, handshakeDeadline, clock.now()); err != nil {
 			_ = transport.Close()
 			return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, err)
 		}
-		helloSentAt := time.Now()
+		helloSentAt := clock.now()
 		if err := transport.WritePacket(handshakeCtx, hello, remoteAddr); err != nil {
 			_ = transport.Close()
-			if handshakeCtx.Err() != nil {
-				return nil, fmt.Errorf("%w: sending hello: %w", ErrHandshakeTimeout, handshakeCtx.Err())
+			if deadlineErr := handshakeDeadlineError(handshakeCtx, handshakeDeadline, clock.now()); deadlineErr != nil {
+				return nil, fmt.Errorf("%w: sending hello: %w", ErrHandshakeTimeout, deadlineErr)
 			}
 			return nil, err
 		}
 
-		attemptCtx, cancel := context.WithTimeout(handshakeCtx, retryDelay)
+		attemptDeadline := helloSentAt.Add(retryDelay)
+		if attemptDeadline.After(handshakeDeadline) {
+			attemptDeadline = handshakeDeadline
+		}
+		attemptCtx, cancel := context.WithDeadline(handshakeCtx, attemptDeadline)
 		for {
+			now := clock.now()
+			if deadlineErr := handshakeDeadlineError(handshakeCtx, handshakeDeadline, now); deadlineErr != nil {
+				cancel()
+				_ = transport.Close()
+				return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, deadlineErr)
+			}
+			if !now.Before(attemptDeadline) {
+				cancel()
+				break
+			}
 			wire, from, err := transport.ReadPacket(attemptCtx)
-			ackReceivedAt := time.Now()
+			ackReceivedAt := clock.now()
 			if err != nil {
 				cancel()
-				if handshakeCtx.Err() != nil {
+				if deadlineErr := handshakeDeadlineError(handshakeCtx, handshakeDeadline, ackReceivedAt); deadlineErr != nil {
 					_ = transport.Close()
-					return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, handshakeCtx.Err())
+					return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, deadlineErr)
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					if waitErr := clock.waitUntil(handshakeCtx, attemptDeadline); waitErr != nil {
+						_ = transport.Close()
+						if deadlineErr := handshakeDeadlineError(handshakeCtx, handshakeDeadline, clock.now()); deadlineErr != nil {
+							return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, deadlineErr)
+						}
+						return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, waitErr)
+					}
+					if deadlineErr := handshakeDeadlineError(handshakeCtx, handshakeDeadline, clock.now()); deadlineErr != nil {
+						_ = transport.Close()
+						return nil, fmt.Errorf("%w: waiting for hello ack: %w", ErrHandshakeTimeout, deadlineErr)
+					}
 					break
 				}
 				_ = transport.Close()
@@ -219,6 +276,8 @@ func dialSessionWithTransport(ctx context.Context, transport Transport, remoteAd
 		}
 		retryDelay = min(retryDelay*2, handshakeMaxRetry)
 	}
+	_ = transport.Close()
+	return nil, fmt.Errorf("%w: maximum of %d hello attempts exhausted", ErrHandshakeTimeout, MaxHandshakeAttempts)
 }
 
 func AcceptSession(ctx context.Context, transport Transport, pacerPPS float64) (*DatagramSession, error) {
@@ -409,12 +468,19 @@ func estimateRelayClockOffset(helloSentAt, ackReceivedAt time.Time, relayUnixMil
 	return time.UnixMilli(relayUnixMilli).Sub(ackReceivedAt), nil
 }
 
-func handshakeDeadlineContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	maxDeadline := time.Now().Add(MaxHandshakeTimeout)
+func handshakeDeadlineContext(ctx context.Context, now time.Time) (context.Context, context.CancelFunc) {
+	maxDeadline := now.Add(MaxHandshakeTimeout)
 	if deadline, ok := ctx.Deadline(); ok && !deadline.After(maxDeadline) {
 		return context.WithCancel(ctx)
 	}
 	return context.WithDeadline(ctx, maxDeadline)
+}
+
+func handshakeDeadlineError(ctx context.Context, deadline, now time.Time) error {
+	if !now.Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return ctx.Err()
 }
 
 func validateHandshakeHelloFreshness(msg handshakeMessage, now time.Time) error {

@@ -42,6 +42,11 @@ func TestMultipathTransportUsesRelayClockOffsetForPathRequests(t *testing.T) {
 func TestMultipathTransportFansOutWrites(t *testing.T) {
 	left := newFakeMultipathPath("127.0.0.1:10001")
 	right := newFakeMultipathPath("127.0.0.1:10002")
+	writeBarrier := make(chan struct{})
+	left.writeArrived = make(chan struct{}, 1)
+	right.writeArrived = make(chan struct{}, 1)
+	left.writeRelease = writeBarrier
+	right.writeRelease = writeBarrier
 	transport, err := NewMultipathTransport(left, right)
 	if err != nil {
 		t.Fatalf("new multipath transport: %v", err)
@@ -50,17 +55,50 @@ func TestMultipathTransportFansOutWrites(t *testing.T) {
 
 	remote := mustMultipathUDPAddr(t, "127.0.0.1:443")
 	payload := []byte("game packet")
-	if err := transport.WritePacket(context.Background(), payload, remote); err != nil {
-		t.Fatalf("write packet: %v", err)
-	}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- transport.WritePacket(context.Background(), payload, remote) }()
+	left.waitWriteArrived(t)
+	right.waitWriteArrived(t)
+	close(writeBarrier)
 
 	leftWrite := left.nextWrite(t)
 	rightWrite := right.nextWrite(t)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write packet: %v", err)
+	}
 	if string(leftWrite.packet) != string(payload) || string(rightWrite.packet) != string(payload) {
 		t.Fatalf("fanout payload mismatch: %q %q", leftWrite.packet, rightWrite.packet)
 	}
 	if leftWrite.addr.String() != remote.String() || rightWrite.addr.String() != remote.String() {
 		t.Fatalf("fanout remote mismatch: %v %v", leftWrite.addr, rightWrite.addr)
+	}
+}
+
+func TestMultipathTransportFirstSuccessDoesNotCancelSiblingFanout(t *testing.T) {
+	fast := newFakeMultipathPath("127.0.0.1:10001")
+	slow := newFakeMultipathPath("127.0.0.1:10002")
+	slow.writeArrived = make(chan struct{}, 1)
+	slowRelease := make(chan struct{})
+	slow.writeRelease = slowRelease
+	transport, err := NewMultipathTransport(fast, slow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	remote := mustMultipathUDPAddr(t, "127.0.0.1:443")
+	done := make(chan error, 1)
+	go func() { done <- transport.WritePacket(context.Background(), []byte("fanout"), remote) }()
+	slow.waitWriteArrived(t)
+	_ = fast.nextWrite(t)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	close(slowRelease)
+	write := slow.nextWrite(t)
+	if string(write.packet) != "fanout" || write.addr.String() != remote.String() {
+		t.Fatalf("delayed fanout write = %q to %v", write.packet, write.addr)
 	}
 }
 
@@ -365,6 +403,8 @@ type fakeMultipathPath struct {
 	blockWrites    bool
 	writeStarted   chan struct{}
 	writeStartOnce sync.Once
+	writeArrived   chan struct{}
+	writeRelease   <-chan struct{}
 	closed         chan struct{}
 	closeOnce      sync.Once
 	closeCount     atomic.Int32
@@ -441,6 +481,18 @@ func newFakeMultipathPath(local string) *fakeMultipathPath {
 }
 
 func (p *fakeMultipathPath) WritePacket(ctx context.Context, packet []byte, addr net.Addr) error {
+	if p.writeArrived != nil {
+		p.writeArrived <- struct{}{}
+	}
+	if p.writeRelease != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.closed:
+			return io.EOF
+		case <-p.writeRelease:
+		}
+	}
 	if p.writeErr != nil {
 		return p.writeErr
 	}
@@ -460,6 +512,15 @@ func (p *fakeMultipathPath) WritePacket(ctx context.Context, packet []byte, addr
 		return io.EOF
 	case p.writes <- fakeMultipathWrite{packet: append([]byte(nil), packet...), addr: addr}:
 		return nil
+	}
+}
+
+func (p *fakeMultipathPath) waitWriteArrived(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.writeArrived:
+	case <-time.After(time.Second):
+		t.Fatal("multipath write did not reach the synchronization barrier")
 	}
 }
 

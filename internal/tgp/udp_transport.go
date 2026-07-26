@@ -42,7 +42,7 @@ func (t *UDPTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Add
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	deadline, _ := ctx.Deadline()
+	deadline, hasDeadline := ctx.Deadline()
 	if err := t.conn.SetWriteDeadline(deadline); err != nil {
 		return fmt.Errorf("set udp write deadline: %w", err)
 	}
@@ -54,15 +54,35 @@ func (t *UDPTransport) WritePacket(ctx context.Context, pkt []byte, addr net.Add
 	<-interrupted
 	clearErr := t.conn.SetWriteDeadline(time.Time{})
 	if writeErr != nil {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return fmt.Errorf("write udp packet: %w", writeErr)
+		return normalizePacketConnError(ctx, deadline, hasDeadline, "write udp packet", writeErr)
 	}
 	if clearErr != nil {
 		return fmt.Errorf("clear udp write deadline: %w", clearErr)
 	}
 	return nil
+}
+
+func normalizePacketConnError(ctx context.Context, deadline time.Time, hasDeadline bool, operation string, operationErr error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var timeoutErr interface{ Timeout() bool }
+	if hasDeadline && errors.As(operationErr, &timeoutErr) && timeoutErr.Timeout() {
+		// The socket deadline and the context timer are armed independently. The
+		// socket can report its timeout just before context.Err observes the same
+		// deadline. The recorded deadline identifies that boundary without
+		// reclassifying an unrelated, earlier socket timeout.
+		if !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	return fmt.Errorf("%s: %w", operation, operationErr)
 }
 
 func interruptPacketConnOnCancel(ctx context.Context, setDeadline func(time.Time) error) (func(), <-chan struct{}) {
@@ -91,7 +111,7 @@ func (t *UDPTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error)
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	deadline, _ := ctx.Deadline()
+	deadline, hasDeadline := ctx.Deadline()
 	if err := t.conn.SetReadDeadline(deadline); err != nil {
 		return nil, nil, fmt.Errorf("set udp read deadline: %w", err)
 	}
@@ -104,10 +124,7 @@ func (t *UDPTransport) ReadPacket(ctx context.Context) ([]byte, net.Addr, error)
 	<-interrupted
 	clearErr := t.conn.SetReadDeadline(time.Time{})
 	if readErr != nil {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		return nil, nil, fmt.Errorf("read udp packet: %w", readErr)
+		return nil, nil, normalizePacketConnError(ctx, deadline, hasDeadline, "read udp packet", readErr)
 	}
 	if clearErr != nil {
 		return nil, nil, fmt.Errorf("clear udp read deadline: %w", clearErr)

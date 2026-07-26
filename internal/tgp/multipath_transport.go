@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -146,10 +147,10 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 	}
 	writeCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(t.ctx, cancel)
-	defer stop()
-	defer cancel()
 
 	results := make(chan multipathWriteResult, len(indexes))
+	var pending atomic.Int32
+	pending.Store(int32(len(indexes)))
 	for _, index := range indexes {
 		path := t.paths[index]
 		packet := append([]byte(nil), pkt...)
@@ -159,6 +160,10 @@ func (t *MultipathTransport) WritePacket(ctx context.Context, pkt []byte, addr n
 				err:   path.WritePacket(writeCtx, packet, addr),
 			}
 			results <- result
+			if pending.Add(-1) == 0 {
+				stop()
+				cancel()
+			}
 		}(index)
 	}
 	return t.awaitWriteResults(ctx, cancel, indexes, results)

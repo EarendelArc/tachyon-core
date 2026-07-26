@@ -127,6 +127,80 @@ func TestUDPTransportRepeatedCancelDoesNotAccumulateGoroutines(t *testing.T) {
 	}
 }
 
+func TestUDPTransportMapsElapsedContextSocketDeadline(t *testing.T) {
+	remote := mustMultipathUDPAddr(t, "127.0.0.1:443")
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			conn := &immediateTimeoutPacketConn{}
+			transport := NewUDPTransport(conn)
+			ctx := &deadlinePendingContext{
+				deadline: time.Now().Add(-time.Millisecond),
+				done:     make(chan struct{}),
+			}
+
+			var err error
+			if operation == "read" {
+				_, _, err = transport.ReadPacket(ctx)
+			} else {
+				err = transport.WritePacket(ctx, []byte("packet"), remote)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s error = %v, want context.DeadlineExceeded", operation, err)
+			}
+		})
+	}
+}
+
+func TestUDPTransportDoesNotMapIndependentSocketTimeout(t *testing.T) {
+	remote := mustMultipathUDPAddr(t, "127.0.0.1:443")
+	tests := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "no context deadline", ctx: context.Background()},
+		{name: "socket timeout before context deadline", ctx: &deadlinePendingContext{
+			deadline: time.Now().Add(time.Hour),
+			done:     make(chan struct{}),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := NewUDPTransport(&immediateTimeoutPacketConn{})
+			err := transport.WritePacket(tt.ctx, []byte("packet"), remote)
+			if err == nil {
+				t.Fatal("independent socket timeout unexpectedly succeeded")
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("independent socket timeout was mapped to context deadline: %v", err)
+			}
+		})
+	}
+}
+
+type deadlinePendingContext struct {
+	deadline time.Time
+	done     <-chan struct{}
+}
+
+func (c *deadlinePendingContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *deadlinePendingContext) Done() <-chan struct{}       { return c.done }
+func (c *deadlinePendingContext) Err() error                  { return nil }
+func (c *deadlinePendingContext) Value(any) any               { return nil }
+
+type immediateTimeoutPacketConn struct{}
+
+func (*immediateTimeoutPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: testTimeoutError{}}
+}
+func (*immediateTimeoutPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, &net.OpError{Op: "write", Net: "udp", Err: testTimeoutError{}}
+}
+func (*immediateTimeoutPacketConn) Close() error                     { return nil }
+func (*immediateTimeoutPacketConn) LocalAddr() net.Addr              { return nil }
+func (*immediateTimeoutPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*immediateTimeoutPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*immediateTimeoutPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
 type blockingWritePacketConn struct {
 	mu            sync.Mutex
 	writeDeadline time.Time

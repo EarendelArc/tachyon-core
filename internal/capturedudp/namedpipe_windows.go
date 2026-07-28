@@ -35,7 +35,6 @@ var (
 type windowsPipeConnection struct {
 	handle    windows.Handle
 	readMu    sync.Mutex
-	writeMu   sync.Mutex
 	closeOnce sync.Once
 }
 
@@ -144,9 +143,10 @@ func (server *windowsNamedPipeServer) Run(ctx context.Context) error {
 		if ctx.Err() != nil || closed {
 			return nil
 		}
-		if err != nil && !errors.Is(err, ErrNamedPipeIdleTimeout) {
-			return err
-		}
+		// Authentication, protocol, idle, EOF, and broken read/write failures
+		// belong to this connection. Cleanup above is complete before a fresh
+		// listener instance is created. Only listener creation is server-fatal.
+		_ = err
 		next, createErr := server.createConnection()
 		if createErr != nil {
 			return createErr
@@ -173,7 +173,7 @@ func (server *windowsNamedPipeServer) serveConnection(ctx context.Context, conne
 	if err != nil {
 		return err
 	}
-	session := newNamedPipeControllerSession(connection, server.sender, server.config.OperationTimeout)
+	session := newNamedPipeControllerSession(ctx, connection, server.sender, server.config.OperationTimeout)
 	server.mu.Lock()
 	if server.closed || server.active != connection {
 		server.mu.Unlock()
@@ -477,8 +477,6 @@ func (connection *windowsPipeConnection) ReadFull(ctx context.Context, destinati
 }
 
 func (connection *windowsPipeConnection) WriteFull(ctx context.Context, source []byte) error {
-	connection.writeMu.Lock()
-	defer connection.writeMu.Unlock()
 	for len(source) != 0 {
 		written, err := connection.write(ctx, source)
 		if err != nil {

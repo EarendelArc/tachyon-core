@@ -69,9 +69,21 @@ helper as a server-originated `Delivery`. v1 peers and helper-originated reply
 frames fail closed. `named_pipe` capture mode does not create or run the legacy
 TUN pipeline, so the two capture paths cannot double-deliver.
 
-An idle timeout, when configured, closes only the current connection. The
-listener cleans controller/lease state and continues accepting clients. Write
-and operation deadlines remain bounded independently.
+Any per-connection read, write, broken-pipe, EOF, authentication, protocol, or
+idle failure closes only that connection. The listener revokes its controller
+and leases before accepting another client. Only listener-instance creation
+failure or context cancellation terminates the service.
+
+Every helper request gets an independent `operation_timeout` context inherited
+by real TGP dialing, handshake, pacing, and send work. Timeout maps to the stable
+Timeout status and does not block the next frame. Hello, Response, Pong, and
+Delivery share one bounded writer queue. Queue wait and in-flight I/O are
+cancelable, use a strict per-write budget, and are all awakened by close; there
+is no unbounded mutex wait or second hidden write timeout.
+
+The Windows E2E gate runs a real in-process Named Pipe to `ClientManager` to
+loopback TGP Relay to identity-checked Delivery path without creating a TUN or
+changing system routes.
 
 ```text
 AttachTransport(verified transport) -> one-use token

@@ -20,6 +20,7 @@ const (
 	namedPipeDefaultTimeout         = 10 * time.Second
 	namedPipeMaxTimeout             = 30 * time.Second
 	namedPipeMaxIdleTimeout         = 24 * time.Hour
+	namedPipeWriteQueueSize         = 32
 )
 
 var (

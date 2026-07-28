@@ -15,13 +15,113 @@ import (
 type namedPipeControllerSession struct {
 	mu               sync.RWMutex
 	controller       *Controller
-	transport        namedPipeFrameIO
 	sender           NamedPipeDatagramSender
 	operationTimeout time.Duration
+	writer           *namedPipeWriter
 }
 
-func newNamedPipeControllerSession(transport namedPipeFrameIO, sender NamedPipeDatagramSender, operationTimeout time.Duration) *namedPipeControllerSession {
-	return &namedPipeControllerSession{transport: transport, sender: sender, operationTimeout: operationTimeout}
+type namedPipeWriteRequest struct {
+	ctx    context.Context
+	wire   []byte
+	result chan error
+}
+
+type namedPipeWriter struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	transport namedPipeFrameIO
+	timeout   time.Duration
+	queue     chan namedPipeWriteRequest
+	done      chan struct{}
+}
+
+func newNamedPipeWriter(ctx context.Context, transport namedPipeFrameIO, timeout time.Duration) *namedPipeWriter {
+	writerCtx, cancel := context.WithCancel(ctx)
+	writer := &namedPipeWriter{
+		ctx: writerCtx, cancel: cancel, transport: transport, timeout: timeout,
+		queue: make(chan namedPipeWriteRequest, namedPipeWriteQueueSize), done: make(chan struct{}),
+	}
+	go writer.run()
+	return writer
+}
+
+func (writer *namedPipeWriter) WriteFrame(ctx context.Context, frame namedPipeFrame) error {
+	wire, err := marshalNamedPipeFrame(frame)
+	if err != nil {
+		return err
+	}
+	request := namedPipeWriteRequest{ctx: ctx, wire: wire, result: make(chan error, 1)}
+	select {
+	case writer.queue <- request:
+	case <-ctx.Done():
+		clear(wire)
+		return normalizeNamedPipeContextError(ctx, ctx.Err())
+	case <-writer.done:
+		clear(wire)
+		return ErrClosed
+	}
+	select {
+	case err := <-request.result:
+		return err
+	case <-ctx.Done():
+		return normalizeNamedPipeContextError(ctx, ctx.Err())
+	case <-writer.done:
+		return ErrClosed
+	}
+}
+
+func (writer *namedPipeWriter) run() {
+	defer close(writer.done)
+	for {
+		select {
+		case request := <-writer.queue:
+			if err := request.ctx.Err(); err != nil {
+				clear(request.wire)
+				request.result <- normalizeNamedPipeContextError(request.ctx, err)
+				continue
+			}
+			writeCtx, cancel := context.WithTimeout(writer.ctx, writer.timeout)
+			stopCaller := context.AfterFunc(request.ctx, cancel)
+			err := writer.transport.WriteFull(writeCtx, request.wire)
+			if request.ctx.Err() != nil {
+				err = normalizeNamedPipeContextError(request.ctx, errors.Join(err, request.ctx.Err()))
+			} else {
+				err = normalizeNamedPipeContextError(writeCtx, err)
+			}
+			stopCaller()
+			cancel()
+			clear(request.wire)
+			request.result <- err
+			if err != nil {
+				// A partial or failed frame makes the byte stream unusable. Cancel
+				// the connection so its blocked reader exits and the listener can
+				// revoke this controller before accepting a replacement.
+				writer.cancel()
+			}
+		case <-writer.ctx.Done():
+			for {
+				select {
+				case request := <-writer.queue:
+					clear(request.wire)
+					request.result <- ErrClosed
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (writer *namedPipeWriter) Close() {
+	writer.cancel()
+	<-writer.done
+}
+
+func newNamedPipeControllerSession(ctx context.Context, transport namedPipeFrameIO, sender NamedPipeDatagramSender, operationTimeout time.Duration) *namedPipeControllerSession {
+	return &namedPipeControllerSession{
+		sender: sender, operationTimeout: operationTimeout,
+		writer: newNamedPipeWriter(ctx, transport, operationTimeout),
+	}
 }
 
 func (session *namedPipeControllerSession) bind(controller *Controller) {
@@ -39,6 +139,8 @@ func (session *namedPipeControllerSession) unbind(controller *Controller) {
 }
 
 func (session *namedPipeControllerSession) DeliverReply(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	operationCtx, cancel := context.WithTimeout(ctx, session.operationTimeout)
+	defer cancel()
 	session.mu.RLock()
 	controller := session.controller
 	session.mu.RUnlock()
@@ -56,8 +158,21 @@ func (session *namedPipeControllerSession) DeliverReply(ctx context.Context, dat
 	payload = append(payload, delivery.LeaseNonce[:]...)
 	payload = append(payload, delivery.Payload...)
 	defer clear(payload)
-	return writeNamedPipeFrameWithTimeout(ctx, session.transport,
-		namedPipeFrame{Type: pipeMessageDelivery, Payload: payload}, session.operationTimeout)
+	return session.writer.WriteFrame(operationCtx, namedPipeFrame{Type: pipeMessageDelivery, Payload: payload})
+}
+
+func (session *namedPipeControllerSession) WriteFrame(ctx context.Context, frame namedPipeFrame) error {
+	writeCtx, cancel := context.WithTimeout(ctx, session.operationTimeout)
+	defer cancel()
+	return session.writer.WriteFrame(writeCtx, frame)
+}
+
+func (session *namedPipeControllerSession) Close() {
+	session.writer.Close()
+}
+
+func (session *namedPipeControllerSession) Context() context.Context {
+	return session.writer.ctx
 }
 
 func serveNamedPipeController(
@@ -78,7 +193,9 @@ func serveNamedPipeController(
 		return err
 	}
 	var controller *Controller
+	connectionCtx := session.Context()
 	defer func() {
+		session.Close()
 		if controller != nil {
 			session.unbind(controller)
 			resultErr = errors.Join(resultErr, controller.Close())
@@ -88,7 +205,7 @@ func serveNamedPipeController(
 	}()
 
 	helloPayload := append([]byte(nil), token[:]...)
-	if err := writeNamedPipeFrameWithTimeout(ctx, transport, namedPipeFrame{Type: pipeMessageHello, Payload: helloPayload}, operationTimeout); err != nil {
+	if err := session.WriteFrame(connectionCtx, namedPipeFrame{Type: pipeMessageHello, Payload: helloPayload}); err != nil {
 		clear(helloPayload)
 		clear(token[:])
 		return err
@@ -97,7 +214,7 @@ func serveNamedPipeController(
 
 	var lastRequestID uint64
 	for {
-		frame, err := readNamedPipeFrameWithIdleTimeout(ctx, transport, idleTimeout)
+		frame, err := readNamedPipeFrameWithIdleTimeout(connectionCtx, transport, idleTimeout)
 		if err != nil {
 			clear(token[:])
 			if isNamedPipeEOF(err) {
@@ -122,8 +239,7 @@ func serveNamedPipeController(
 			if frame.Type != pipeMessageAuthenticate {
 				clear(frame.Payload)
 				clear(token[:])
-				_ = writeNamedPipeFrameWithTimeout(ctx, transport,
-					namedPipeResponse(requestID, frame.Type, pipeStatusUnauthorized, nil), operationTimeout)
+				_ = session.WriteFrame(connectionCtx, namedPipeResponse(requestID, frame.Type, pipeStatusUnauthorized, nil))
 				return ErrAuthentication
 			}
 			presented, decodeErr := decoder.take(SessionTokenSize)
@@ -142,8 +258,8 @@ func serveNamedPipeController(
 			clear(frame.Payload)
 			clear(token[:])
 			status := statusForError(decodeErr)
-			if writeErr := writeNamedPipeFrameWithTimeout(ctx, transport,
-				namedPipeResponse(requestID, frame.Type, status, nil), operationTimeout); writeErr != nil {
+			if writeErr := session.WriteFrame(connectionCtx,
+				namedPipeResponse(requestID, frame.Type, status, nil)); writeErr != nil {
 				return writeErr
 			}
 			if decodeErr != nil {
@@ -152,7 +268,9 @@ func serveNamedPipeController(
 			continue
 		}
 
-		responseData, release, terminal, operationErr := handleNamedPipeOperation(ctx, controller, sender, frame.Type, decoder)
+		operationCtx, operationCancel := context.WithTimeout(connectionCtx, operationTimeout)
+		responseData, release, terminal, operationErr := handleNamedPipeOperation(operationCtx, controller, sender, frame.Type, decoder)
+		operationCancel()
 		clear(frame.Payload)
 		response := namedPipeResponse(requestID, frame.Type, statusForError(operationErr), responseData)
 		if frame.Type == pipeMessagePing && operationErr == nil {
@@ -161,7 +279,7 @@ func serveNamedPipeController(
 			response = namedPipeFrame{Type: pipeMessagePong, Payload: pongPayload}
 		}
 		clear(responseData)
-		writeErr := writeNamedPipeFrameWithTimeout(ctx, transport, response, operationTimeout)
+		writeErr := session.WriteFrame(connectionCtx, response)
 		clear(response.Payload)
 		if release != nil {
 			release()
@@ -367,18 +485,6 @@ func readNamedPipeFrameWithIdleTimeout(
 		return namedPipeFrame{}, errors.Join(ErrNamedPipeIdleTimeout, err)
 	}
 	return frame, normalizeNamedPipeContextError(operationContext, err)
-}
-
-func writeNamedPipeFrameWithTimeout(
-	ctx context.Context,
-	transport namedPipeFrameIO,
-	frame namedPipeFrame,
-	timeout time.Duration,
-) error {
-	operationContext, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	err := writeNamedPipeFrame(operationContext, transport, frame)
-	return normalizeNamedPipeContextError(operationContext, err)
 }
 
 func normalizeNamedPipeContextError(ctx context.Context, err error) error {

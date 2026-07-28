@@ -3,15 +3,285 @@
 package capturedudp
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/tgp"
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsNamedPipeTGPClientManagerRelayDeliveryE2E(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	relayTransport, err := tgp.ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := tgp.NewRelay(tgp.RelayOptions{
+		Transport: relayTransport, PacerPPS: 100000,
+		Handler: tgp.RelayHandlerFunc(func(ctx context.Context, packet tgp.RelayPacket) error {
+			datagram, err := tgp.ParseTunnelDatagram(packet.Payload)
+			if err != nil {
+				return err
+			}
+			datagram.Payload = append([]byte("relay:"), datagram.Payload...)
+			wire, err := tgp.MarshalTunnelDatagram(datagram)
+			if err != nil {
+				return err
+			}
+			return packet.Session.SendPacket(ctx, 0, wire)
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	relayResult := make(chan error, 1)
+	go func() { relayResult <- relay.ListenAndServe(ctx) }()
+
+	var sinkMu sync.RWMutex
+	var sink NamedPipeServer
+	manager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
+		RemoteAddr: relayTransport.LocalAddr().String(), LocalAddr: "127.0.0.1:0",
+		PacerPPS: 100000, HandshakeTimeout: time.Second,
+		OnDatagram: func(ctx context.Context, datagram tgp.TunnelDatagram) error {
+			sinkMu.RLock()
+			server := sink
+			sinkMu.RUnlock()
+			if server == nil {
+				return ErrTransportNotVerified
+			}
+			return server.DeliverReply(ctx, datagram)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	sid, integrity := currentWindowsTestIdentity(t)
+	registry := testRegistry(t, Limits{})
+	server, err := NewNamedPipeServer(registry, NamedPipeConfig{
+		Name: uniqueWindowsPipeName(t), AllowedSIDs: []string{sid}, MinimumIntegrityRID: integrity,
+		OperationTimeout: 2 * time.Second, AllowInsecureUserSID: true,
+	}, clientManagerNamedPipeSender{manager: manager})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sinkMu.Lock()
+	sink = server
+	sinkMu.Unlock()
+	defer server.Close()
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- server.Run(ctx) }()
+
+	pipeName := server.(*windowsNamedPipeServer).config.Name
+	handle := openWindowsPipeClient(t, pipeName)
+	client := &windowsPipeConnection{handle: handle}
+	hello, err := readNamedPipeFrame(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := uint64(1)
+	auth := appendRequestID(nil, requestID)
+	auth = append(auth, hello.Payload...)
+	mustPipeStatusOK(t, ctx, client, pipeMessageAuthenticate, requestID, auth)
+	requestID++
+	prepare := appendRequestID(nil, requestID)
+	prepare = appendUint64(prepare, 1)
+	transaction := mustPipeResponseData(t, ctx, client, pipeMessagePrepareGeneration, requestID, prepare)
+	requestID++
+	commit := appendRequestID(nil, requestID)
+	commit = append(commit, transaction...)
+	mustPipeStatusOK(t, ctx, client, pipeMessageCommitGeneration, requestID, commit)
+
+	spec := testFlow(77, 1, "198.18.0.2:53000", "203.0.113.9:27015")
+	requestID++
+	openFlow, err := encodePipeFlowSpec(requestID, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseWire := mustPipeResponseData(t, ctx, client, pipeMessageOpenFlow, requestID, openFlow)
+	var lease FlowLease
+	copy(lease.FlowID[:], leaseWire[:16])
+	lease.Generation = binary.BigEndian.Uint64(leaseWire[16:24])
+	copy(lease.LeaseNonce[:], leaseWire[24:40])
+	requestID++
+	datagram := appendRequestID(nil, requestID)
+	datagram = append(datagram, lease.FlowID[:]...)
+	datagram = appendUint64(datagram, lease.Generation)
+	datagram = append(datagram, lease.LeaseNonce[:]...)
+	datagram = appendUint64(datagram, 1)
+	datagram = append(datagram, "ping"...)
+	if err := writeNamedPipeFrame(ctx, client, namedPipeFrame{Type: pipeMessageDatagram, Payload: datagram}); err != nil {
+		t.Fatal(err)
+	}
+	var gotResponse, gotDelivery bool
+	for !gotResponse || !gotDelivery {
+		frame, err := readNamedPipeFrame(ctx, client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch frame.Type {
+		case pipeMessageResponse:
+			responseID, operation, status, _, err := decodePipeResponse(frame)
+			if err != nil || responseID != requestID || operation != pipeMessageDatagram || status != pipeStatusOK {
+				t.Fatalf("datagram response id=%d operation=%d status=%d error=%v", responseID, operation, status, err)
+			}
+			gotResponse = true
+		case pipeMessageDelivery:
+			if len(frame.Payload) != 50 || !bytes.Equal(frame.Payload[:16], lease.FlowID[:]) ||
+				binary.BigEndian.Uint64(frame.Payload[16:24]) != lease.Generation ||
+				!bytes.Equal(frame.Payload[24:40], lease.LeaseNonce[:]) || string(frame.Payload[40:]) != "relay:ping" {
+				t.Fatalf("invalid delivery payload %x", frame.Payload)
+			}
+			gotDelivery = true
+		default:
+			t.Fatalf("unexpected frame type %d", frame.Type)
+		}
+	}
+	_ = windows.CloseHandle(handle)
+	waitForCapturedUDPHealth(t, registry, func(health Health) bool {
+		return !health.TransportAttached && !health.ControllerConnected && health.OpenFlows == 0
+	})
+	cancel()
+	_ = server.Close()
+	select {
+	case err := <-serverResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("named pipe server did not stop")
+	}
+	select {
+	case err := <-relayResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not stop")
+	}
+}
+
+type clientManagerNamedPipeSender struct {
+	manager *tgp.ClientManager
+}
+
+func TestWindowsNamedPipeWriteBreakAllowsSecondClient(t *testing.T) {
+	sid, integrity := currentWindowsTestIdentity(t)
+	registry := testRegistry(t, Limits{})
+	sender := &gatedNamedPipeDatagramSender{started: make(chan struct{}), release: make(chan struct{})}
+	config := NamedPipeConfig{
+		Name: uniqueWindowsPipeName(t), AllowedSIDs: []string{sid}, MinimumIntegrityRID: integrity,
+		OperationTimeout: time.Second, AllowInsecureUserSID: true,
+	}
+	server, err := NewNamedPipeServer(registry, config, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- server.Run(ctx) }()
+	clientHandle := openWindowsPipeClient(t, config.Name)
+	client := &windowsPipeConnection{handle: clientHandle}
+	operationCtx, operationCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer operationCancel()
+	hello, err := readNamedPipeFrame(operationCtx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := uint64(1)
+	auth := appendRequestID(nil, requestID)
+	auth = append(auth, hello.Payload...)
+	mustPipeStatusOK(t, operationCtx, client, pipeMessageAuthenticate, requestID, auth)
+	requestID++
+	prepare := appendRequestID(nil, requestID)
+	prepare = appendUint64(prepare, 1)
+	transaction := mustPipeResponseData(t, operationCtx, client, pipeMessagePrepareGeneration, requestID, prepare)
+	requestID++
+	commit := appendRequestID(nil, requestID)
+	commit = append(commit, transaction...)
+	mustPipeStatusOK(t, operationCtx, client, pipeMessageCommitGeneration, requestID, commit)
+	spec := testFlow(9, 1, "198.18.0.2:53000", "203.0.113.9:27015")
+	requestID++
+	openFlow, err := encodePipeFlowSpec(requestID, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseWire := mustPipeResponseData(t, operationCtx, client, pipeMessageOpenFlow, requestID, openFlow)
+	requestID++
+	datagram := appendRequestID(nil, requestID)
+	datagram = append(datagram, leaseWire[:16]...)
+	datagram = append(datagram, leaseWire[16:24]...)
+	datagram = append(datagram, leaseWire[24:40]...)
+	datagram = appendUint64(datagram, 1)
+	datagram = append(datagram, "break-write"...)
+	if err := writeNamedPipeFrame(operationCtx, client, namedPipeFrame{Type: pipeMessageDatagram, Payload: datagram}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sender.started:
+	case <-operationCtx.Done():
+		t.Fatal(operationCtx.Err())
+	}
+	_ = windows.CloseHandle(clientHandle)
+	close(sender.release)
+	waitForCapturedUDPHealth(t, registry, func(health Health) bool {
+		return !health.TransportAttached && !health.ControllerConnected && !health.Ready
+	})
+	replacement := openWindowsPipeClient(t, config.Name)
+	replacementClient := &windowsPipeConnection{handle: replacement}
+	replacementHello, err := readNamedPipeFrame(operationCtx, replacementClient)
+	if err != nil || replacementHello.Type != pipeMessageHello {
+		t.Fatalf("write-break reconnect hello type=%d error=%v", replacementHello.Type, err)
+	}
+	_ = windows.CloseHandle(replacement)
+	cancel()
+	_ = server.Close()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after write-break reconnect")
+	}
+}
+
+type gatedNamedPipeDatagramSender struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (sender *gatedNamedPipeDatagramSender) SendDatagram(ctx context.Context, _ tgp.TunnelDatagram) error {
+	select {
+	case <-sender.started:
+	default:
+		close(sender.started)
+	}
+	select {
+	case <-sender.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (sender clientManagerNamedPipeSender) SendDatagram(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	wire, err := tgp.MarshalTunnelDatagram(datagram)
+	if err != nil {
+		return err
+	}
+	return sender.manager.SendPacket(ctx, 0, wire)
+}
 
 func TestNamedPipeACLRequiresExplicitPreviewForUserSID(t *testing.T) {
 	sid, _ := currentWindowsTestIdentity(t)

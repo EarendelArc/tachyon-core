@@ -38,15 +38,17 @@ attachment 都有仅由其来源 registry 接受的内部随机 256-bit capabili
 Detach 是排他的。生命周期不可逆（`new -> attached -> detached/closed`）：存在
 active attachment/controller 时不能替换，外部实例不能撤销，失败或未验证的尝试不得
 改变状态。Detach、controller close 与 registry close 会原子清零 capability 和对端
-verified 状态；stale attachment 永远不能再次取得 token。未来同包内 Named Pipe transport 必须先验证 OS
-对端，才能创建已验证 attachment。仅当以下条件全部成立时，`Health.Ready` 才为 true：
+verified 状态；stale attachment 永远不能再次取得 token。Windows Named Pipe transport
+会先验证被模拟的对端 token，再创建已验证 attachment。Service SID 可匹配启用的 token
+group 或 restricted SID；普通用户 SID 只能匹配 `TokenUser`，且需要显式 insecure preview
+开关。仅当以下条件全部成立时，`Health.Ready` 才为 true：
 
 - transport 已连接；
 - transport 的 OS 对端已验证；
 - 恰好一个 controller 已连接；
 - 一个已 commit 的 policy generation 正在生效。
 
-当前没有任何代码路径声称 OS 对端已经通过验证。
+非 Windows 构建明确返回 unsupported。
 
 ## Controller 契约
 
@@ -55,9 +57,15 @@ token，并把唯一 controller capability 绑定到该 attachment。Controller 
 断开时，capability、prepared policy、active policy 和 flow lease 全部撤销。已经交给
 调用方的 payload 会继续占用全局字节预算，直到调用方执行 `Release()`。
 
-未来所有 transport 都必须在 EOF、broken pipe、受监管 helper 退出或意外崩溃时同步
-执行 attachment detach 或 controller close，之后才能重连或报告 Ready。这是未来
-transport 的不变量；当前仍未实现 Named Pipe transport。
+所有 transport 都必须在 EOF、broken pipe、受监管 helper 退出或意外崩溃时同步执行
+attachment detach 或 controller close，之后才能重连或报告 Ready。Named Pipe server
+已执行该不变量：任意单连接 read/write/idle/EOF 错误只清理当前 controller 与 lease，
+listener 随后继续接受新客户端；只有 listener 创建失败或 context 取消才终止服务。
+
+每个 helper 请求使用独立 `operation_timeout` context。真实 TGP 拨号、握手、pacing 和
+发送继承该 context；超时映射为稳定 Timeout 状态，不阻塞下一帧。Hello、Response、Pong
+和 Delivery 共用单 writer 有界队列；排队与在途写都可取消，写预算从排队后的严格请求
+期限计算，连接关闭会立即唤醒所有等待者。
 
 ```text
 AttachTransport(verified transport) -> one-use token
@@ -132,8 +140,9 @@ AEAD tag、FEC 长度前缀、v2 身份和 endpoint 编码开销，再预留或�
 
 ## Windows x64 封闭 Alpha 顺序
 
-1. 在契约外实现带版本和长度前缀的 Named Pipe transport。强制 Pipe ACL，并在创建
-   当前尚不可用的 verified attachment 前验证客户端进程 token。
+1. 带版本、长度前缀、ACL 和对端 token 验证的 Named Pipe preview 已实现。Alpha 晋级前
+   仍需在管理员 Windows CI runner 上运行真实 Service SID group 与低完整性 token harness；
+   本地单元测试不伪造这些 OS 场景已通过。
 2. 实现仓库内 Windows Service/helper，负责 transport 生命周期、策略事务、watchdog、
    bypass 身份和直连回滚。
 3. 使用动态 BFE session 和原子事务实现 WFP 管理层。真实 callout 数据面完成前不得

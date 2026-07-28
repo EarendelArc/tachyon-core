@@ -93,7 +93,7 @@ func TestNamedPipeControllerFullMappingAndIdle(t *testing.T) {
 	serverIO := &netFrameIO{Conn: serverConn}
 	clientIO := &netFrameIO{Conn: clientConn}
 	sender := &fakeNamedPipeDatagramSender{sent: make(chan tgp.TunnelDatagram, 1)}
-	session := newNamedPipeControllerSession(serverIO, sender, 100*time.Millisecond)
+	session := newNamedPipeControllerSession(context.Background(), serverIO, sender, 100*time.Millisecond)
 	serverResult := make(chan error, 1)
 	go func() {
 		defer serverConn.Close()
@@ -232,16 +232,81 @@ func TestNamedPipeSlowReaderTimesOutAndRevokesAttachment(t *testing.T) {
 	defer clientConn.Close()
 	result := make(chan error, 1)
 	sender := &fakeNamedPipeDatagramSender{}
-	session := newNamedPipeControllerSession(&netFrameIO{Conn: serverConn}, sender, 25*time.Millisecond)
+	session := newNamedPipeControllerSession(context.Background(), &netFrameIO{Conn: serverConn}, sender, 25*time.Millisecond)
 	go func() {
 		defer serverConn.Close()
-		result <- serveNamedPipeController(context.Background(), registry, attachment, session.transport, sender, session, 25*time.Millisecond, 0)
+		result <- serveNamedPipeController(context.Background(), registry, attachment, session.writer.transport, sender, session, 25*time.Millisecond, 0)
 	}()
 	if err := <-result; !errors.Is(err, ErrNamedPipeTimeout) {
 		t.Fatalf("slow reader error = %v", err)
 	}
 	if health := registry.Health(); health.TransportAttached || health.ControllerConnected || health.Ready {
 		t.Fatalf("health after slow reader = %+v", health)
+	}
+}
+
+func TestNamedPipeDatagramOperationTimeoutIsStableAndDoesNotBlockNextOperation(t *testing.T) {
+	registry, controller := testController(t, Limits{})
+	defer registry.Close()
+	commitGeneration(t, controller, 1)
+	spec := testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015")
+	lease, err := controller.OpenFlow(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append([]byte(nil), lease.FlowID[:]...)
+	payload = appendUint64(payload, lease.Generation)
+	payload = append(payload, lease.LeaseNonce[:]...)
+	payload = appendUint64(payload, 1)
+	payload = append(payload, "timeout"...)
+	sender := blockingNamedPipeDatagramSender{}
+	operationCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, _, terminal, err := handleNamedPipeOperation(operationCtx, controller, sender, pipeMessageDatagram, &pipeDecoder{payload: payload})
+	if !errors.Is(err, context.DeadlineExceeded) || terminal {
+		t.Fatalf("datagram terminal=%v error=%v", terminal, err)
+	}
+	if status := statusForError(err); status != pipeStatusTimeout {
+		t.Fatalf("timeout status=%d", status)
+	}
+	data, _, terminal, err := handleNamedPipeOperation(context.Background(), controller, sender, pipeMessagePing, &pipeDecoder{payload: []byte("next")})
+	if err != nil || terminal || string(data) != "next" {
+		t.Fatalf("next operation data=%q terminal=%v error=%v", data, terminal, err)
+	}
+}
+
+func TestNamedPipeWriterQueueIsCancelableAndCloseWakesBlockedWrite(t *testing.T) {
+	transport := &blockingWriteFrameIO{started: make(chan struct{}, 1)}
+	writer := newNamedPipeWriter(context.Background(), transport, time.Second)
+	first := make(chan error, 1)
+	go func() {
+		first <- writer.WriteFrame(context.Background(), namedPipeFrame{Type: pipeMessagePing})
+	}()
+	select {
+	case <-transport.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+	queuedCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err := writer.WriteFrame(queuedCtx, namedPipeFrame{Type: pipeMessagePing})
+	cancel()
+	if !errors.Is(err, ErrNamedPipeTimeout) {
+		t.Fatalf("queued write error=%v", err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		writer.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("writer close did not wake in-flight write")
+	}
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight writer caller did not wake")
 	}
 }
 
@@ -273,6 +338,20 @@ type countingFrameIO struct {
 	readCalls int
 }
 
+type blockingWriteFrameIO struct {
+	started chan struct{}
+}
+
+func (*blockingWriteFrameIO) ReadFull(context.Context, []byte) error { return io.EOF }
+func (transport *blockingWriteFrameIO) WriteFull(ctx context.Context, _ []byte) error {
+	select {
+	case transport.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func (transport *countingFrameIO) ReadFull(_ context.Context, destination []byte) error {
 	transport.readCalls++
 	_, err := io.ReadFull(transport.reader, destination)
@@ -285,6 +364,13 @@ type netFrameIO struct{ net.Conn }
 type fakeNamedPipeDatagramSender struct {
 	sent chan tgp.TunnelDatagram
 	err  error
+}
+
+type blockingNamedPipeDatagramSender struct{}
+
+func (blockingNamedPipeDatagramSender) SendDatagram(ctx context.Context, _ tgp.TunnelDatagram) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (sender *fakeNamedPipeDatagramSender) SendDatagram(_ context.Context, datagram tgp.TunnelDatagram) error {

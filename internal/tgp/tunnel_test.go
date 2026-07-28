@@ -2,7 +2,9 @@ package tgp
 
 import (
 	"bytes"
+	"errors"
 	"net/netip"
+	"strconv"
 	"testing"
 
 	"github.com/tachyon-space/tachyon-core/internal/tun"
@@ -137,6 +139,72 @@ func TestTunnelDatagramV2IdentityIsInsideAEADPayload(t *testing.T) {
 	}
 }
 
+func TestCapturedUDPV2PayloadBudgets(t *testing.T) {
+	tests := []struct {
+		name     string
+		local    string
+		remote   string
+		overhead int
+	}{
+		{name: "ipv4", local: "198.18.0.2", remote: "203.0.113.10", overhead: CapturedUDPV2IPv4Overhead},
+		{name: "ipv6", local: "2001:db8::2", remote: "2001:db8::10", overhead: CapturedUDPV2IPv6Overhead},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			local := netip.MustParseAddr(test.local)
+			remote := netip.MustParseAddr(test.remote)
+			for _, tier := range []int{MinTGPDatagramSize, DefaultTGPDatagramSize, MaxTGPDatagramSize} {
+				t.Run(strconv.Itoa(tier), func(t *testing.T) {
+					maximum, err := MaxCapturedUDPV2Payload(tier, local, remote)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if maximum != tier-test.overhead {
+						t.Fatalf("maximum payload = %d, want %d", maximum, tier-test.overhead)
+					}
+					wire := mustCapturedUDPV2Wire(t, local, remote, maximum)
+					fecWire, err := frameFECData(wire, len(wire)+fecLengthPrefixSize)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var key [trafficKeySize]byte
+					codec, err := NewCodecWithMaxDatagramSize(key, tier)
+					if err != nil {
+						t.Fatal(err)
+					}
+					header, err := NewDataHeader(SessionID{}, capturedPacketStreamID, 1, len(fecWire))
+					if err != nil {
+						t.Fatal(err)
+					}
+					sealed, err := codec.Seal(1, header, fecWire)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(sealed) != tier {
+						t.Fatalf("sealed size = %d, want tier %d", len(sealed), tier)
+					}
+
+					tooLarge := mustCapturedUDPV2Wire(t, local, remote, maximum+1)
+					tooLargeFEC, err := frameFECData(tooLarge, len(tooLarge)+fecLengthPrefixSize)
+					if err != nil {
+						if !errors.Is(err, ErrFECShardTooLarge) {
+							t.Fatal(err)
+						}
+						return
+					}
+					header, err = NewDataHeader(SessionID{}, capturedPacketStreamID, 2, len(tooLargeFEC))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := codec.Seal(2, header, tooLargeFEC); !errors.Is(err, ErrDatagramTooLarge) {
+						t.Fatalf("oversized payload error = %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestDefaultTUNMTUFitsWorstCaseTGPDatagramInPublicPathMTU(t *testing.T) {
 	const (
 		publicPathMTU = 1400
@@ -232,4 +300,17 @@ func testTunnelLeaseNonce(value byte) LeaseNonce {
 	var nonce LeaseNonce
 	nonce[len(nonce)-1] = value
 	return nonce
+}
+
+func mustCapturedUDPV2Wire(t *testing.T, local, remote netip.Addr, payloadSize int) []byte {
+	t.Helper()
+	wire, err := MarshalTunnelDatagram(TunnelDatagram{
+		Identity: TunnelIdentity{FlowID: testTunnelFlowID(1), Generation: 1, LeaseNonce: testTunnelLeaseNonce(1)},
+		LocalIP:  local, LocalPort: 53000, RemoteIP: remote, RemotePort: 27015,
+		Payload: make([]byte, payloadSize),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
 }

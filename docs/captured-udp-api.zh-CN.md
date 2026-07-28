@@ -13,9 +13,11 @@ callout 驱动和数据包注入路径均未实现。本文档不能作为 Tachy
 该契约只接受已经由特权平台组件完成进程归属和授权的 UDP flow。Core 在这条路径上不
 查询 PID 或可执行文件路径。
 
-公开 API 只能创建未验证的 transport attachment，它不能认证 controller。未来同包内
-Named Pipe transport 必须先验证 OS 对端，才能创建已验证 attachment。仅当以下条件
-全部成立时，`Health.Ready` 才为 true：
+公开 API 只能创建未验证的 transport attachment，它不能认证 controller。每个
+attachment 都有仅由其来源 registry 接受的内部随机 256-bit capability。Attach 与
+Detach 是排他的：存在 active attachment/controller 时不能替换，外部实例不能撤销，
+失败或未验证的尝试不得改变状态。未来同包内 Named Pipe transport 必须先验证 OS
+对端，才能创建已验证 attachment。仅当以下条件全部成立时，`Health.Ready` 才为 true：
 
 - transport 已连接；
 - transport 的 OS 对端已验证；
@@ -31,9 +33,13 @@ token，并把唯一 controller capability 绑定到该 attachment。Controller 
 断开时，capability、prepared policy、active policy 和 flow lease 全部撤销。已经交给
 调用方的 payload 会继续占用全局字节预算，直到调用方执行 `Release()`。
 
+未来所有 transport 都必须在 EOF、broken pipe、受监管 helper 退出或意外崩溃时同步
+执行 attachment detach 或 controller close，之后才能重连或报告 Ready。这是未来
+transport 的不变量；当前仍未实现 Named Pipe transport。
+
 ```text
 AttachTransport(verified transport) -> one-use token
-Authenticate(attachment_id, token) -> sole controller
+Authenticate(attachment capability, token) -> sole controller
 PrepareGeneration(generation) -> transaction
 CommitGeneration(transaction)
 AbortGeneration(transaction)
@@ -66,12 +72,32 @@ lease nonce，因此旧 lease 的迟到回复不能投递给新 lease。
 `TGD\x01` 只为 legacy TUN preview 保持可解析。Captured-UDP registry 不会生成 v1，
 并拒绝没有 lease identity 的 v1 回程。只填写部分 v2 identity 也是非法的。
 
+Captured UDP 当前没有 v1/v2 降级或服务端 capability 协商，要求两端都支持 v2。旧
+服务端可能拒绝 `TGD\x02`；客户端必须 fail-closed，绝不能把 captured flow 重试为 v1。
+未来如需混合版本支持，必须在打开 flow 前通过已认证握手协商 v2。
+
+## 加密数据报预算
+
+`MaxTGPDatagramSize` 表示完整加密 TGP UDP payload。Registry 会先扣除 TGP codec、
+AEAD tag、FEC 长度前缀、v2 身份和 endpoint 编码开销，再预留或复制游戏 payload。
+
+| TGP UDP payload | IPv4 游戏 payload | IPv6 游戏 payload |
+| ---: | ---: | ---: |
+| 1232 | 1100 | 1076 |
+| 1352 | 1220 | 1196 |
+| 1452 | 1320 | 1296 |
+
+混合地址族 flow 非法。配置的全局上限与具体 flow 地址族预算都会在分配或入队前检查。
+
 ## 资源与生命周期不变量
 
 - Generation 非零且只允许单调 commit。
 - Flow lease 有 idle TTL；后台 reaper 和数据热路径都会回收过期 lease。
 - Flow 数、单包大小、TTL、估算 flow metadata 和所有未释放 payload 总字节数均有
   不可配置突破的硬上限。
+- 每个 controller 对双向数据共享 packet/s 与 byte/s token bucket，控制调用使用独立
+  operations/s bucket。零长数据报也消耗一个 packet 和至少一个 byte；rate 与 burst
+  配置不能突破硬上限。
 - 大 payload 复制发生在释放 registry 全局锁之后。
 - Accepted payload 和 delivery 会占用字节预算，调用方必须调用 `Release()`；泄漏预算
   时以 `ErrBufferBudget` fail-closed，而不是允许内存无限增长。

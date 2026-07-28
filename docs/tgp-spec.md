@@ -10,6 +10,14 @@ is retained for the legacy TUN preview. `TGD\x02` additionally carries a
 128-bit Flow ID, 64-bit policy generation, and 128-bit lease nonce. Servers
 must return all v2 identity fields unchanged and include them in relay-flow
 identity. Captured-UDP clients must reject v1 replies and partial v2 identity.
+There is no captured-tunnel downgrade or capability negotiation yet: both
+endpoints must support v2, and clients must fail closed rather than retry v1.
+Future mixed-version support must authenticate v2 negotiation during the TGP
+handshake before any captured flow is opened.
+
+After TGP codec, AEAD, FEC prefix, v2 identity, and endpoint overhead, the
+maximum IPv4/IPv6 game payloads are 1100/1076 bytes at a 1232-byte TGP budget,
+1220/1196 at 1352, and 1320/1296 at 1452.
 
 **Version:** TGP/1.1
 

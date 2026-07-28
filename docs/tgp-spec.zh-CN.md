@@ -9,6 +9,13 @@ TGP session 建立后，tunnel payload 由普通 data packet 的 ChaCha20-Poly13
 `TGD\x02` 额外携带 128-bit Flow ID、64-bit policy generation 和 128-bit lease
 nonce。服务端必须原样返回全部 v2 identity 字段，并把它们纳入 relay flow 身份。
 Captured-UDP 客户端必须拒绝 v1 回程和只填写部分字段的 v2 identity。
+当前没有 captured tunnel 降级或 capability 协商：两端必须都支持 v2，客户端必须
+fail-closed，不能重试为 v1。未来的混合版本支持必须在打开 captured flow 前，通过
+TGP 已认证握手完成 v2 协商。
+
+扣除 TGP codec、AEAD、FEC 长度前缀、v2 身份与 endpoint 开销后，1232 字节 TGP
+预算对应 IPv4/IPv6 游戏 payload 上限 1100/1076 字节；1352 对应 1220/1196；
+1452 对应 1320/1296。
 
 **版本:** TGP/1.1
 

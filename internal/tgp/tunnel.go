@@ -13,6 +13,15 @@ var (
 	ErrInvalidTunnelData = errors.New("invalid tgp tunnel datagram")
 )
 
+// Captured UDP v2 overhead includes the TGP outer header, encrypted inner
+// header, ChaCha20-Poly1305 tag, FEC length prefix, tunnel magic, complete
+// lease identity, endpoint length bytes, addresses, and ports. MaxDatagramSize
+// is the encrypted TGP UDP payload size and excludes the outer IP/UDP headers.
+const (
+	CapturedUDPV2IPv4Overhead = outerHeaderSize + innerHeaderSize + aeadOverheadSize + fecLengthPrefixSize + 4 + 16 + 8 + 16 + 1 + 4 + 2 + 1 + 4 + 2
+	CapturedUDPV2IPv6Overhead = outerHeaderSize + innerHeaderSize + aeadOverheadSize + fecLengthPrefixSize + 4 + 16 + 8 + 16 + 1 + 16 + 2 + 1 + 16 + 2
+)
+
 type FlowID [16]byte
 type LeaseNonce [16]byte
 
@@ -37,6 +46,26 @@ type TunnelDatagram struct {
 	RemoteIP   netip.Addr
 	RemotePort uint16
 	Payload    []byte
+}
+
+// MaxCapturedUDPV2Payload returns the largest game UDP payload that can pass
+// through the v2 tunnel and the FEC path without exceeding maxDatagramSize.
+func MaxCapturedUDPV2Payload(maxDatagramSize int, localIP, remoteIP netip.Addr) (int, error) {
+	maxDatagramSize, err := normalizeMaxDatagramSize(maxDatagramSize)
+	if err != nil {
+		return 0, err
+	}
+	if !localIP.IsValid() || !remoteIP.IsValid() || localIP.Is4() != remoteIP.Is4() {
+		return 0, fmt.Errorf("%w: captured UDP endpoints must use the same valid address family", ErrInvalidTunnelData)
+	}
+	overhead := CapturedUDPV2IPv6Overhead
+	if localIP.Is4() {
+		overhead = CapturedUDPV2IPv4Overhead
+	}
+	if maxDatagramSize <= overhead {
+		return 0, fmt.Errorf("%w: tunnel overhead %d exhausts datagram budget %d", ErrDatagramTooLarge, overhead, maxDatagramSize)
+	}
+	return maxDatagramSize - overhead, nil
 }
 
 func MarshalTunnelDatagram(datagram TunnelDatagram) ([]byte, error) {

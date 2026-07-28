@@ -18,8 +18,12 @@ already attributed and authorized. Core does not inspect PIDs or executable
 paths on this path.
 
 The public API can create only an unverified transport attachment. Such an
-attachment cannot authenticate a controller. A future named-pipe transport in
-this package must verify its OS peer before creating a verified attachment.
+attachment cannot authenticate a controller. Every attachment has an internal
+random 256-bit capability accepted only by its originating registry. Attach
+and detach are exclusive: an active attachment/controller cannot be replaced,
+a foreign instance cannot detach it, and rejected attempts do not mutate state.
+A future named-pipe transport in this package must verify its OS peer before
+creating a verified attachment.
 `Health.Ready` is true only while all of these conditions hold:
 
 - a transport is attached;
@@ -38,9 +42,13 @@ disconnect revokes the capability and clears prepared policy, active policy,
 and flow leases. Payloads already handed to a caller remain charged against the
 global byte budget until that caller invokes `Release()`.
 
+Every future transport must synchronously detach/close on EOF, broken pipe,
+supervised helper exit, or helper crash before reconnecting or reporting ready.
+This is a transport invariant; no Named Pipe transport exists yet.
+
 ```text
 AttachTransport(verified transport) -> one-use token
-Authenticate(attachment_id, token) -> sole controller
+Authenticate(attachment capability, token) -> sole controller
 PrepareGeneration(generation) -> transaction
 CommitGeneration(transaction)
 AbortGeneration(transaction)
@@ -76,6 +84,26 @@ so a late reply from an old lease cannot be delivered to the new lease.
 registry never emits it and rejects a v1 reply because it has no lease identity.
 Partially populated v2 identities are invalid.
 
+Captured UDP has no v1/v2 downgrade or server capability negotiation yet and
+requires v2 at both endpoints. A legacy server may reject `TGD\x02`; clients
+must fail closed and never retry captured traffic as v1. Future mixed-version
+support must negotiate v2 in the authenticated handshake before opening flows.
+
+## Encrypted datagram budget
+
+`MaxTGPDatagramSize` covers the complete encrypted TGP UDP payload. Registry
+subtracts the TGP codec, AEAD tag, FEC prefix, v2 identity, and endpoint
+overhead before reserving or copying a game payload.
+
+| TGP UDP payload | IPv4 game payload | IPv6 game payload |
+| ---: | ---: | ---: |
+| 1232 | 1100 | 1076 |
+| 1352 | 1220 | 1196 |
+| 1452 | 1320 | 1296 |
+
+Mixed-family flows are invalid. Both the configured global limit and exact
+flow-family budget are checked before allocation or queueing.
+
 ## Resource and lifetime invariants
 
 - Generations are non-zero and monotonically committed.
@@ -83,6 +111,10 @@ Partially populated v2 identities are invalid.
   expired leases.
 - Flow count, datagram size, flow TTL, estimated flow metadata, and total
   outstanding payload bytes have non-configurable hard ceilings.
+- Each controller has shared packet/second and byte/second buckets for both
+  data directions and an operations/second bucket for control calls. Empty
+  datagrams cost one packet and at least one byte. Rate and burst settings
+  cannot exceed hard ceilings.
 - Payload copying occurs after releasing the global registry lock.
 - Accepted payloads and deliveries reserve the byte budget until callers invoke
   `Release()`. A leaked reservation fails closed with `ErrBufferBudget` rather

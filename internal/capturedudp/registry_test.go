@@ -3,6 +3,7 @@ package capturedudp
 import (
 	"errors"
 	"net/netip"
+	"strconv"
 	"testing"
 	"time"
 
@@ -11,33 +12,44 @@ import (
 
 func TestUnverifiedTransportCannotAuthenticateOrBecomeReady(t *testing.T) {
 	registry := testRegistry(t, Limits{})
-	attachment := NewUnverifiedTransportAttachment("pending-pipe")
+	attachment, err := registry.NewUnverifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := registry.AttachTransport(attachment); !errors.Is(err, ErrTransportNotVerified) {
 		t.Fatalf("attach unverified transport error = %v", err)
 	}
 	health := registry.Health()
-	if health.Ready || !health.TransportAttached || health.TransportPeerVerified || health.ControllerConnected {
+	if health.Ready || health.TransportAttached || health.TransportPeerVerified || health.ControllerConnected {
 		t.Fatalf("unverified transport health = %+v", health)
 	}
-	if _, err := registry.Authenticate(attachment.ID, SessionToken{}); !errors.Is(err, ErrTransportNotVerified) {
+	if _, err := registry.Authenticate(attachment, SessionToken{}); !errors.Is(err, ErrTransportMismatch) {
 		t.Fatalf("authenticate unverified transport error = %v", err)
 	}
 }
 
 func TestControllerIsSingleUseBoundAndDisconnectRevokesState(t *testing.T) {
 	registry := testRegistry(t, Limits{})
-	token, err := registry.AttachTransport(verifiedTransportAttachment("pipe-1"))
+	attachment, err := registry.newVerifiedTransportAttachment()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Authenticate("pipe-2", token); !errors.Is(err, ErrTransportMismatch) {
+	token, err := registry.AttachTransport(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Authenticate(other, token); !errors.Is(err, ErrTransportMismatch) {
 		t.Fatalf("cross-transport authentication error = %v", err)
 	}
-	controller, err := registry.Authenticate("pipe-1", token)
+	controller, err := registry.Authenticate(attachment, token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Authenticate("pipe-1", token); !errors.Is(err, ErrControllerActive) {
+	if _, err := registry.Authenticate(attachment, token); !errors.Is(err, ErrControllerActive) {
 		t.Fatalf("second controller error = %v", err)
 	}
 	commitGeneration(t, controller, 1)
@@ -57,6 +69,40 @@ func TestControllerIsSingleUseBoundAndDisconnectRevokesState(t *testing.T) {
 	}
 	if _, err := controller.AcceptDatagram(testDatagram(lease, 0, "late")); !errors.Is(err, ErrControllerRevoked) {
 		t.Fatalf("revoked controller error = %v", err)
+	}
+}
+
+func TestAttachReplacementAndForeignDetachHaveNoSideEffects(t *testing.T) {
+	registry, controller := testController(t, Limits{})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.AttachTransport(replacement); !errors.Is(err, ErrTransportActive) {
+		t.Fatalf("replacement attach error = %v", err)
+	}
+	unverified, err := registry.NewUnverifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.AttachTransport(unverified); !errors.Is(err, ErrTransportNotVerified) {
+		t.Fatalf("unverified replacement error = %v", err)
+	}
+	if err := replacement.Detach(); !errors.Is(err, ErrTransportMismatch) {
+		t.Fatalf("foreign detach error = %v", err)
+	}
+	accepted, err := controller.AcceptDatagram(testDatagram(lease, 0, "active"))
+	if err != nil {
+		t.Fatalf("failed attach attempt revoked active controller: %v", err)
+	}
+	accepted.Release()
+	if !registry.Health().Ready {
+		t.Fatal("failed attach attempt changed active health")
 	}
 }
 
@@ -165,7 +211,7 @@ func TestFlowTTLExpiresInactiveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = registry.Close() })
-	controller := attachController(t, registry, "ttl-pipe")
+	controller := attachController(t, registry)
 	commitGeneration(t, controller, 1)
 	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
 	if err != nil {
@@ -243,12 +289,165 @@ func TestBufferedByteBudgetCannotBeResetByGenerationReplacement(t *testing.T) {
 	accepted.Release()
 }
 
+func TestRegistryEnforcesCapturedUDPV2PayloadBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		local    string
+		remote   string
+		expected map[int]int
+	}{
+		{
+			name: "ipv4", local: "10.0.0.2:40000", remote: "203.0.113.9:27015",
+			expected: map[int]int{1232: 1100, 1352: 1220, 1452: 1320},
+		},
+		{
+			name: "ipv6", local: "[2001:db8::2]:40000", remote: "[2001:db8::9]:27015",
+			expected: map[int]int{1232: 1076, 1352: 1196, 1452: 1296},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, tier := range []int{1232, 1352, 1452} {
+				t.Run(strconv.Itoa(tier), func(t *testing.T) {
+					maximum, err := tgp.MaxCapturedUDPV2Payload(
+						tier,
+						netip.MustParseAddrPort(test.local).Addr(),
+						netip.MustParseAddrPort(test.remote).Addr(),
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if maximum != test.expected[tier] {
+						t.Fatalf("maximum payload = %d, want %d", maximum, test.expected[tier])
+					}
+					registry, controller := testController(t, Limits{
+						MaxTGPDatagramSize: tier,
+						MaxDatagramSize:    tier - tgp.CapturedUDPV2IPv4Overhead,
+					})
+					commitGeneration(t, controller, 1)
+					lease, err := controller.OpenFlow(testFlow(1, 1, test.local, test.remote))
+					if err != nil {
+						t.Fatal(err)
+					}
+					accepted, err := controller.AcceptDatagram(Datagram{
+						FlowID: lease.FlowID, Generation: lease.Generation, LeaseNonce: lease.LeaseNonce,
+						Payload: make([]byte, maximum),
+					})
+					if err != nil {
+						t.Fatalf("maximum payload rejected: %v", err)
+					}
+					accepted.Release()
+					if registry.Health().BufferedBytes != 0 {
+						t.Fatal("maximum payload reservation was not released")
+					}
+					if _, err := controller.AcceptDatagram(Datagram{
+						FlowID: lease.FlowID, Generation: lease.Generation, LeaseNonce: lease.LeaseNonce,
+						Sequence: 1, Payload: make([]byte, maximum+1),
+					}); !errors.Is(err, ErrDatagramTooLarge) {
+						t.Fatalf("oversized payload error = %v", err)
+					}
+					if registry.Health().BufferedBytes != 0 {
+						t.Fatal("oversized payload reserved buffer space")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDataPacketRateLimitChargesZeroLengthDatagrams(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	registry, controller := testControllerAt(t, Limits{
+		MaxDatagramSize: 16, PacketsPerSecond: 1, PacketBurst: 1,
+		BytesPerSecond: 100, ByteBurst: 100,
+	}, &now)
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := controller.AcceptDatagram(testDatagram(lease, 0, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+	if _, err := controller.AcceptDatagram(testDatagram(lease, 1, "")); !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("second zero-length datagram error = %v", err)
+	}
+	now = now.Add(time.Second)
+	accepted, err = controller.AcceptDatagram(testDatagram(lease, 1, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+	if registry.Stats().DataRateLimited != 1 {
+		t.Fatalf("data rate-limited count = %d", registry.Stats().DataRateLimited)
+	}
+}
+
+func TestDataByteRateLimitChargesZeroLengthDatagrams(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	registry, controller := testControllerAt(t, Limits{
+		MaxDatagramSize: 2, PacketsPerSecond: 100, PacketBurst: 10,
+		BytesPerSecond: 1, ByteBurst: 2,
+	}, &now)
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := controller.AcceptDatagram(testDatagram(lease, 0, "xx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+	if _, err := controller.AcceptDatagram(testDatagram(lease, 1, "")); !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("zero-length byte charge error = %v", err)
+	}
+	now = now.Add(time.Second)
+	accepted, err = controller.AcceptDatagram(testDatagram(lease, 1, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+	if registry.Stats().DataRateLimited != 1 {
+		t.Fatalf("data rate-limited count = %d", registry.Stats().DataRateLimited)
+	}
+}
+
+func TestControlOperationRateLimit(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	registry, controller := testControllerAt(t, Limits{
+		ControlOpsPerSecond: 1, ControlBurst: 1,
+	}, &now)
+	transaction, err := controller.PrepareGeneration(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AbortGeneration(transaction); !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("second control operation error = %v", err)
+	}
+	now = now.Add(time.Second)
+	if err := controller.AbortGeneration(transaction); err != nil {
+		t.Fatal(err)
+	}
+	if registry.Stats().ControlRateLimited != 1 {
+		t.Fatalf("control rate-limited count = %d", registry.Stats().ControlRateLimited)
+	}
+}
+
 func TestLimitsRejectHardCapViolations(t *testing.T) {
 	tests := []Limits{
 		{MaxFlows: HardMaxFlows + 1},
 		{MaxDatagramSize: HardMaxDatagramSize + 1},
 		{MaxDatagramSize: 1024, MaxBufferedBytes: 512},
 		{FlowTTL: HardMaxFlowTTL + time.Second},
+		{PacketsPerSecond: HardMaxPacketsPerSecond + 1},
+		{PacketBurst: HardMaxPacketBurst + 1},
+		{BytesPerSecond: HardMaxBytesPerSecond + 1},
+		{ByteBurst: HardMaxByteBurst + 1},
+		{ControlOpsPerSecond: HardMaxControlOpsPerSecond + 1},
+		{ControlBurst: HardMaxControlBurst + 1},
 	}
 	for _, limits := range tests {
 		registry, err := NewRegistry(limits)
@@ -292,16 +491,33 @@ func testRegistry(t *testing.T, limits Limits) *Registry {
 func testController(t *testing.T, limits Limits) (*Registry, *Controller) {
 	t.Helper()
 	registry := testRegistry(t, limits)
-	return registry, attachController(t, registry, "verified-test-transport")
+	return registry, attachController(t, registry)
 }
 
-func attachController(t *testing.T, registry *Registry, attachmentID string) *Controller {
+func testControllerAt(t *testing.T, limits Limits, now *time.Time) (*Registry, *Controller) {
 	t.Helper()
-	token, err := registry.AttachTransport(verifiedTransportAttachment(attachmentID))
+	registry, err := newRegistry(registryOptions{
+		limits: limits,
+		now:    func() time.Time { return *now },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller, err := registry.Authenticate(attachmentID, token)
+	t.Cleanup(func() { _ = registry.Close() })
+	return registry, attachController(t, registry)
+}
+
+func attachController(t *testing.T, registry *Registry) *Controller {
+	t.Helper()
+	attachment, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := registry.AttachTransport(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := registry.Authenticate(attachment, token)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,8 @@ const (
 	DefaultTGPDatagramSize = 1352
 	MaxTGPDatagramSize     = 1452
 	WorstCaseTUNOverhead   = 68
-	maxTGPDataPayloadSize  = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - chacha20poly1305.Overhead
+	aeadOverheadSize       = chacha20poly1305.Overhead
+	maxTGPDataPayloadSize  = MaxTGPDatagramSize - outerHeaderSize - innerHeaderSize - aeadOverheadSize
 	maxDTLSSequence        = 1<<48 - 1
 )
 

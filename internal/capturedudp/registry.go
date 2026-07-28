@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,19 +22,30 @@ import (
 const (
 	SessionTokenSize = 32
 
-	HardMaxFlows          = 65536
-	HardMaxDatagramSize   = 65507
-	HardMaxBufferedBytes  = 64 << 20
-	HardMaxFlowTTL        = time.Hour
-	MinFlowTTL            = time.Second
-	defaultMaxFlows       = 4096
-	defaultDatagramSize   = 65507
-	defaultBufferedBytes  = 8 << 20
-	defaultFlowTTL        = 2 * time.Minute
-	defaultReapInterval   = 30 * time.Second
-	maxTransportIDLength  = 128
-	estimatedFlowMetaSize = 256
-	hardFlowMetadataBytes = 16 << 20
+	HardMaxFlows               = 65536
+	HardMaxDatagramSize        = tgp.MaxTGPDatagramSize - tgp.CapturedUDPV2IPv4Overhead
+	HardMaxBufferedBytes       = 64 << 20
+	HardMaxFlowTTL             = time.Hour
+	MinFlowTTL                 = time.Second
+	HardMaxPacketsPerSecond    = 200000
+	HardMaxPacketBurst         = 20000
+	HardMaxBytesPerSecond      = 256 << 20
+	HardMaxByteBurst           = 64 << 20
+	HardMaxControlOpsPerSecond = 10000
+	HardMaxControlBurst        = 1000
+	defaultMaxFlows            = 4096
+	defaultTGPDatagramSize     = tgp.DefaultTGPDatagramSize
+	defaultBufferedBytes       = 8 << 20
+	defaultFlowTTL             = 2 * time.Minute
+	defaultReapInterval        = 30 * time.Second
+	defaultPacketsPerSecond    = 20000
+	defaultPacketBurst         = 2000
+	defaultBytesPerSecond      = 32 << 20
+	defaultByteBurst           = 8 << 20
+	defaultControlOpsPerSecond = 2000
+	defaultControlBurst        = 200
+	estimatedFlowMetaSize      = 256
+	hardFlowMetadataBytes      = 16 << 20
 )
 
 var (
@@ -53,16 +63,19 @@ var (
 	ErrBufferBudget         = errors.New("captured UDP buffered byte budget exhausted")
 	ErrTransportNotVerified = errors.New("captured UDP transport peer is not verified")
 	ErrTransportMismatch    = errors.New("captured UDP transport attachment mismatch")
+	ErrTransportActive      = errors.New("captured UDP transport attachment already active")
 	ErrControllerActive     = errors.New("captured UDP controller already connected")
 	ErrControllerRevoked    = errors.New("captured UDP controller revoked")
 	ErrTransactionActive    = errors.New("captured UDP generation transaction already prepared")
 	ErrUnknownTransaction   = errors.New("unknown captured UDP generation transaction")
 	ErrMissingLeaseIdentity = errors.New("captured UDP reply has no lease identity")
+	ErrRateLimit            = errors.New("captured UDP controller rate limit exceeded")
 )
 
 type FlowID = tgp.FlowID
 type LeaseNonce = tgp.LeaseNonce
 type SessionToken [SessionTokenSize]byte
+type attachmentID [32]byte
 type controllerID [16]byte
 type transactionID [16]byte
 
@@ -74,18 +87,32 @@ const (
 )
 
 type Limits struct {
-	MaxFlows         int
-	MaxDatagramSize  int
-	MaxBufferedBytes int
-	FlowTTL          time.Duration
+	MaxFlows            int
+	MaxTGPDatagramSize  int
+	MaxDatagramSize     int
+	MaxBufferedBytes    int
+	FlowTTL             time.Duration
+	PacketsPerSecond    int
+	PacketBurst         int
+	BytesPerSecond      int
+	ByteBurst           int
+	ControlOpsPerSecond int
+	ControlBurst        int
 }
 
 func (limits Limits) normalized() (Limits, error) {
 	if limits.MaxFlows <= 0 {
 		limits.MaxFlows = defaultMaxFlows
 	}
+	if limits.MaxTGPDatagramSize <= 0 {
+		limits.MaxTGPDatagramSize = defaultTGPDatagramSize
+	}
+	if limits.MaxTGPDatagramSize < tgp.MinTGPDatagramSize || limits.MaxTGPDatagramSize > tgp.MaxTGPDatagramSize {
+		return Limits{}, fmt.Errorf("captured UDP TGP datagram size %d is outside [%d,%d]", limits.MaxTGPDatagramSize, tgp.MinTGPDatagramSize, tgp.MaxTGPDatagramSize)
+	}
+	maxPayload := limits.MaxTGPDatagramSize - tgp.CapturedUDPV2IPv4Overhead
 	if limits.MaxDatagramSize <= 0 {
-		limits.MaxDatagramSize = defaultDatagramSize
+		limits.MaxDatagramSize = maxPayload
 	}
 	if limits.MaxBufferedBytes <= 0 {
 		limits.MaxBufferedBytes = defaultBufferedBytes
@@ -96,14 +123,40 @@ func (limits Limits) normalized() (Limits, error) {
 	if limits.MaxFlows > HardMaxFlows || limits.MaxFlows*estimatedFlowMetaSize > hardFlowMetadataBytes {
 		return Limits{}, fmt.Errorf("captured UDP max flows %d exceeds hard metadata budget", limits.MaxFlows)
 	}
-	if limits.MaxDatagramSize > HardMaxDatagramSize {
-		return Limits{}, fmt.Errorf("captured UDP max datagram size %d exceeds hard limit %d", limits.MaxDatagramSize, HardMaxDatagramSize)
+	if limits.MaxDatagramSize > HardMaxDatagramSize || limits.MaxDatagramSize > maxPayload {
+		return Limits{}, fmt.Errorf("captured UDP max datagram size %d exceeds v2 budget %d", limits.MaxDatagramSize, maxPayload)
 	}
 	if limits.MaxBufferedBytes > HardMaxBufferedBytes || limits.MaxBufferedBytes < limits.MaxDatagramSize {
 		return Limits{}, fmt.Errorf("captured UDP buffered byte budget %d is outside [%d,%d]", limits.MaxBufferedBytes, limits.MaxDatagramSize, HardMaxBufferedBytes)
 	}
 	if limits.FlowTTL < MinFlowTTL || limits.FlowTTL > HardMaxFlowTTL {
 		return Limits{}, fmt.Errorf("captured UDP flow TTL %s is outside [%s,%s]", limits.FlowTTL, MinFlowTTL, HardMaxFlowTTL)
+	}
+	if limits.PacketsPerSecond <= 0 {
+		limits.PacketsPerSecond = defaultPacketsPerSecond
+	}
+	if limits.PacketBurst <= 0 {
+		limits.PacketBurst = defaultPacketBurst
+	}
+	if limits.BytesPerSecond <= 0 {
+		limits.BytesPerSecond = defaultBytesPerSecond
+	}
+	if limits.ByteBurst <= 0 {
+		limits.ByteBurst = defaultByteBurst
+	}
+	if limits.ControlOpsPerSecond <= 0 {
+		limits.ControlOpsPerSecond = defaultControlOpsPerSecond
+	}
+	if limits.ControlBurst <= 0 {
+		limits.ControlBurst = defaultControlBurst
+	}
+	if limits.PacketsPerSecond > HardMaxPacketsPerSecond || limits.PacketBurst > HardMaxPacketBurst ||
+		limits.BytesPerSecond > HardMaxBytesPerSecond || limits.ByteBurst > HardMaxByteBurst ||
+		limits.ControlOpsPerSecond > HardMaxControlOpsPerSecond || limits.ControlBurst > HardMaxControlBurst {
+		return Limits{}, errors.New("captured UDP rate limit exceeds a hard ceiling")
+	}
+	if limits.ByteBurst < limits.MaxDatagramSize {
+		return Limits{}, fmt.Errorf("captured UDP byte burst %d is smaller than max datagram %d", limits.ByteBurst, limits.MaxDatagramSize)
 	}
 	return limits, nil
 }
@@ -113,16 +166,16 @@ func (limits Limits) normalized() (Limits, error) {
 // implementation in this package must set peerVerified only after OS-token and
 // ACL verification.
 type TransportAttachment struct {
-	ID           string
+	registry     *Registry
+	id           attachmentID
 	peerVerified bool
 }
 
-func NewUnverifiedTransportAttachment(id string) TransportAttachment {
-	return TransportAttachment{ID: strings.TrimSpace(id)}
-}
-
-func verifiedTransportAttachment(id string) TransportAttachment {
-	return TransportAttachment{ID: strings.TrimSpace(id), peerVerified: true}
+func (attachment *TransportAttachment) Detach() error {
+	if attachment == nil || attachment.registry == nil {
+		return ErrTransportMismatch
+	}
+	return attachment.registry.detachTransport(attachment)
 }
 
 // FlowSpec is the immutable endpoint portion of a flow lease. LeaseNonce is
@@ -179,6 +232,8 @@ type Stats struct {
 	FlowsExpired           uint64
 	DatagramsAccepted      uint64
 	RepliesResolved        uint64
+	DataRateLimited        uint64
+	ControlRateLimited     uint64
 	Rejected               uint64
 }
 
@@ -202,6 +257,28 @@ type preparedGeneration struct {
 	generation uint64
 }
 
+type tokenBucket struct {
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newTokenBucket(rate, burst int, now time.Time) tokenBucket {
+	return tokenBucket{rate: float64(rate), burst: float64(burst), tokens: float64(burst), last: now}
+}
+
+func (bucket *tokenBucket) refill(now time.Time) {
+	if !now.After(bucket.last) {
+		return
+	}
+	bucket.tokens += now.Sub(bucket.last).Seconds() * bucket.rate
+	if bucket.tokens > bucket.burst {
+		bucket.tokens = bucket.burst
+	}
+	bucket.last = now
+}
+
 type Registry struct {
 	mu sync.Mutex
 
@@ -218,6 +295,9 @@ type Registry struct {
 	tokenIssued     bool
 	controller      controllerID
 	controllerAlive bool
+	packetBucket    tokenBucket
+	byteBucket      tokenBucket
+	controlBucket   tokenBucket
 
 	prepared         *preparedGeneration
 	activeGeneration uint64
@@ -262,41 +342,62 @@ func newRegistry(options registryOptions) (*Registry, error) {
 	return registry, nil
 }
 
+func (r *Registry) NewUnverifiedTransportAttachment() (*TransportAttachment, error) {
+	return r.newTransportAttachment(false)
+}
+
+func (r *Registry) newVerifiedTransportAttachment() (*TransportAttachment, error) {
+	return r.newTransportAttachment(true)
+}
+
+func (r *Registry) newTransportAttachment(peerVerified bool) (*TransportAttachment, error) {
+	var id attachmentID
+	if err := readRandom(r.random, id[:]); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrClosed
+	}
+	return &TransportAttachment{registry: r, id: id, peerVerified: peerVerified}, nil
+}
+
 // AttachTransport records transport state and issues a fresh one-use token
 // only for an attachment whose OS peer was verified by a platform transport.
-func (r *Registry) AttachTransport(attachment TransportAttachment) (SessionToken, error) {
+func (r *Registry) AttachTransport(attachment *TransportAttachment) (SessionToken, error) {
 	var zero SessionToken
-	if attachment.ID == "" || len(attachment.ID) > maxTransportIDLength {
+	if attachment == nil || attachment.registry != r || attachment.id == (attachmentID{}) {
 		return zero, ErrTransportMismatch
 	}
+	if !attachment.peerVerified {
+		return zero, ErrTransportNotVerified
+	}
 	var token SessionToken
-	if attachment.peerVerified {
-		if err := readRandom(r.random, token[:]); err != nil {
-			return zero, err
-		}
+	if err := readRandom(r.random, token[:]); err != nil {
+		return zero, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return zero, ErrClosed
 	}
-	r.revokeControllerLocked(false)
-	r.attachment = &attachment
-	if !attachment.peerVerified {
-		return zero, ErrTransportNotVerified
+	if r.attachment != nil || r.controllerAlive {
+		return zero, ErrTransportActive
 	}
+	r.attachment = attachment
 	r.token = token
 	r.tokenIssued = true
 	return token, nil
 }
 
-func (r *Registry) DetachTransport(attachmentID string) error {
+func (r *Registry) detachTransport(attachment *TransportAttachment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return ErrClosed
 	}
-	if r.attachment == nil || r.attachment.ID != attachmentID {
+	if attachment == nil || attachment.registry != r || r.attachment != attachment || r.attachment.id != attachment.id {
 		return ErrTransportMismatch
 	}
 	r.revokeControllerLocked(true)
@@ -306,7 +407,7 @@ func (r *Registry) DetachTransport(attachmentID string) error {
 
 // Authenticate consumes the per-attachment token and binds the sole
 // controller capability to that transport attachment.
-func (r *Registry) Authenticate(attachmentID string, token SessionToken) (*Controller, error) {
+func (r *Registry) Authenticate(attachment *TransportAttachment, token SessionToken) (*Controller, error) {
 	var id controllerID
 	if err := readRandom(r.random, id[:]); err != nil {
 		return nil, err
@@ -316,7 +417,7 @@ func (r *Registry) Authenticate(attachmentID string, token SessionToken) (*Contr
 	if r.closed {
 		return nil, ErrClosed
 	}
-	if r.attachment == nil || r.attachment.ID != attachmentID {
+	if attachment == nil || attachment.registry != r || r.attachment != attachment || r.attachment.id != attachment.id {
 		r.stats.AuthenticationFailures++
 		return nil, ErrTransportMismatch
 	}
@@ -335,15 +436,19 @@ func (r *Registry) Authenticate(attachmentID string, token SessionToken) (*Contr
 	r.tokenIssued = false
 	r.controller = id
 	r.controllerAlive = true
+	now := r.now()
+	r.packetBucket = newTokenBucket(r.limits.PacketsPerSecond, r.limits.PacketBurst, now)
+	r.byteBucket = newTokenBucket(r.limits.BytesPerSecond, r.limits.ByteBurst, now)
+	r.controlBucket = newTokenBucket(r.limits.ControlOpsPerSecond, r.limits.ControlBurst, now)
 	r.stats.ControllersConnected++
-	return &Controller{registry: r, id: id, attachmentID: attachmentID}, nil
+	return &Controller{registry: r, id: id, attachment: attachment}, nil
 }
 
 type Controller struct {
-	registry     *Registry
-	id           controllerID
-	attachmentID string
-	closeOnce    sync.Once
+	registry   *Registry
+	id         controllerID
+	attachment *TransportAttachment
+	closeOnce  sync.Once
 }
 
 func (controller *Controller) Close() error {
@@ -352,7 +457,7 @@ func (controller *Controller) Close() error {
 	}
 	var err error
 	controller.closeOnce.Do(func() {
-		err = controller.registry.disconnectController(controller.id, controller.attachmentID)
+		err = controller.registry.disconnectController(controller.id, controller.attachment)
 	})
 	return err
 }
@@ -495,17 +600,17 @@ func (r *Registry) Close() error {
 }
 
 func (r *Registry) prepareGeneration(id controllerID, generation uint64) (Transaction, error) {
-	if generation == 0 {
-		return Transaction{}, ErrInvalidGeneration
-	}
-	var transaction transactionID
-	if err := readRandom(r.random, transaction[:]); err != nil {
-		return Transaction{}, err
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.requireControllerLocked(id); err != nil {
 		return Transaction{}, err
+	}
+	if err := r.consumeControlLocked(r.now()); err != nil {
+		return Transaction{}, err
+	}
+	if generation == 0 {
+		r.stats.Rejected++
+		return Transaction{}, ErrInvalidGeneration
 	}
 	if r.prepared != nil {
 		return Transaction{}, ErrTransactionActive
@@ -513,6 +618,10 @@ func (r *Registry) prepareGeneration(id controllerID, generation uint64) (Transa
 	if generation <= r.lastGeneration || generation == r.activeGeneration {
 		r.stats.Rejected++
 		return Transaction{}, ErrStaleGeneration
+	}
+	var transaction transactionID
+	if err := readRandom(r.random, transaction[:]); err != nil {
+		return Transaction{}, err
 	}
 	r.prepared = &preparedGeneration{id: transaction, generation: generation}
 	r.stats.GenerationsPrepared++
@@ -523,6 +632,9 @@ func (r *Registry) commitGeneration(id controllerID, transaction Transaction) er
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.requireControllerLocked(id); err != nil {
+		return err
+	}
+	if err := r.consumeControlLocked(r.now()); err != nil {
 		return err
 	}
 	if r.prepared == nil || r.prepared.id != transaction.id || r.prepared.generation != transaction.generation {
@@ -543,6 +655,9 @@ func (r *Registry) abortGeneration(id controllerID, transaction Transaction) err
 	if err := r.requireControllerLocked(id); err != nil {
 		return err
 	}
+	if err := r.consumeControlLocked(r.now()); err != nil {
+		return err
+	}
 	if r.prepared == nil || r.prepared.id != transaction.id || r.prepared.generation != transaction.generation {
 		r.stats.Rejected++
 		return ErrUnknownTransaction
@@ -558,6 +673,9 @@ func (r *Registry) disableGeneration(id controllerID, generation uint64) error {
 	if err := r.requireControllerLocked(id); err != nil {
 		return err
 	}
+	if err := r.consumeControlLocked(r.now()); err != nil {
+		return err
+	}
 	if generation == 0 || generation != r.activeGeneration {
 		r.stats.Rejected++
 		return ErrGenerationNotActive
@@ -570,18 +688,17 @@ func (r *Registry) disableGeneration(id controllerID, generation uint64) error {
 }
 
 func (r *Registry) openFlow(id controllerID, spec FlowSpec) (FlowLease, error) {
-	if err := validateFlowSpec(spec); err != nil {
-		r.reject()
-		return FlowLease{}, err
-	}
-	var nonce LeaseNonce
-	if err := readRandom(r.random, nonce[:]); err != nil {
-		return FlowLease{}, err
-	}
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.requireControllerLocked(id); err != nil {
+		return FlowLease{}, err
+	}
+	if err := r.consumeControlLocked(now); err != nil {
+		return FlowLease{}, err
+	}
+	if err := validateFlowSpec(spec); err != nil {
+		r.stats.Rejected++
 		return FlowLease{}, err
 	}
 	r.expireFlowsLocked(now)
@@ -597,6 +714,10 @@ func (r *Registry) openFlow(id controllerID, spec FlowSpec) (FlowLease, error) {
 		r.stats.Rejected++
 		return FlowLease{}, ErrFlowLimit
 	}
+	var nonce LeaseNonce
+	if err := readRandom(r.random, nonce[:]); err != nil {
+		return FlowLease{}, err
+	}
 	r.flows[spec.ID] = &flowLease{spec: spec, nonce: nonce, lastActivity: now}
 	r.stats.FlowsOpened++
 	return FlowLease{FlowID: spec.ID, Generation: spec.Generation, LeaseNonce: nonce, ExpiresAt: now.Add(r.limits.FlowTTL)}, nil
@@ -606,6 +727,9 @@ func (r *Registry) closeFlow(controller controllerID, generation uint64, id Flow
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.requireControllerLocked(controller); err != nil {
+		return err
+	}
+	if err := r.consumeControlLocked(r.now()); err != nil {
 		return err
 	}
 	lease, exists := r.flows[id]
@@ -630,12 +754,22 @@ func (r *Registry) acceptDatagram(controller controllerID, datagram Datagram) (*
 		r.mu.Unlock()
 		return nil, ErrDatagramTooLarge
 	}
+	if err := r.consumeDataLocked(now, len(datagram.Payload)); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
 	lease, exists := r.flows[datagram.FlowID]
 	if !exists || r.flowExpiredLocked(datagram.FlowID, lease, now) || datagram.Generation != r.activeGeneration ||
 		lease.spec.Generation != datagram.Generation || lease.nonce != datagram.LeaseNonce {
 		r.stats.Rejected++
 		r.mu.Unlock()
 		return nil, ErrUnknownFlow
+	}
+	payloadLimit, err := tgp.MaxCapturedUDPV2Payload(r.limits.MaxTGPDatagramSize, lease.spec.Local.Addr(), lease.spec.Remote.Addr())
+	if err != nil || len(datagram.Payload) > payloadLimit {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, ErrDatagramTooLarge
 	}
 	if lease.hasSequence && datagram.Sequence <= lease.sequence {
 		r.stats.Rejected++
@@ -670,12 +804,22 @@ func (r *Registry) resolveReply(controller controllerID, datagram tgp.TunnelData
 		r.mu.Unlock()
 		return nil, err
 	}
+	if len(datagram.Payload) > r.limits.MaxDatagramSize {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, ErrDatagramTooLarge
+	}
+	if err := r.consumeDataLocked(now, len(datagram.Payload)); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
 	if datagram.Identity.IsZero() {
 		r.stats.Rejected++
 		r.mu.Unlock()
 		return nil, ErrMissingLeaseIdentity
 	}
-	if len(datagram.Payload) > r.limits.MaxDatagramSize {
+	payloadLimit, err := tgp.MaxCapturedUDPV2Payload(r.limits.MaxTGPDatagramSize, datagram.LocalIP, datagram.RemoteIP)
+	if err != nil || len(datagram.Payload) > payloadLimit {
 		r.stats.Rejected++
 		r.mu.Unlock()
 		return nil, ErrDatagramTooLarge
@@ -714,13 +858,13 @@ func (r *Registry) requireControllerLocked(id controllerID) error {
 	return nil
 }
 
-func (r *Registry) disconnectController(id controllerID, attachmentID string) error {
+func (r *Registry) disconnectController(id controllerID, attachment *TransportAttachment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return ErrClosed
 	}
-	if !r.controllerAlive || r.controller != id || r.attachment == nil || r.attachment.ID != attachmentID {
+	if !r.controllerAlive || r.controller != id || attachment == nil || r.attachment != attachment || r.attachment.id != attachment.id {
 		return ErrControllerRevoked
 	}
 	r.revokeControllerLocked(true)
@@ -739,6 +883,34 @@ func (r *Registry) revokeControllerLocked(countDisconnect bool) {
 	r.prepared = nil
 	r.activeGeneration = 0
 	r.evictFlowsLocked(false)
+}
+
+func (r *Registry) consumeControlLocked(now time.Time) error {
+	r.controlBucket.refill(now)
+	if r.controlBucket.tokens < 1 {
+		r.stats.ControlRateLimited++
+		r.stats.Rejected++
+		return ErrRateLimit
+	}
+	r.controlBucket.tokens--
+	return nil
+}
+
+func (r *Registry) consumeDataLocked(now time.Time, payloadSize int) error {
+	byteCharge := payloadSize
+	if byteCharge == 0 {
+		byteCharge = 1
+	}
+	r.packetBucket.refill(now)
+	r.byteBucket.refill(now)
+	if r.packetBucket.tokens < 1 || r.byteBucket.tokens < float64(byteCharge) {
+		r.stats.DataRateLimited++
+		r.stats.Rejected++
+		return ErrRateLimit
+	}
+	r.packetBucket.tokens--
+	r.byteBucket.tokens -= float64(byteCharge)
+	return nil
 }
 
 func (r *Registry) reserveBufferLocked(size int) (*bufferLease, error) {
@@ -809,12 +981,6 @@ func (r *Registry) reapLoop() {
 			r.expireFlowsAt(r.now())
 		}
 	}
-}
-
-func (r *Registry) reject() {
-	r.mu.Lock()
-	r.stats.Rejected++
-	r.mu.Unlock()
 }
 
 func validateFlowSpec(spec FlowSpec) error {

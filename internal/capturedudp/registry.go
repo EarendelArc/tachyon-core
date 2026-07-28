@@ -22,30 +22,36 @@ import (
 const (
 	SessionTokenSize = 32
 
-	HardMaxFlows               = 65536
-	HardMaxDatagramSize        = tgp.MaxTGPDatagramSize - tgp.CapturedUDPV2IPv4Overhead
-	HardMaxBufferedBytes       = 64 << 20
-	HardMaxFlowTTL             = time.Hour
-	MinFlowTTL                 = time.Second
-	HardMaxPacketsPerSecond    = 200000
-	HardMaxPacketBurst         = 20000
-	HardMaxBytesPerSecond      = 256 << 20
-	HardMaxByteBurst           = 64 << 20
-	HardMaxControlOpsPerSecond = 10000
-	HardMaxControlBurst        = 1000
-	defaultMaxFlows            = 4096
-	defaultTGPDatagramSize     = tgp.DefaultTGPDatagramSize
-	defaultBufferedBytes       = 8 << 20
-	defaultFlowTTL             = 2 * time.Minute
-	defaultReapInterval        = 30 * time.Second
-	defaultPacketsPerSecond    = 20000
-	defaultPacketBurst         = 2000
-	defaultBytesPerSecond      = 32 << 20
-	defaultByteBurst           = 8 << 20
-	defaultControlOpsPerSecond = 2000
-	defaultControlBurst        = 200
-	estimatedFlowMetaSize      = 256
-	hardFlowMetadataBytes      = 16 << 20
+	HardMaxFlows                = 65536
+	HardMaxDatagramSize         = tgp.MaxTGPDatagramSize - tgp.CapturedUDPV2IPv4Overhead
+	HardMaxBufferedBytes        = 64 << 20
+	HardMaxFlowTTL              = time.Hour
+	MinFlowTTL                  = time.Second
+	HardMaxPacketsPerSecond     = 200000
+	HardMaxPacketBurst          = 20000
+	HardMaxBytesPerSecond       = 256 << 20
+	HardMaxByteBurst            = 64 << 20
+	HardMaxControlOpsPerSecond  = 10000
+	HardMaxControlBurst         = 1000
+	HardMaxOutstandingObjects   = 8192
+	HardMaxObjectsPerDirection  = 4096
+	HardMaxOutstandingMetadata  = 1 << 20
+	HardMaxMetadataPerDirection = 768 << 10
+	MinPayloadReservation       = 64
+	defaultMaxFlows             = 4096
+	defaultTGPDatagramSize      = tgp.DefaultTGPDatagramSize
+	defaultBufferedBytes        = 8 << 20
+	defaultFlowTTL              = 2 * time.Minute
+	defaultReapInterval         = 30 * time.Second
+	defaultPacketsPerSecond     = 20000
+	defaultPacketBurst          = 2000
+	defaultBytesPerSecond       = 32 << 20
+	defaultByteBurst            = 8 << 20
+	defaultControlOpsPerSecond  = 2000
+	defaultControlBurst         = 200
+	estimatedFlowMetaSize       = 256
+	hardFlowMetadataBytes       = 16 << 20
+	outstandingObjectMetaSize   = 160
 )
 
 var (
@@ -70,6 +76,8 @@ var (
 	ErrUnknownTransaction   = errors.New("unknown captured UDP generation transaction")
 	ErrMissingLeaseIdentity = errors.New("captured UDP reply has no lease identity")
 	ErrRateLimit            = errors.New("captured UDP controller rate limit exceeded")
+	ErrAttachmentStale      = errors.New("captured UDP transport attachment is no longer usable")
+	ErrOutstandingBudget    = errors.New("captured UDP outstanding object budget exhausted")
 )
 
 type FlowID = tgp.FlowID
@@ -80,6 +88,23 @@ type controllerID [16]byte
 type transactionID [16]byte
 
 type AddressFamily uint8
+
+type attachmentState uint8
+
+const (
+	attachmentNew attachmentState = iota
+	attachmentAttached
+	attachmentDetached
+	attachmentClosed
+)
+
+type bufferDirection uint8
+
+const (
+	bufferAccepted bufferDirection = iota
+	bufferDelivery
+	bufferDirectionCount
+)
 
 const (
 	AddressFamilyIPv4 AddressFamily = 4
@@ -126,8 +151,9 @@ func (limits Limits) normalized() (Limits, error) {
 	if limits.MaxDatagramSize > HardMaxDatagramSize || limits.MaxDatagramSize > maxPayload {
 		return Limits{}, fmt.Errorf("captured UDP max datagram size %d exceeds v2 budget %d", limits.MaxDatagramSize, maxPayload)
 	}
-	if limits.MaxBufferedBytes > HardMaxBufferedBytes || limits.MaxBufferedBytes < limits.MaxDatagramSize {
-		return Limits{}, fmt.Errorf("captured UDP buffered byte budget %d is outside [%d,%d]", limits.MaxBufferedBytes, limits.MaxDatagramSize, HardMaxBufferedBytes)
+	minimumBufferedBytes := max(limits.MaxDatagramSize, MinPayloadReservation)
+	if limits.MaxBufferedBytes > HardMaxBufferedBytes || limits.MaxBufferedBytes < minimumBufferedBytes {
+		return Limits{}, fmt.Errorf("captured UDP buffered byte budget %d is outside [%d,%d]", limits.MaxBufferedBytes, minimumBufferedBytes, HardMaxBufferedBytes)
 	}
 	if limits.FlowTTL < MinFlowTTL || limits.FlowTTL > HardMaxFlowTTL {
 		return Limits{}, fmt.Errorf("captured UDP flow TTL %s is outside [%s,%s]", limits.FlowTTL, MinFlowTTL, HardMaxFlowTTL)
@@ -169,6 +195,7 @@ type TransportAttachment struct {
 	registry     *Registry
 	id           attachmentID
 	peerVerified bool
+	state        attachmentState
 }
 
 func (attachment *TransportAttachment) Detach() error {
@@ -216,6 +243,10 @@ type Health struct {
 	PreparedGeneration    uint64
 	OpenFlows             int
 	BufferedBytes         int
+	OutstandingObjects    int
+	OutstandingMetadata   int
+	AcceptedOutstanding   int
+	DeliveriesOutstanding int
 }
 
 type Stats struct {
@@ -299,12 +330,16 @@ type Registry struct {
 	byteBucket      tokenBucket
 	controlBucket   tokenBucket
 
-	prepared         *preparedGeneration
-	activeGeneration uint64
-	lastGeneration   uint64
-	flows            map[FlowID]*flowLease
-	bufferedBytes    int
-	stats            Stats
+	prepared            *preparedGeneration
+	activeGeneration    uint64
+	lastGeneration      uint64
+	flows               map[FlowID]*flowLease
+	bufferedBytes       int
+	outstandingObjects  int
+	outstandingMetadata int
+	objectsByDirection  [bufferDirectionCount]int
+	metadataByDirection [bufferDirectionCount]int
+	stats               Stats
 }
 
 type registryOptions struct {
@@ -360,31 +395,38 @@ func (r *Registry) newTransportAttachment(peerVerified bool) (*TransportAttachme
 	if r.closed {
 		return nil, ErrClosed
 	}
-	return &TransportAttachment{registry: r, id: id, peerVerified: peerVerified}, nil
+	return &TransportAttachment{registry: r, id: id, peerVerified: peerVerified, state: attachmentNew}, nil
 }
 
 // AttachTransport records transport state and issues a fresh one-use token
 // only for an attachment whose OS peer was verified by a platform transport.
 func (r *Registry) AttachTransport(attachment *TransportAttachment) (SessionToken, error) {
 	var zero SessionToken
-	if attachment == nil || attachment.registry != r || attachment.id == (attachmentID{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		if attachment != nil && attachment.registry == r && attachment.state == attachmentNew {
+			r.destroyAttachmentLocked(attachment, attachmentClosed)
+		}
+		return zero, ErrClosed
+	}
+	if attachment == nil || attachment.registry != r {
 		return zero, ErrTransportMismatch
+	}
+	if attachment.state != attachmentNew || attachment.id == (attachmentID{}) {
+		return zero, ErrAttachmentStale
 	}
 	if !attachment.peerVerified {
 		return zero, ErrTransportNotVerified
+	}
+	if r.attachment != nil || r.controllerAlive {
+		return zero, ErrTransportActive
 	}
 	var token SessionToken
 	if err := readRandom(r.random, token[:]); err != nil {
 		return zero, err
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return zero, ErrClosed
-	}
-	if r.attachment != nil || r.controllerAlive {
-		return zero, ErrTransportActive
-	}
+	attachment.state = attachmentAttached
 	r.attachment = attachment
 	r.token = token
 	r.tokenIssued = true
@@ -394,32 +436,45 @@ func (r *Registry) AttachTransport(attachment *TransportAttachment) (SessionToke
 func (r *Registry) detachTransport(attachment *TransportAttachment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if attachment == nil || attachment.registry != r {
+		return ErrTransportMismatch
+	}
 	if r.closed {
+		if attachment.state == attachmentNew {
+			r.destroyAttachmentLocked(attachment, attachmentClosed)
+		}
 		return ErrClosed
 	}
-	if attachment == nil || attachment.registry != r || r.attachment != attachment || r.attachment.id != attachment.id {
+	if attachment.state == attachmentNew {
+		return ErrTransportMismatch
+	}
+	if attachment.state != attachmentAttached || attachment.id == (attachmentID{}) {
+		return ErrAttachmentStale
+	}
+	if r.attachment != attachment {
 		return ErrTransportMismatch
 	}
 	r.revokeControllerLocked(true)
 	r.attachment = nil
+	r.destroyAttachmentLocked(attachment, attachmentDetached)
 	return nil
 }
 
 // Authenticate consumes the per-attachment token and binds the sole
 // controller capability to that transport attachment.
 func (r *Registry) Authenticate(attachment *TransportAttachment, token SessionToken) (*Controller, error) {
-	var id controllerID
-	if err := readRandom(r.random, id[:]); err != nil {
-		return nil, err
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil, ErrClosed
 	}
-	if attachment == nil || attachment.registry != r || r.attachment != attachment || r.attachment.id != attachment.id {
+	if attachment == nil || attachment.registry != r || r.attachment != attachment {
 		r.stats.AuthenticationFailures++
 		return nil, ErrTransportMismatch
+	}
+	if attachment.state != attachmentAttached || attachment.id == (attachmentID{}) {
+		r.stats.AuthenticationFailures++
+		return nil, ErrAttachmentStale
 	}
 	if !r.attachment.peerVerified {
 		r.stats.AuthenticationFailures++
@@ -431,6 +486,10 @@ func (r *Registry) Authenticate(attachment *TransportAttachment, token SessionTo
 	if !r.tokenIssued || subtle.ConstantTimeCompare(r.token[:], token[:]) != 1 {
 		r.stats.AuthenticationFailures++
 		return nil, ErrAuthentication
+	}
+	var id controllerID
+	if err := readRandom(r.random, id[:]); err != nil {
+		return nil, err
 	}
 	clear(r.token[:])
 	r.tokenIssued = false
@@ -519,9 +578,11 @@ func (controller *Controller) ResolveReply(datagram tgp.TunnelDatagram) (*Delive
 }
 
 type bufferLease struct {
-	registry *Registry
-	bytes    int
-	once     sync.Once
+	registry  *Registry
+	bytes     int
+	metadata  int
+	direction bufferDirection
+	once      sync.Once
 }
 
 func (lease *bufferLease) release() {
@@ -529,7 +590,7 @@ func (lease *bufferLease) release() {
 		return
 	}
 	lease.once.Do(func() {
-		lease.registry.releaseBuffer(lease.bytes)
+		lease.registry.releaseBuffer(lease.direction, lease.bytes, lease.metadata)
 	})
 }
 
@@ -566,6 +627,8 @@ func (r *Registry) Health() Health {
 		ControllerConnected: r.controllerAlive,
 		ActiveGeneration:    r.activeGeneration,
 		OpenFlows:           len(r.flows), BufferedBytes: r.bufferedBytes,
+		OutstandingObjects: r.outstandingObjects, OutstandingMetadata: r.outstandingMetadata,
+		AcceptedOutstanding: r.objectsByDirection[bufferAccepted], DeliveriesOutstanding: r.objectsByDirection[bufferDelivery],
 	}
 	if r.attachment != nil {
 		health.TransportPeerVerified = r.attachment.peerVerified
@@ -592,6 +655,9 @@ func (r *Registry) Close() error {
 	}
 	r.closed = true
 	r.revokeControllerLocked(false)
+	if r.attachment != nil {
+		r.destroyAttachmentLocked(r.attachment, attachmentClosed)
+	}
 	r.attachment = nil
 	close(r.stop)
 	r.mu.Unlock()
@@ -776,7 +842,7 @@ func (r *Registry) acceptDatagram(controller controllerID, datagram Datagram) (*
 		r.mu.Unlock()
 		return nil, ErrSequenceReplay
 	}
-	buffer, err := r.reserveBufferLocked(len(datagram.Payload))
+	buffer, err := r.reserveBufferLocked(bufferAccepted, len(datagram.Payload))
 	if err != nil {
 		r.stats.Rejected++
 		r.mu.Unlock()
@@ -833,7 +899,7 @@ func (r *Registry) resolveReply(controller controllerID, datagram tgp.TunnelData
 		r.mu.Unlock()
 		return nil, ErrUnknownFlow
 	}
-	buffer, err := r.reserveBufferLocked(len(datagram.Payload))
+	buffer, err := r.reserveBufferLocked(bufferDelivery, len(datagram.Payload))
 	if err != nil {
 		r.stats.Rejected++
 		r.mu.Unlock()
@@ -864,12 +930,20 @@ func (r *Registry) disconnectController(id controllerID, attachment *TransportAt
 	if r.closed {
 		return ErrClosed
 	}
-	if !r.controllerAlive || r.controller != id || attachment == nil || r.attachment != attachment || r.attachment.id != attachment.id {
+	if !r.controllerAlive || r.controller != id || attachment == nil || r.attachment != attachment ||
+		attachment.state != attachmentAttached || attachment.id == (attachmentID{}) {
 		return ErrControllerRevoked
 	}
 	r.revokeControllerLocked(true)
 	r.attachment = nil
+	r.destroyAttachmentLocked(attachment, attachmentDetached)
 	return nil
+}
+
+func (r *Registry) destroyAttachmentLocked(attachment *TransportAttachment, state attachmentState) {
+	clear(attachment.id[:])
+	attachment.peerVerified = false
+	attachment.state = state
 }
 
 func (r *Registry) revokeControllerLocked(countDisconnect bool) {
@@ -913,25 +987,44 @@ func (r *Registry) consumeDataLocked(now time.Time, payloadSize int) error {
 	return nil
 }
 
-func (r *Registry) reserveBufferLocked(size int) (*bufferLease, error) {
+func (r *Registry) reserveBufferLocked(direction bufferDirection, size int) (*bufferLease, error) {
 	if size < 0 || size > r.limits.MaxDatagramSize {
 		return nil, ErrDatagramTooLarge
 	}
-	if r.bufferedBytes > r.limits.MaxBufferedBytes-size {
+	if direction >= bufferDirectionCount {
+		return nil, ErrOutstandingBudget
+	}
+	reservedBytes := max(size, MinPayloadReservation)
+	if r.bufferedBytes > r.limits.MaxBufferedBytes-reservedBytes {
 		return nil, ErrBufferBudget
 	}
-	r.bufferedBytes += size
-	return &bufferLease{registry: r, bytes: size}, nil
+	if r.outstandingObjects >= HardMaxOutstandingObjects ||
+		r.objectsByDirection[direction] >= HardMaxObjectsPerDirection ||
+		r.outstandingMetadata > HardMaxOutstandingMetadata-outstandingObjectMetaSize ||
+		r.metadataByDirection[direction] > HardMaxMetadataPerDirection-outstandingObjectMetaSize {
+		return nil, ErrOutstandingBudget
+	}
+	r.bufferedBytes += reservedBytes
+	r.outstandingObjects++
+	r.outstandingMetadata += outstandingObjectMetaSize
+	r.objectsByDirection[direction]++
+	r.metadataByDirection[direction] += outstandingObjectMetaSize
+	return &bufferLease{registry: r, bytes: reservedBytes, metadata: outstandingObjectMetaSize, direction: direction}, nil
 }
 
-func (r *Registry) releaseBuffer(size int) {
+func (r *Registry) releaseBuffer(direction bufferDirection, reservedBytes, metadata int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if size >= r.bufferedBytes {
-		r.bufferedBytes = 0
-	} else {
-		r.bufferedBytes -= size
+	if direction >= bufferDirectionCount || reservedBytes <= 0 || metadata <= 0 ||
+		r.bufferedBytes < reservedBytes || r.outstandingObjects <= 0 || r.outstandingMetadata < metadata ||
+		r.objectsByDirection[direction] <= 0 || r.metadataByDirection[direction] < metadata {
+		panic("captured UDP buffer lease accounting underflow")
 	}
+	r.bufferedBytes -= reservedBytes
+	r.outstandingObjects--
+	r.outstandingMetadata -= metadata
+	r.objectsByDirection[direction]--
+	r.metadataByDirection[direction] -= metadata
 }
 
 func (r *Registry) evictFlowsLocked(expired bool) {

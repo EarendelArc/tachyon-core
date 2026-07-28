@@ -20,8 +20,11 @@ paths on this path.
 The public API can create only an unverified transport attachment. Such an
 attachment cannot authenticate a controller. Every attachment has an internal
 random 256-bit capability accepted only by its originating registry. Attach
-and detach are exclusive: an active attachment/controller cannot be replaced,
-a foreign instance cannot detach it, and rejected attempts do not mutate state.
+and detach are exclusive. The lifecycle is irreversible (`new -> attached ->
+detached/closed`): an active attachment/controller cannot be replaced, a
+foreign instance cannot detach it, and rejected attempts do not mutate state.
+Detach, controller close, and registry close atomically clear the capability
+and verified-peer state. A stale attachment can never obtain another token.
 A future named-pipe transport in this package must verify its OS peer before
 creating a verified attachment.
 `Health.Ready` is true only while all of these conditions hold:
@@ -111,6 +114,10 @@ flow-family budget are checked before allocation or queueing.
   expired leases.
 - Flow count, datagram size, flow TTL, estimated flow metadata, and total
   outstanding payload bytes have non-configurable hard ceilings.
+- Accepted datagrams and reply deliveries share hard total and per-direction
+  limits for outstanding objects and estimated metadata. These ceilings are
+  not configurable. Every object reserves at least 64 payload-budget bytes,
+  including an empty payload, so sustained zero-length traffic remains bounded.
 - Each controller has shared packet/second and byte/second buckets for both
   data directions and an operations/second bucket for control calls. Empty
   datagrams cost one packet and at least one byte. Rate and burst settings
@@ -118,7 +125,8 @@ flow-family budget are checked before allocation or queueing.
 - Payload copying occurs after releasing the global registry lock.
 - Accepted payloads and deliveries reserve the byte budget until callers invoke
   `Release()`. A leaked reservation fails closed with `ErrBufferBudget` rather
-  than allowing unbounded allocation.
+  than allowing unbounded allocation. `Release()` is idempotent and returns the
+  exact payload, object, and metadata reservations once.
 - Helper datagram sequences are strictly increasing per lease.
 - Input and output payloads are copied at the trust boundary.
 

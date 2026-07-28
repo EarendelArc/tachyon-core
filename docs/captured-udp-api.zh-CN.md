@@ -15,8 +15,10 @@ callout 驱动和数据包注入路径均未实现。本文档不能作为 Tachy
 
 公开 API 只能创建未验证的 transport attachment，它不能认证 controller。每个
 attachment 都有仅由其来源 registry 接受的内部随机 256-bit capability。Attach 与
-Detach 是排他的：存在 active attachment/controller 时不能替换，外部实例不能撤销，
-失败或未验证的尝试不得改变状态。未来同包内 Named Pipe transport 必须先验证 OS
+Detach 是排他的。生命周期不可逆（`new -> attached -> detached/closed`）：存在
+active attachment/controller 时不能替换，外部实例不能撤销，失败或未验证的尝试不得
+改变状态。Detach、controller close 与 registry close 会原子清零 capability 和对端
+verified 状态；stale attachment 永远不能再次取得 token。未来同包内 Named Pipe transport 必须先验证 OS
 对端，才能创建已验证 attachment。仅当以下条件全部成立时，`Health.Ready` 才为 true：
 
 - transport 已连接；
@@ -95,12 +97,16 @@ AEAD tag、FEC 长度前缀、v2 身份和 endpoint 编码开销，再预留或�
 - Flow lease 有 idle TTL；后台 reaper 和数据热路径都会回收过期 lease。
 - Flow 数、单包大小、TTL、估算 flow metadata 和所有未释放 payload 总字节数均有
   不可配置突破的硬上限。
+- Accepted datagram 与 reply delivery 对 outstanding object 和估算 metadata 同时具有
+  不可配置的全局及单方向硬上限。每个对象至少预留 64 字节 payload 预算，零长 payload
+  也不例外，因此持续零长流量仍保持有界。
 - 每个 controller 对双向数据共享 packet/s 与 byte/s token bucket，控制调用使用独立
   operations/s bucket。零长数据报也消耗一个 packet 和至少一个 byte；rate 与 burst
   配置不能突破硬上限。
 - 大 payload 复制发生在释放 registry 全局锁之后。
 - Accepted payload 和 delivery 会占用字节预算，调用方必须调用 `Release()`；泄漏预算
-  时以 `ErrBufferBudget` fail-closed，而不是允许内存无限增长。
+  时以 `ErrBufferBudget` fail-closed，而不是允许内存无限增长。`Release()` 幂等，并且
+  只精确归还一次 payload、object 与 metadata reservation。
 - 每个 lease 的 helper 数据报序列必须严格递增。
 - 跨越信任边界的输入输出 payload 都会复制。
 

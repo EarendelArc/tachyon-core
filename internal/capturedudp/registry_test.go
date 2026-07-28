@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/netip"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,6 +105,133 @@ func TestAttachReplacementAndForeignDetachHaveNoSideEffects(t *testing.T) {
 	accepted.Release()
 	if !registry.Health().Ready {
 		t.Fatal("failed attach attempt changed active health")
+	}
+}
+
+func TestAttachmentLifecycleIsIrreversibleAfterControllerClose(t *testing.T) {
+	registry := testRegistry(t, Limits{})
+	attachment, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := registry.AttachTransport(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := registry.Authenticate(attachment, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if attachment.state != attachmentDetached || attachment.id != (attachmentID{}) || attachment.peerVerified {
+		t.Fatalf("destroyed attachment = state %d id %x verified %v", attachment.state, attachment.id, attachment.peerVerified)
+	}
+	if _, err := registry.AttachTransport(attachment); !errors.Is(err, ErrAttachmentStale) {
+		t.Fatalf("reattach destroyed capability error = %v", err)
+	}
+	if err := attachment.Detach(); !errors.Is(err, ErrAttachmentStale) {
+		t.Fatalf("detach destroyed capability error = %v", err)
+	}
+}
+
+func TestForeignAttachmentCannotMutateOwningRegistry(t *testing.T) {
+	first := testRegistry(t, Limits{})
+	second := testRegistry(t, Limits{})
+	attachment, err := first.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.AttachTransport(attachment); !errors.Is(err, ErrTransportMismatch) {
+		t.Fatalf("foreign attach error = %v", err)
+	}
+	if attachment.state != attachmentNew || attachment.id == (attachmentID{}) || !attachment.peerVerified {
+		t.Fatal("foreign attach mutated capability")
+	}
+	if _, err := first.AttachTransport(attachment); err != nil {
+		t.Fatalf("owner could not attach after foreign attempt: %v", err)
+	}
+	if err := attachment.Detach(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentAttachAllowsExactlyOneSuccess(t *testing.T) {
+	registry := testRegistry(t, Limits{})
+	attachment, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const contenders = 32
+	var successes atomic.Int32
+	errorsSeen := make(chan error, contenders)
+	var wait sync.WaitGroup
+	for range contenders {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, attachErr := registry.AttachTransport(attachment); attachErr == nil {
+				successes.Add(1)
+			} else {
+				errorsSeen <- attachErr
+			}
+		}()
+	}
+	wait.Wait()
+	close(errorsSeen)
+	if successes.Load() != 1 {
+		t.Fatalf("successful attaches = %d, want 1", successes.Load())
+	}
+	for err := range errorsSeen {
+		if !errors.Is(err, ErrAttachmentStale) {
+			t.Fatalf("concurrent attach error = %v", err)
+		}
+	}
+	if err := attachment.Detach(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentDetachAndControllerCloseDestroyCapabilityOnce(t *testing.T) {
+	registry := testRegistry(t, Limits{})
+	attachment, err := registry.newVerifiedTransportAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := registry.AttachTransport(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := registry.Authenticate(attachment, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() { defer wait.Done(); results <- attachment.Detach() }()
+	go func() { defer wait.Done(); results <- controller.Close() }()
+	wait.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(err, ErrAttachmentStale) && !errors.Is(err, ErrControllerRevoked) {
+			t.Fatalf("concurrent close error = %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful terminal transitions = %d, want 1", successes)
+	}
+	if attachment.state != attachmentDetached || attachment.id != (attachmentID{}) || attachment.peerVerified {
+		t.Fatal("concurrent close did not destroy attachment")
+	}
+	if health := registry.Health(); health.TransportAttached || health.ControllerConnected || health.Ready {
+		t.Fatalf("health after concurrent close = %+v", health)
 	}
 }
 
@@ -228,7 +357,7 @@ func TestFlowTTLExpiresInactiveLease(t *testing.T) {
 }
 
 func TestBufferedByteBudgetRequiresRelease(t *testing.T) {
-	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: 4})
+	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: MinPayloadReservation})
 	commitGeneration(t, controller, 1)
 	first, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
 	if err != nil {
@@ -242,8 +371,8 @@ func TestBufferedByteBudgetRequiresRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := registry.Health().BufferedBytes; got != 4 {
-		t.Fatalf("buffered bytes = %d, want 4", got)
+	if got := registry.Health().BufferedBytes; got != MinPayloadReservation {
+		t.Fatalf("buffered bytes = %d, want %d", got, MinPayloadReservation)
 	}
 	if _, err := controller.AcceptDatagram(testDatagram(second, 0, "x")); !errors.Is(err, ErrBufferBudget) {
 		t.Fatalf("buffer budget error = %v", err)
@@ -260,7 +389,7 @@ func TestBufferedByteBudgetRequiresRelease(t *testing.T) {
 }
 
 func TestBufferedByteBudgetCannotBeResetByGenerationReplacement(t *testing.T) {
-	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: 4})
+	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: MinPayloadReservation})
 	commitGeneration(t, controller, 1)
 	oldLease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
 	if err != nil {
@@ -271,7 +400,7 @@ func TestBufferedByteBudgetCannotBeResetByGenerationReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	commitGeneration(t, controller, 2)
-	if got := registry.Health().BufferedBytes; got != 4 {
+	if got := registry.Health().BufferedBytes; got != MinPayloadReservation {
 		t.Fatalf("replacement reset outstanding byte budget to %d", got)
 	}
 	newLease, err := controller.OpenFlow(testFlow(1, 2, "10.0.0.2:40000", "203.0.113.9:27015"))
@@ -287,6 +416,203 @@ func TestBufferedByteBudgetCannotBeResetByGenerationReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	accepted.Release()
+}
+
+func TestZeroLengthReservationsAreBidirectionalAndReleaseExactlyOnce(t *testing.T) {
+	registry, controller := testController(t, Limits{})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := controller.AcceptDatagram(testDatagram(lease, 0, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := controller.ResolveReply(accepted.Datagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := registry.Health()
+	if health.BufferedBytes != 2*MinPayloadReservation || health.OutstandingObjects != 2 ||
+		health.OutstandingMetadata != 2*outstandingObjectMetaSize || health.AcceptedOutstanding != 1 ||
+		health.DeliveriesOutstanding != 1 {
+		t.Fatalf("zero-length reservations = %+v", health)
+	}
+	accepted.Release()
+	accepted.Release()
+	health = registry.Health()
+	if health.BufferedBytes != MinPayloadReservation || health.OutstandingObjects != 1 ||
+		health.OutstandingMetadata != outstandingObjectMetaSize || health.AcceptedOutstanding != 0 ||
+		health.DeliveriesOutstanding != 1 {
+		t.Fatalf("accepted idempotent release = %+v", health)
+	}
+	delivery.Release()
+	delivery.Release()
+	health = registry.Health()
+	if health.BufferedBytes != 0 || health.OutstandingObjects != 0 || health.OutstandingMetadata != 0 ||
+		health.AcceptedOutstanding != 0 || health.DeliveriesOutstanding != 0 {
+		t.Fatalf("delivery idempotent release = %+v", health)
+	}
+}
+
+func TestOutstandingDirectionObjectLimitBoundsZeroLengthTraffic(t *testing.T) {
+	registry, controller := testController(t, Limits{
+		PacketsPerSecond: HardMaxPacketsPerSecond,
+		PacketBurst:      HardMaxPacketBurst,
+	})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outstanding := make([]*AcceptedDatagram, 0, HardMaxObjectsPerDirection)
+	for sequence := range HardMaxObjectsPerDirection {
+		accepted, acceptErr := controller.AcceptDatagram(testDatagram(lease, uint64(sequence), ""))
+		if acceptErr != nil {
+			t.Fatalf("accept %d: %v", sequence, acceptErr)
+		}
+		outstanding = append(outstanding, accepted)
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(lease, HardMaxObjectsPerDirection, "")); !errors.Is(err, ErrOutstandingBudget) {
+		t.Fatalf("object cap error = %v", err)
+	}
+	health := registry.Health()
+	if health.AcceptedOutstanding != HardMaxObjectsPerDirection || health.OutstandingObjects != HardMaxObjectsPerDirection {
+		t.Fatalf("object cap health = %+v", health)
+	}
+	for _, accepted := range outstanding {
+		accepted.Release()
+	}
+	if health = registry.Health(); health.BufferedBytes != 0 || health.OutstandingObjects != 0 || health.OutstandingMetadata != 0 {
+		t.Fatalf("object cap release health = %+v", health)
+	}
+}
+
+func TestOutstandingMetadataLimitBoundsBothDirections(t *testing.T) {
+	registry, controller := testController(t, Limits{
+		PacketsPerSecond: HardMaxPacketsPerSecond,
+		PacketBurst:      HardMaxPacketBurst,
+	})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const acceptedCount = 3276
+	outstandingAccepted := make([]*AcceptedDatagram, 0, acceptedCount)
+	var reply tgp.TunnelDatagram
+	for sequence := range acceptedCount {
+		accepted, acceptErr := controller.AcceptDatagram(testDatagram(lease, uint64(sequence), ""))
+		if acceptErr != nil {
+			t.Fatalf("accept %d: %v", sequence, acceptErr)
+		}
+		reply = accepted.Datagram
+		outstandingAccepted = append(outstandingAccepted, accepted)
+	}
+	remaining := HardMaxOutstandingMetadata/outstandingObjectMetaSize - acceptedCount
+	outstandingDeliveries := make([]*Delivery, 0, remaining)
+	for index := range remaining {
+		delivery, resolveErr := controller.ResolveReply(reply)
+		if resolveErr != nil {
+			t.Fatalf("resolve %d: %v", index, resolveErr)
+		}
+		outstandingDeliveries = append(outstandingDeliveries, delivery)
+	}
+	if _, err := controller.ResolveReply(reply); !errors.Is(err, ErrOutstandingBudget) {
+		t.Fatalf("metadata cap error = %v", err)
+	}
+	health := registry.Health()
+	if health.OutstandingMetadata != len(outstandingAccepted)*outstandingObjectMetaSize+len(outstandingDeliveries)*outstandingObjectMetaSize {
+		t.Fatalf("metadata cap health = %+v", health)
+	}
+	for _, accepted := range outstandingAccepted {
+		accepted.Release()
+	}
+	for _, delivery := range outstandingDeliveries {
+		delivery.Release()
+	}
+	if health = registry.Health(); health.BufferedBytes != 0 || health.OutstandingObjects != 0 || health.OutstandingMetadata != 0 {
+		t.Fatalf("metadata cap release health = %+v", health)
+	}
+}
+
+func TestLongRunningReleasedTrafficKeepsAccountingBounded(t *testing.T) {
+	registry, controller := testController(t, Limits{
+		PacketsPerSecond: HardMaxPacketsPerSecond,
+		PacketBurst:      HardMaxPacketBurst,
+	})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sequence := range 5000 {
+		accepted, acceptErr := controller.AcceptDatagram(testDatagram(lease, uint64(sequence), ""))
+		if acceptErr != nil {
+			t.Fatalf("accept %d: %v", sequence, acceptErr)
+		}
+		delivery, resolveErr := controller.ResolveReply(accepted.Datagram)
+		if resolveErr != nil {
+			t.Fatalf("resolve %d: %v", sequence, resolveErr)
+		}
+		accepted.Release()
+		delivery.Release()
+	}
+	if health := registry.Health(); health.BufferedBytes != 0 || health.OutstandingObjects != 0 || health.OutstandingMetadata != 0 {
+		t.Fatalf("long-running accounting = %+v", health)
+	}
+}
+
+func TestConcurrentBidirectionalReleaseKeepsAccountingExact(t *testing.T) {
+	registry, controller := testController(t, Limits{
+		PacketsPerSecond: HardMaxPacketsPerSecond,
+		PacketBurst:      HardMaxPacketBurst,
+	})
+	commitGeneration(t, controller, 1)
+	const workers = 64
+	leases := make([]FlowLease, workers)
+	for worker := range workers {
+		lease, err := controller.OpenFlow(testFlow(byte(worker+1), 1,
+			"10.0.0.2:"+strconv.Itoa(40000+worker), "203.0.113.9:27015"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases[worker] = lease
+	}
+	errorsSeen := make(chan error, workers)
+	var wait sync.WaitGroup
+	for worker := range workers {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			for sequence := range 100 {
+				accepted, err := controller.AcceptDatagram(testDatagram(leases[worker], uint64(sequence), ""))
+				if err != nil {
+					errorsSeen <- err
+					return
+				}
+				delivery, err := controller.ResolveReply(accepted.Datagram)
+				if err != nil {
+					accepted.Release()
+					errorsSeen <- err
+					return
+				}
+				accepted.Release()
+				accepted.Release()
+				delivery.Release()
+				delivery.Release()
+			}
+		}(worker)
+	}
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		t.Fatal(err)
+	}
+	if health := registry.Health(); health.BufferedBytes != 0 || health.OutstandingObjects != 0 || health.OutstandingMetadata != 0 {
+		t.Fatalf("concurrent accounting = %+v", health)
+	}
 }
 
 func TestRegistryEnforcesCapturedUDPV2PayloadBudget(t *testing.T) {
@@ -459,7 +785,7 @@ func TestLimitsRejectHardCapViolations(t *testing.T) {
 }
 
 func TestPayloadCopiesAreBudgetedOutsideLeaseState(t *testing.T) {
-	_, controller := testController(t, Limits{MaxDatagramSize: 16, MaxBufferedBytes: 16})
+	_, controller := testController(t, Limits{MaxDatagramSize: 16, MaxBufferedBytes: MinPayloadReservation})
 	commitGeneration(t, controller, 1)
 	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
 	if err != nil {

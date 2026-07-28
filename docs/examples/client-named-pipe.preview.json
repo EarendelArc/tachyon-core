@@ -1,0 +1,17 @@
+{
+  "client": {
+    "captured_udp": {
+      "mode": "named_pipe",
+      "named_pipe": {
+        "name": "\\\\.\\pipe\\Tachyon\\captured-udp",
+        "allowed_sids": [
+          "S-1-5-80-REPLACE-WITH-TACHYON-HELPER-SERVICE-SID"
+        ],
+        "minimum_integrity_rid": 8192,
+        "operation_timeout": 10000000000,
+        "idle_timeout": 0,
+        "allow_insecure_user_sid": false
+      }
+    }
+  }
+}

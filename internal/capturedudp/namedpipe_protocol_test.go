@@ -18,7 +18,7 @@ func TestNamedPipeFrameRoundTrip(t *testing.T) {
 	messageTypes := []namedPipeMessageType{
 		pipeMessageHello, pipeMessageAuthenticate, pipeMessagePrepareGeneration,
 		pipeMessageCommitGeneration, pipeMessageAbortGeneration, pipeMessageDisableGeneration,
-		pipeMessageOpenFlow, pipeMessageDatagram, pipeMessageReply, pipeMessageCloseFlow,
+		pipeMessageOpenFlow, pipeMessageDatagram, pipeMessageDelivery, pipeMessageCloseFlow,
 		pipeMessageCloseConnection, pipeMessagePing, pipeMessagePong, pipeMessageResponse,
 	}
 	for _, messageType := range messageTypes {
@@ -92,10 +92,12 @@ func TestNamedPipeControllerFullMappingAndIdle(t *testing.T) {
 	defer clientConn.Close()
 	serverIO := &netFrameIO{Conn: serverConn}
 	clientIO := &netFrameIO{Conn: clientConn}
+	sender := &fakeNamedPipeDatagramSender{sent: make(chan tgp.TunnelDatagram, 1)}
+	session := newNamedPipeControllerSession(serverIO, sender, 100*time.Millisecond)
 	serverResult := make(chan error, 1)
 	go func() {
 		defer serverConn.Close()
-		serverResult <- serveNamedPipeController(context.Background(), registry, attachment, serverIO, 100*time.Millisecond, 0)
+		serverResult <- serveNamedPipeController(context.Background(), registry, attachment, serverIO, sender, session, 100*time.Millisecond, 0)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -179,22 +181,29 @@ func TestNamedPipeControllerFullMappingAndIdle(t *testing.T) {
 	datagramData = append(datagramData, lease.LeaseNonce[:]...)
 	datagramData = appendUint64(datagramData, 0)
 	datagramData = append(datagramData, "ping"...)
-	tunnelWire := mustPipeResponseData(t, ctx, clientIO, pipeMessageDatagram, requestID, datagramData)
-	tunnelDatagram, err := tgp.ParseTunnelDatagram(tunnelWire)
-	if err != nil || string(tunnelDatagram.Payload) != "ping" {
-		t.Fatalf("tunnel datagram payload=%q err=%v", tunnelDatagram.Payload, err)
+	mustPipeStatusOK(t, ctx, clientIO, pipeMessageDatagram, requestID, datagramData)
+	var tunnelDatagram tgp.TunnelDatagram
+	select {
+	case tunnelDatagram = <-sender.sent:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if string(tunnelDatagram.Payload) != "ping" {
+		t.Fatalf("tunnel datagram payload=%q", tunnelDatagram.Payload)
 	}
 	tunnelDatagram.Payload = []byte("pong")
-	replyWire, err := tgp.MarshalTunnelDatagram(tunnelDatagram)
-	if err != nil {
-		t.Fatal(err)
+	deliveryResult := make(chan error, 1)
+	go func() { deliveryResult <- session.DeliverReply(ctx, tunnelDatagram) }()
+	deliveryFrame, err := readNamedPipeFrame(ctx, clientIO)
+	if err != nil || deliveryFrame.Type != pipeMessageDelivery {
+		t.Fatalf("delivery frame type=%d err=%v", deliveryFrame.Type, err)
 	}
-	requestID++
-	replyData := appendRequestID(nil, requestID)
-	replyData = append(replyData, replyWire...)
-	delivery := mustPipeResponseData(t, ctx, clientIO, pipeMessageReply, requestID, replyData)
+	delivery := deliveryFrame.Payload
 	if len(delivery) != 44 || string(delivery[40:]) != "pong" {
 		t.Fatalf("delivery length=%d payload=%q", len(delivery), delivery[40:])
+	}
+	if err := <-deliveryResult; err != nil {
+		t.Fatal(err)
 	}
 
 	requestID++
@@ -222,9 +231,11 @@ func TestNamedPipeSlowReaderTimesOutAndRevokesAttachment(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 	result := make(chan error, 1)
+	sender := &fakeNamedPipeDatagramSender{}
+	session := newNamedPipeControllerSession(&netFrameIO{Conn: serverConn}, sender, 25*time.Millisecond)
 	go func() {
 		defer serverConn.Close()
-		result <- serveNamedPipeController(context.Background(), registry, attachment, &netFrameIO{Conn: serverConn}, 25*time.Millisecond, 0)
+		result <- serveNamedPipeController(context.Background(), registry, attachment, session.transport, sender, session, 25*time.Millisecond, 0)
 	}()
 	if err := <-result; !errors.Is(err, ErrNamedPipeTimeout) {
 		t.Fatalf("slow reader error = %v", err)
@@ -270,6 +281,21 @@ func (transport *countingFrameIO) ReadFull(_ context.Context, destination []byte
 func (*countingFrameIO) WriteFull(context.Context, []byte) error { return nil }
 
 type netFrameIO struct{ net.Conn }
+
+type fakeNamedPipeDatagramSender struct {
+	sent chan tgp.TunnelDatagram
+	err  error
+}
+
+func (sender *fakeNamedPipeDatagramSender) SendDatagram(_ context.Context, datagram tgp.TunnelDatagram) error {
+	if sender.err != nil {
+		return sender.err
+	}
+	if sender.sent != nil {
+		sender.sent <- datagram
+	}
+	return nil
+}
 
 func (transport *netFrameIO) ReadFull(ctx context.Context, destination []byte) error {
 	if deadline, ok := ctx.Deadline(); ok {

@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/capturedudp"
@@ -57,7 +58,7 @@ type clientRuntime struct {
 	stableInterfaceLUID      func(tun.Device) uint64
 	installSelectiveRoutes   func(context.Context, tun.SelectiveRouteOptions) (tun.RouteTransaction, error)
 	newPIDTracker            func() (*pidtrack.Tracker, error)
-	newNamedPipeServer       func(*capturedudp.Registry, capturedudp.NamedPipeConfig) (capturedudp.NamedPipeServer, error)
+	newNamedPipeServer       func(*capturedudp.Registry, capturedudp.NamedPipeConfig, capturedudp.NamedPipeDatagramSender) (capturedudp.NamedPipeServer, error)
 }
 
 // New constructs and validates the application without starting any I/O.
@@ -108,33 +109,7 @@ func (a *App) runClient(ctx context.Context) error {
 	errCh := make(chan error, 4)
 
 	if strings.EqualFold(strings.TrimSpace(a.cfg.Client.CapturedUDP.Mode), "named_pipe") {
-		captureRegistry, err := capturedudp.NewRegistry(capturedudp.Limits{
-			MaxTGPDatagramSize: a.cfg.TGP.MaxDatagramSize,
-		})
-		if err != nil {
-			return fmt.Errorf("create captured UDP registry: %w", err)
-		}
-		defer captureRegistry.Close()
-		pipeConfig := a.cfg.Client.CapturedUDP.NamedPipe
-		captureServer, err := a.client.newNamedPipeServer(captureRegistry, capturedudp.NamedPipeConfig{
-			Name: pipeConfig.Name, AllowedSIDs: pipeConfig.AllowedSIDs,
-			MinimumIntegrityRID: pipeConfig.MinimumIntegrityRID,
-			OperationTimeout:    pipeConfig.OperationTimeout, IdleTimeout: pipeConfig.IdleTimeout,
-			AllowInsecureUserSID: pipeConfig.AllowInsecureUserSID,
-		})
-		if err != nil {
-			return fmt.Errorf("start captured UDP named pipe transport: %w", err)
-		}
-		defer captureServer.Close()
-		if pipeConfig.AllowInsecureUserSID {
-			a.logger.Warn("captured UDP named pipe preview allows an ordinary user SID; do not use this setting in production")
-		}
-		go func() {
-			if err := captureServer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("captured UDP named pipe transport: %w", err)
-			}
-		}()
-		a.logger.Info("captured UDP named pipe listening; acceleration remains NotReady until a verified helper authenticates and commits a generation")
+		return a.runNamedPipeClient(ctx)
 	}
 
 	tunPrefixes, err := parseTUNPrefixes(a.cfg.Client.TUN.Address)
@@ -336,6 +311,107 @@ func (a *App) runClient(ctx context.Context) error {
 		)
 	}
 	return errors.Join(runErr, shutdownErr, routeErr)
+}
+
+type capturedUDPTGPSender struct {
+	manager tgpPacketSender
+}
+
+func (sender capturedUDPTGPSender) SendDatagram(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	wire, err := tgp.MarshalTunnelDatagram(datagram)
+	if err != nil {
+		return err
+	}
+	defer clear(wire)
+	return sender.manager.SendPacket(ctx, capturedPacketStream, wire)
+}
+
+type capturedUDPReplySink struct {
+	mu     sync.RWMutex
+	server capturedudp.NamedPipeServer
+}
+
+func (sink *capturedUDPReplySink) set(server capturedudp.NamedPipeServer) {
+	sink.mu.Lock()
+	sink.server = server
+	sink.mu.Unlock()
+}
+
+func (sink *capturedUDPReplySink) deliver(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	sink.mu.RLock()
+	server := sink.server
+	sink.mu.RUnlock()
+	if server == nil {
+		return capturedudp.ErrTransportNotVerified
+	}
+	return server.DeliverReply(ctx, datagram)
+}
+
+// runNamedPipeClient is intentionally separate from the legacy TUN pipeline:
+// selecting named_pipe must never create a TUN device or double-deliver UDP.
+func (a *App) runNamedPipeClient(ctx context.Context) error {
+	remoteAddr := clientTGPRemoteAddr(a.cfg.Client.Proxy)
+	relayAddrs, err := resolveTGPRelayAddresses(ctx, remoteAddr)
+	if err != nil {
+		return err
+	}
+	relayPolicy, err := newTGPRelayPolicy(remoteAddr, relayAddrs, nil)
+	if err != nil {
+		return err
+	}
+	registry, err := capturedudp.NewRegistry(capturedudp.Limits{MaxTGPDatagramSize: a.cfg.TGP.MaxDatagramSize})
+	if err != nil {
+		return fmt.Errorf("create captured UDP registry: %w", err)
+	}
+	defer registry.Close()
+
+	replySink := &capturedUDPReplySink{}
+	manager, err := tgp.NewClientManager(tgp.ClientManagerOptions{
+		RemoteAddr:       remoteAddr,
+		PinnedRemotes:    relayPolicy.Endpoints(),
+		LocalAddrs:       clientTGPLocalAddrs(a.cfg.Client.Proxy, a.cfg.TGP.Multipath),
+		PacerPPS:         tgpPacerPPS(a.cfg.TGP.Pacing),
+		FEC:              tgpFECOptions(a.cfg.TGP.FEC),
+		MaxDatagramSize:  a.cfg.TGP.MaxDatagramSize,
+		DisableMigration: !a.cfg.TGP.ConnectionMigration,
+		AuthKey:          tgpAuthKey(a.cfg.TGP.Auth),
+		HandshakeTimeout: a.cfg.TGP.HandshakeTimeout,
+		ValidateRemote:   relayPolicy.Validate,
+		OnDatagram:       replySink.deliver,
+	})
+	if err != nil {
+		return fmt.Errorf("create TGP client manager: %w", err)
+	}
+	defer manager.Close()
+
+	pipeConfig := a.cfg.Client.CapturedUDP.NamedPipe
+	server, err := a.client.newNamedPipeServer(registry, capturedudp.NamedPipeConfig{
+		Name: pipeConfig.Name, AllowedSIDs: pipeConfig.AllowedSIDs,
+		MinimumIntegrityRID: pipeConfig.MinimumIntegrityRID,
+		OperationTimeout:    pipeConfig.OperationTimeout, IdleTimeout: pipeConfig.IdleTimeout,
+		AllowInsecureUserSID: pipeConfig.AllowInsecureUserSID,
+	}, capturedUDPTGPSender{manager: manager})
+	if err != nil {
+		return fmt.Errorf("start captured UDP named pipe transport: %w", err)
+	}
+	replySink.set(server)
+	defer server.Close()
+	if pipeConfig.AllowInsecureUserSID {
+		a.logger.Warn("captured UDP named pipe preview allows an ordinary user SID; do not use this setting in production")
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- server.Run(ctx) }()
+	a.logger.Info("captured UDP named pipe preview ready; TUN capture is disabled")
+	select {
+	case <-ctx.Done():
+		return nil
+	case runErr := <-result:
+		if runErr == nil && ctx.Err() == nil {
+			return fmt.Errorf("captured UDP named pipe transport stopped unexpectedly")
+		}
+		return runErr
+	}
 }
 
 func (a *App) shutdownClient(ctx context.Context) error {

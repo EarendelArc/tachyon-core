@@ -5,7 +5,6 @@ package capturedudp
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -75,12 +74,13 @@ func TestWindowsNamedPipeEndToEndSingleInstanceIdleAndEOFCleanup(t *testing.T) {
 		Name: uniqueWindowsPipeName(t), AllowedSIDs: []string{sid}, MinimumIntegrityRID: integrity,
 		OperationTimeout: 100 * time.Millisecond, IdleTimeout: 0, AllowInsecureUserSID: true,
 	}
-	server, err := NewNamedPipeServer(registry, config)
+	sender := &fakeNamedPipeDatagramSender{}
+	server, err := NewNamedPipeServer(registry, config, sender)
 	if err != nil {
 		t.Fatalf("create named pipe server: %v", err)
 	}
 	defer server.Close()
-	if second, err := NewNamedPipeServer(registry, config); err == nil {
+	if second, err := NewNamedPipeServer(registry, config, sender); err == nil {
 		_ = second.Close()
 		t.Fatal("second named pipe instance unexpectedly succeeded")
 	}
@@ -137,6 +137,16 @@ func TestWindowsNamedPipeEndToEndSingleInstanceIdleAndEOFCleanup(t *testing.T) {
 	waitForCapturedUDPHealth(t, registry, func(health Health) bool {
 		return !health.TransportAttached && !health.ControllerConnected && !health.Ready && health.ActiveGeneration == 0
 	})
+	replacement := openWindowsPipeClient(t, config.Name)
+	replacementIO := &windowsPipeConnection{handle: replacement}
+	reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	reconnectHello, err := readNamedPipeFrame(reconnectCtx, replacementIO)
+	reconnectCancel()
+	if err != nil || reconnectHello.Type != pipeMessageHello {
+		t.Fatalf("EOF reconnect hello type=%d err=%v", reconnectHello.Type, err)
+	}
+	clear(reconnectHello.Payload)
+	_ = windows.CloseHandle(replacement)
 	cancel()
 	_ = server.Close()
 	select {
@@ -146,6 +156,51 @@ func TestWindowsNamedPipeEndToEndSingleInstanceIdleAndEOFCleanup(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("named pipe server did not stop")
+	}
+}
+
+func TestWindowsNamedPipeIdleExpiryAllowsReconnect(t *testing.T) {
+	sid, integrity := currentWindowsTestIdentity(t)
+	registry := testRegistry(t, Limits{})
+	config := NamedPipeConfig{
+		Name: uniqueWindowsPipeName(t), AllowedSIDs: []string{sid}, MinimumIntegrityRID: integrity,
+		OperationTimeout: time.Second, IdleTimeout: 75 * time.Millisecond, AllowInsecureUserSID: true,
+	}
+	server, err := NewNamedPipeServer(registry, config, &fakeNamedPipeDatagramSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- server.Run(ctx) }()
+	first := openWindowsPipeClient(t, config.Name)
+	firstIO := &windowsPipeConnection{handle: first}
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if _, err := readNamedPipeFrame(readCtx, firstIO); err != nil {
+		t.Fatal(err)
+	}
+	readCancel()
+	time.Sleep(200 * time.Millisecond)
+	_ = windows.CloseHandle(first)
+	second := openWindowsPipeClient(t, config.Name)
+	secondIO := &windowsPipeConnection{handle: second}
+	readCtx, readCancel = context.WithTimeout(context.Background(), 2*time.Second)
+	hello, err := readNamedPipeFrame(readCtx, secondIO)
+	readCancel()
+	if err != nil || hello.Type != pipeMessageHello {
+		t.Fatalf("idle reconnect hello type=%d err=%v", hello.Type, err)
+	}
+	clear(hello.Payload)
+	_ = windows.CloseHandle(second)
+	cancel()
+	_ = server.Close()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after idle reconnect")
 	}
 }
 
@@ -160,7 +215,7 @@ func TestWindowsNamedPipeWrongSIDIsDeniedByACL(t *testing.T) {
 		Name: uniqueWindowsPipeName(t), AllowedSIDs: []string{wrongSID}, MinimumIntegrityRID: integrity,
 		OperationTimeout: time.Second,
 	}
-	server, err := NewNamedPipeServer(registry, config)
+	server, err := NewNamedPipeServer(registry, config, &fakeNamedPipeDatagramSender{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,11 +229,29 @@ func TestWindowsNamedPipeWrongSIDIsDeniedByACL(t *testing.T) {
 	}
 }
 
-func TestWindowsLowIntegrityClientCIGate(t *testing.T) {
-	if os.Getenv("TACHYON_WINDOWS_LOW_INTEGRITY_CI") == "" {
-		t.Skip("requires an external low-integrity Windows token harness; set TACHYON_WINDOWS_LOW_INTEGRITY_CI in the dedicated security CI job")
+func TestWindowsNamedPipeRejectsLowIntegrityPolicy(t *testing.T) {
+	if err := validateNamedPipeIntegrity(mandatoryLowRID, mandatoryMediumRID); !errors.Is(err, ErrNamedPipeIdentity) {
+		t.Fatalf("low integrity error = %v", err)
 	}
-	t.Fatal("dedicated CI must provide and invoke the low-integrity helper harness before enabling this gate")
+	if err := validateNamedPipeIntegrity(mandatoryHighRID, mandatoryMediumRID); err != nil {
+		t.Fatalf("high integrity error = %v", err)
+	}
+}
+
+func TestWindowsNamedPipeMatchesEnabledServiceGroup(t *testing.T) {
+	serviceSID, err := windows.StringToSid("S-1-5-80-123-456-789-10-11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]struct{}{serviceSID.String(): {}}
+	groups := []windows.SIDAndAttributes{{Sid: serviceSID, Attributes: windows.SE_GROUP_ENABLED}}
+	if got := matchRestrictedHelperGroup(allowed, groups, true); got != serviceSID.String() {
+		t.Fatalf("enabled service group match = %q", got)
+	}
+	groups[0].Attributes = windows.SE_GROUP_USE_FOR_DENY_ONLY
+	if got := matchRestrictedHelperGroup(allowed, groups, true); got != "" {
+		t.Fatalf("deny-only service group matched as %q", got)
+	}
 }
 
 func currentWindowsTestIdentity(t *testing.T) (string, uint32) {

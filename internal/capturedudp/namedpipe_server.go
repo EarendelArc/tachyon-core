@@ -6,20 +6,71 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
+
+type namedPipeControllerSession struct {
+	mu               sync.RWMutex
+	controller       *Controller
+	transport        namedPipeFrameIO
+	sender           NamedPipeDatagramSender
+	operationTimeout time.Duration
+}
+
+func newNamedPipeControllerSession(transport namedPipeFrameIO, sender NamedPipeDatagramSender, operationTimeout time.Duration) *namedPipeControllerSession {
+	return &namedPipeControllerSession{transport: transport, sender: sender, operationTimeout: operationTimeout}
+}
+
+func (session *namedPipeControllerSession) bind(controller *Controller) {
+	session.mu.Lock()
+	session.controller = controller
+	session.mu.Unlock()
+}
+
+func (session *namedPipeControllerSession) unbind(controller *Controller) {
+	session.mu.Lock()
+	if session.controller == controller {
+		session.controller = nil
+	}
+	session.mu.Unlock()
+}
+
+func (session *namedPipeControllerSession) DeliverReply(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	session.mu.RLock()
+	controller := session.controller
+	session.mu.RUnlock()
+	if controller == nil {
+		return ErrControllerRevoked
+	}
+	delivery, err := controller.ResolveReply(datagram)
+	if err != nil {
+		return err
+	}
+	defer delivery.Release()
+	payload := make([]byte, 0, len(delivery.FlowID)+8+len(delivery.LeaseNonce)+len(delivery.Payload))
+	payload = append(payload, delivery.FlowID[:]...)
+	payload = appendUint64(payload, delivery.Generation)
+	payload = append(payload, delivery.LeaseNonce[:]...)
+	payload = append(payload, delivery.Payload...)
+	defer clear(payload)
+	return writeNamedPipeFrameWithTimeout(ctx, session.transport,
+		namedPipeFrame{Type: pipeMessageDelivery, Payload: payload}, session.operationTimeout)
+}
 
 func serveNamedPipeController(
 	ctx context.Context,
 	registry *Registry,
 	attachment *TransportAttachment,
 	transport namedPipeFrameIO,
+	sender NamedPipeDatagramSender,
+	session *namedPipeControllerSession,
 	operationTimeout time.Duration,
 	idleTimeout time.Duration,
 ) (resultErr error) {
-	if registry == nil || attachment == nil || transport == nil {
+	if registry == nil || attachment == nil || transport == nil || sender == nil || session == nil {
 		return fmt.Errorf("%w: incomplete server state", ErrNamedPipeProtocol)
 	}
 	token, err := registry.AttachTransport(attachment)
@@ -29,6 +80,7 @@ func serveNamedPipeController(
 	var controller *Controller
 	defer func() {
 		if controller != nil {
+			session.unbind(controller)
 			resultErr = errors.Join(resultErr, controller.Close())
 			return
 		}
@@ -82,6 +134,9 @@ func serveNamedPipeController(
 			if decodeErr == nil {
 				copy(presentedToken[:], presented)
 				controller, decodeErr = registry.Authenticate(attachment, presentedToken)
+				if decodeErr == nil {
+					session.bind(controller)
+				}
 			}
 			clear(presentedToken[:])
 			clear(frame.Payload)
@@ -97,7 +152,7 @@ func serveNamedPipeController(
 			continue
 		}
 
-		responseData, release, terminal, operationErr := handleNamedPipeOperation(controller, frame.Type, decoder)
+		responseData, release, terminal, operationErr := handleNamedPipeOperation(ctx, controller, sender, frame.Type, decoder)
 		clear(frame.Payload)
 		response := namedPipeResponse(requestID, frame.Type, statusForError(operationErr), responseData)
 		if frame.Type == pipeMessagePing && operationErr == nil {
@@ -121,7 +176,9 @@ func serveNamedPipeController(
 }
 
 func handleNamedPipeOperation(
+	ctx context.Context,
 	controller *Controller,
+	sender NamedPipeDatagramSender,
 	messageType namedPipeMessageType,
 	decoder *pipeDecoder,
 ) (data []byte, release func(), terminal bool, err error) {
@@ -181,31 +238,9 @@ func handleNamedPipeOperation(
 		if operationErr != nil {
 			return nil, nil, false, operationErr
 		}
-		encoded, operationErr := marshalTunnelForPipe(accepted.Datagram)
-		if operationErr != nil {
-			accepted.Release()
-			return nil, nil, false, operationErr
-		}
-		return encoded, accepted.Release, false, nil
-
-	case pipeMessageReply:
-		encoded, decodeErr := decoder.take(len(decoder.payload) - decoder.offset)
-		if decodeErr != nil || len(encoded) == 0 || decoder.done() != nil {
-			return nil, nil, true, ErrNamedPipeProtocol
-		}
-		datagram, decodeErr := tgp.ParseTunnelDatagram(encoded)
-		if decodeErr != nil {
-			return nil, nil, true, ErrNamedPipeProtocol
-		}
-		delivery, operationErr := controller.ResolveReply(datagram)
-		if operationErr != nil {
-			return nil, nil, false, operationErr
-		}
-		data = append(data, delivery.FlowID[:]...)
-		data = appendUint64(data, delivery.Generation)
-		data = append(data, delivery.LeaseNonce[:]...)
-		data = append(data, delivery.Payload...)
-		return data, delivery.Release, false, nil
+		operationErr = sender.SendDatagram(ctx, accepted.Datagram)
+		accepted.Release()
+		return nil, nil, false, operationErr
 
 	case pipeMessageCloseFlow:
 		generation, decodeErr := decoder.uint64()
@@ -328,6 +363,9 @@ func readNamedPipeFrameWithIdleTimeout(
 	operationContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	frame, err := readNamedPipeFrame(operationContext, transport)
+	if err != nil && errors.Is(operationContext.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		return namedPipeFrame{}, errors.Join(ErrNamedPipeIdleTimeout, err)
+	}
 	return frame, normalizeNamedPipeContextError(operationContext, err)
 }
 

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/tachyon-space/tachyon-core/internal/tgp"
 	"golang.org/x/sys/windows"
 )
 
@@ -40,6 +41,7 @@ type windowsPipeConnection struct {
 
 type windowsNamedPipeServer struct {
 	registry           *Registry
+	sender             NamedPipeDatagramSender
 	config             NamedPipeConfig
 	securityAttributes *windows.SecurityAttributes
 	allowedSIDs        map[string]struct{}
@@ -47,13 +49,14 @@ type windowsNamedPipeServer struct {
 
 	mu      sync.Mutex
 	active  *windowsPipeConnection
+	session *namedPipeControllerSession
 	running bool
 	closed  bool
 }
 
-func NewNamedPipeServer(registry *Registry, config NamedPipeConfig) (NamedPipeServer, error) {
-	if registry == nil {
-		return nil, fmt.Errorf("%w: nil registry", ErrNamedPipeProtocol)
+func NewNamedPipeServer(registry *Registry, config NamedPipeConfig, sender NamedPipeDatagramSender) (NamedPipeServer, error) {
+	if registry == nil || sender == nil {
+		return nil, fmt.Errorf("%w: nil registry or TGP sender", ErrNamedPipeProtocol)
 	}
 	config, err := config.normalized()
 	if err != nil {
@@ -64,7 +67,7 @@ func NewNamedPipeServer(registry *Registry, config NamedPipeConfig) (NamedPipeSe
 		return nil, err
 	}
 	server := &windowsNamedPipeServer{
-		registry: registry, config: config, securityAttributes: securityAttributes,
+		registry: registry, sender: sender, config: config, securityAttributes: securityAttributes,
 		allowedSIDs: allowedSIDs, minimumIntegrity: minimumIntegrity,
 	}
 	connection, err := server.createConnection()
@@ -75,8 +78,8 @@ func NewNamedPipeServer(registry *Registry, config NamedPipeConfig) (NamedPipeSe
 	return server, nil
 }
 
-func ServeNamedPipe(ctx context.Context, registry *Registry, config NamedPipeConfig) error {
-	server, err := NewNamedPipeServer(registry, config)
+func ServeNamedPipe(ctx context.Context, registry *Registry, config NamedPipeConfig, sender NamedPipeDatagramSender) error {
+	server, err := NewNamedPipeServer(registry, config, sender)
 	if err != nil {
 		return err
 	}
@@ -141,7 +144,7 @@ func (server *windowsNamedPipeServer) Run(ctx context.Context) error {
 		if ctx.Err() != nil || closed {
 			return nil
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrNamedPipeIdleTimeout) {
 			return err
 		}
 		next, createErr := server.createConnection()
@@ -170,8 +173,35 @@ func (server *windowsNamedPipeServer) serveConnection(ctx context.Context, conne
 	if err != nil {
 		return err
 	}
-	return serveNamedPipeController(ctx, server.registry, attachment, connection,
+	session := newNamedPipeControllerSession(connection, server.sender, server.config.OperationTimeout)
+	server.mu.Lock()
+	if server.closed || server.active != connection {
+		server.mu.Unlock()
+		_ = attachment.Detach()
+		return ErrClosed
+	}
+	server.session = session
+	server.mu.Unlock()
+	defer func() {
+		server.mu.Lock()
+		if server.session == session {
+			server.session = nil
+		}
+		server.mu.Unlock()
+	}()
+	return serveNamedPipeController(ctx, server.registry, attachment, connection, server.sender, session,
 		server.config.OperationTimeout, server.config.IdleTimeout)
+}
+
+func (server *windowsNamedPipeServer) DeliverReply(ctx context.Context, datagram tgp.TunnelDatagram) error {
+	server.mu.Lock()
+	session := server.session
+	closed := server.closed
+	server.mu.Unlock()
+	if closed || session == nil {
+		return ErrControllerRevoked
+	}
+	return session.DeliverReply(ctx, datagram)
 }
 
 func (server *windowsNamedPipeServer) Close() error {
@@ -308,18 +338,79 @@ func inspectImpersonatedNamedPipePeer(allowedSIDs map[string]struct{}, minimumIn
 	if err != nil || user == nil || user.User.Sid == nil {
 		return identity, fmt.Errorf("%w: read token user: %v", ErrNamedPipeIdentity, err)
 	}
-	identity.SID = user.User.Sid.String()
-	if _, allowed := allowedSIDs[identity.SID]; !allowed {
+	userSID := user.User.Sid.String()
+	identity.SID = userSID
+	_, userAllowed := allowedSIDs[userSID]
+	matchedSID := ""
+	if userAllowed && !strings.HasPrefix(userSID, "S-1-5-80-") {
+		matchedSID = userSID
+	}
+	groups, err := token.GetTokenGroups()
+	if err != nil {
+		return identity, fmt.Errorf("%w: read token groups: %v", ErrNamedPipeIdentity, err)
+	}
+	if matchedSID == "" {
+		matchedSID = matchRestrictedHelperGroup(allowedSIDs, groups.AllGroups(), true)
+	}
+	if matchedSID == "" {
+		restrictedMatch, restrictedErr := matchTokenSIDGroups(token, windows.TokenRestrictedSids, allowedSIDs)
+		if restrictedErr != nil {
+			return identity, fmt.Errorf("%w: read restricted token SIDs: %v", ErrNamedPipeIdentity, restrictedErr)
+		}
+		matchedSID = restrictedMatch
+	}
+	if matchedSID == "" {
 		return identity, fmt.Errorf("%w: peer SID is not allowed", ErrNamedPipeIdentity)
 	}
+	identity.SID = matchedSID
 	identity.IntegrityRID, err = tokenIntegrityRID(token)
 	if err != nil {
 		return identity, fmt.Errorf("%w: read token integrity: %v", ErrNamedPipeIdentity, err)
 	}
-	if identity.IntegrityRID < minimumIntegrity {
-		return identity, fmt.Errorf("%w: peer integrity 0x%x is below 0x%x", ErrNamedPipeIdentity, identity.IntegrityRID, minimumIntegrity)
+	if err := validateNamedPipeIntegrity(identity.IntegrityRID, minimumIntegrity); err != nil {
+		return identity, err
 	}
 	return identity, nil
+}
+
+func validateNamedPipeIntegrity(actual, minimum uint32) error {
+	if actual < minimum {
+		return fmt.Errorf("%w: peer integrity 0x%x is below 0x%x", ErrNamedPipeIdentity, actual, minimum)
+	}
+	return nil
+}
+
+func matchRestrictedHelperGroup(allowed map[string]struct{}, groups []windows.SIDAndAttributes, requireEnabled bool) string {
+	for _, group := range groups {
+		if group.Sid == nil || group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY != 0 ||
+			(requireEnabled && group.Attributes&windows.SE_GROUP_ENABLED == 0) {
+			continue
+		}
+		sid := group.Sid.String()
+		if !isRestrictedHelperSID(sid) {
+			continue
+		}
+		if _, ok := allowed[sid]; ok {
+			return sid
+		}
+	}
+	return ""
+}
+
+func matchTokenSIDGroups(token windows.Token, informationClass uint32, allowed map[string]struct{}) (string, error) {
+	var required uint32
+	err := windows.GetTokenInformation(token, informationClass, nil, 0, &required)
+	if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || required == 0 {
+		return "", err
+	}
+	buffer := make([]byte, required)
+	if err := windows.GetTokenInformation(token, informationClass, &buffer[0], required, &required); err != nil {
+		return "", err
+	}
+	groups := (*windows.Tokengroups)(unsafe.Pointer(&buffer[0])).AllGroups()
+	match := matchRestrictedHelperGroup(allowed, groups, false)
+	runtime.KeepAlive(buffer)
+	return match, nil
 }
 
 func impersonateNamedPipeClient(handle windows.Handle) error {

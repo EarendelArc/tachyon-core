@@ -4,9 +4,29 @@
 
 ## 状态
 
-`internal/capturedudp` 已实现并测试进程内 controller、策略事务、flow lease 和资源预算
-registry。Windows Named Pipe transport、特权 helper、Windows Service、WFP 策略管理器、
-callout 驱动和数据包注入路径均未实现。本文档不能作为 Tachyon 已支持按应用接管的证据。
+`internal/capturedudp` 已实现 registry 和 Windows Named Pipe v2 preview transport。
+通过认证的 helper 数据报会进入真实 TGP `ClientManager`，TGP 回包经过完整身份校验后以
+`Delivery` 帧主动推回 helper。特权 helper、Windows Service、WFP 策略管理器、callout
+驱动和数据包注入路径仍未实现，因此不得宣称已经实现按应用接管。
+
+## Named Pipe v2 preview
+
+帧格式为 `TCU1 | version=2 | type | uint32 payload_length | payload`。Core 在读取和分配
+body 前检查长度，硬上限为 64 KiB。session token 只由 Core 生成，只通过 pipe 内存传递，
+使用一次后清零，不进入命令行、环境变量或日志。
+
+认证后支持 Prepare/Commit/Abort/Disable、OpenFlow、Datagram、CloseFlow、Ping/Pong 和
+CloseConnection。helper 的 `Datagram` 经 Registry 验证身份后进入真实 TGP manager，响应
+只表示发送状态；TGP 回包必须按 FlowID、generation、nonce 与 endpoints 精确解析，再由
+Core 主动发送 `Delivery`。v1 对端和 helper 伪造的 reply 帧均 fail closed。
+
+选择 `named_pipe` capture mode 时不会创建或运行 legacy TUN pipeline，两条捕获路径不能
+双投递。非零 idle timeout 只关闭当前连接；清理 controller 和 lease 后，listener 会继续
+接受下一客户端。Service SID 同时检查启用的 token groups 与 restricted SIDs；普通用户 SID
+只能匹配 `TokenUser`，并且必须显式打开 insecure preview 开关。
+
+真实 Service SID 和低完整性 token 场景需要管理员 Windows CI runner。当前本地单元测试只
+验证策略与匹配逻辑，不伪造这些 OS 集成场景已经通过。
 
 ## 边界与就绪状态
 

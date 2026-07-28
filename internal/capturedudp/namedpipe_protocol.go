@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	NamedPipeProtocolVersion uint16 = 1
+	NamedPipeProtocolVersion uint16 = 2
 	NamedPipeMaxFramePayload        = 64 << 10
 	namedPipeFrameHeaderSize        = 12
 	namedPipeDefaultTimeout         = 10 * time.Second
@@ -27,6 +27,7 @@ var (
 	ErrNamedPipeProtocol    = errors.New("captured UDP named pipe protocol violation")
 	ErrNamedPipeIdentity    = errors.New("captured UDP named pipe peer identity rejected")
 	ErrNamedPipeTimeout     = errors.New("captured UDP named pipe operation timed out")
+	ErrNamedPipeIdleTimeout = errors.New("captured UDP named pipe connection idle timeout")
 	ErrNamedPipeCanceled    = errors.New("captured UDP named pipe operation canceled")
 )
 
@@ -41,7 +42,14 @@ type NamedPipeConfig struct {
 
 type NamedPipeServer interface {
 	Run(context.Context) error
+	DeliverReply(context.Context, tgp.TunnelDatagram) error
 	Close() error
+}
+
+// NamedPipeDatagramSender is the only route from an authenticated helper to
+// the TGP client data plane. Implementations must preserve the tunnel identity.
+type NamedPipeDatagramSender interface {
+	SendDatagram(context.Context, tgp.TunnelDatagram) error
 }
 
 func (config NamedPipeConfig) normalized() (NamedPipeConfig, error) {
@@ -106,7 +114,7 @@ const (
 	pipeMessageDisableGeneration
 	pipeMessageOpenFlow
 	pipeMessageDatagram
-	pipeMessageReply
+	pipeMessageDelivery
 	pipeMessageCloseFlow
 	pipeMessageCloseConnection
 	pipeMessagePing
@@ -118,7 +126,7 @@ func (messageType namedPipeMessageType) valid() bool {
 	switch messageType {
 	case pipeMessageHello, pipeMessageAuthenticate, pipeMessagePrepareGeneration,
 		pipeMessageCommitGeneration, pipeMessageAbortGeneration, pipeMessageDisableGeneration, pipeMessageOpenFlow,
-		pipeMessageDatagram, pipeMessageReply, pipeMessageCloseFlow,
+		pipeMessageDatagram, pipeMessageDelivery, pipeMessageCloseFlow,
 		pipeMessageCloseConnection, pipeMessagePing, pipeMessagePong, pipeMessageResponse:
 		return true
 	default:

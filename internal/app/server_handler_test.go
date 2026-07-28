@@ -75,7 +75,11 @@ func TestUDPRelayPoolSendsAsyncResponsesToSession(t *testing.T) {
 			{CIDR: target.Addr().String() + "/32", Ports: fmt.Sprintf("%d", target.Port())},
 		}),
 	}
+	identity := tgp.TunnelIdentity{Generation: 9}
+	identity.FlowID[len(identity.FlowID)-1] = 1
+	identity.LeaseNonce[len(identity.LeaseNonce)-1] = 2
 	payload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+		Identity:   identity,
 		LocalIP:    netip.MustParseAddr("198.18.0.2"),
 		LocalPort:  53000,
 		RemoteIP:   target.Addr(),
@@ -103,6 +107,9 @@ func TestUDPRelayPoolSendsAsyncResponsesToSession(t *testing.T) {
 			}
 			if !bytes.Equal(response.Payload, want) {
 				t.Fatalf("unexpected response payload: %q, want %q", response.Payload, want)
+			}
+			if response.Identity != identity {
+				t.Fatalf("response identity = %+v, want %+v", response.Identity, identity)
 			}
 		case <-ctx.Done():
 			t.Fatalf("timeout waiting for response %q: %v", want, ctx.Err())

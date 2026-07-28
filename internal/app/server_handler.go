@@ -225,6 +225,7 @@ type udpRelayPoolOptions struct {
 
 type udpRelayKey struct {
 	sessionID tgp.SessionID
+	identity  tgp.TunnelIdentity
 	local     netip.AddrPort
 	remote    netip.AddrPort
 }
@@ -282,6 +283,7 @@ func (p *udpRelayPool) ForwardUDP(ctx context.Context, packet tgp.RelayPacket, d
 	}
 	key := udpRelayKey{
 		sessionID: packet.SessionID,
+		identity:  datagram.Identity,
 		local:     datagram.LocalAddrPort(),
 		remote:    datagram.RemoteAddrPort(),
 	}
@@ -481,6 +483,7 @@ func (f *udpRelayFlow) readLoop() {
 
 func (f *udpRelayFlow) sendResponse(payload []byte) error {
 	responsePayload, err := tgp.MarshalTunnelDatagram(tgp.TunnelDatagram{
+		Identity:   f.key.identity,
 		LocalIP:    f.key.local.Addr(),
 		LocalPort:  f.key.local.Port(),
 		RemoteIP:   f.key.remote.Addr(),

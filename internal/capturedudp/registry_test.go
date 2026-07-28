@@ -4,203 +4,325 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
 
-func TestRegistryAuthenticationAndClose(t *testing.T) {
-	token := testToken(1)
-	registry, err := NewRegistry(token[:], Limits{})
+func TestUnverifiedTransportCannotAuthenticateOrBecomeReady(t *testing.T) {
+	registry := testRegistry(t, Limits{})
+	attachment := NewUnverifiedTransportAttachment("pending-pipe")
+	if _, err := registry.AttachTransport(attachment); !errors.Is(err, ErrTransportNotVerified) {
+		t.Fatalf("attach unverified transport error = %v", err)
+	}
+	health := registry.Health()
+	if health.Ready || !health.TransportAttached || health.TransportPeerVerified || health.ControllerConnected {
+		t.Fatalf("unverified transport health = %+v", health)
+	}
+	if _, err := registry.Authenticate(attachment.ID, SessionToken{}); !errors.Is(err, ErrTransportNotVerified) {
+		t.Fatalf("authenticate unverified transport error = %v", err)
+	}
+}
+
+func TestControllerIsSingleUseBoundAndDisconnectRevokesState(t *testing.T) {
+	registry := testRegistry(t, Limits{})
+	token, err := registry.AttachTransport(verifiedTransportAttachment("pipe-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong := testToken(2)
-	if _, err := registry.Authenticate(wrong[:]); !errors.Is(err, ErrAuthentication) {
-		t.Fatalf("wrong token error = %v, want ErrAuthentication", err)
+	if _, err := registry.Authenticate("pipe-2", token); !errors.Is(err, ErrTransportMismatch) {
+		t.Fatalf("cross-transport authentication error = %v", err)
 	}
-	if _, err := registry.Authenticate(token[:]); err != nil {
-		t.Fatalf("authenticate correct token: %v", err)
-	}
-	if got := registry.Stats().AuthenticationFailures; got != 1 {
-		t.Fatalf("authentication failures = %d, want 1", got)
-	}
-	if err := registry.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if registry.Health().Ready {
-		t.Fatal("closed registry reported ready")
-	}
-	if _, err := registry.Authenticate(token[:]); !errors.Is(err, ErrClosed) {
-		t.Fatalf("authenticate closed registry error = %v, want ErrClosed", err)
-	}
-}
-
-func TestGenerationReplacementIsMonotonicAndEvictsFlows(t *testing.T) {
-	registry, session := testRegistrySession(t, Limits{})
-	if err := session.ActivateGeneration(10); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.ActivateGeneration(10); err != nil {
-		t.Fatalf("idempotent activation: %v", err)
-	}
-	if err := session.OpenFlow(testFlow(1, 10, "10.0.0.2:40000", "203.0.113.9:27015")); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.ActivateGeneration(11); err != nil {
-		t.Fatal(err)
-	}
-	if got := registry.Health(); got.ActiveGeneration != 11 || got.OpenFlows != 0 {
-		t.Fatalf("health after replacement = %+v", got)
-	}
-	if err := session.ActivateGeneration(10); !errors.Is(err, ErrStaleGeneration) {
-		t.Fatalf("stale activation error = %v, want ErrStaleGeneration", err)
-	}
-	stats := registry.Stats()
-	if stats.GenerationsActivated != 2 || stats.FlowsEvicted != 1 {
-		t.Fatalf("stats after replacement = %+v", stats)
-	}
-}
-
-func TestDisableGenerationIsExactAndIdempotent(t *testing.T) {
-	registry, session := testRegistrySession(t, Limits{})
-	if err := session.ActivateGeneration(7); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.DisableGeneration(6); !errors.Is(err, ErrGenerationNotActive) {
-		t.Fatalf("wrong generation disable error = %v", err)
-	}
-	if err := session.DisableGeneration(7); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.DisableGeneration(7); err != nil {
-		t.Fatalf("idempotent disable: %v", err)
-	}
-	if got := registry.Health().ActiveGeneration; got != 0 {
-		t.Fatalf("active generation = %d, want 0", got)
-	}
-}
-
-func TestOpenFlowRejectsDuplicateIdentityAndAmbiguousTuple(t *testing.T) {
-	_, session := testRegistrySession(t, Limits{MaxFlows: 2})
-	if err := session.ActivateGeneration(1); err != nil {
-		t.Fatal(err)
-	}
-	first := testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015")
-	if err := session.OpenFlow(first); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.OpenFlow(first); !errors.Is(err, ErrDuplicateFlow) {
-		t.Fatalf("duplicate flow error = %v", err)
-	}
-	ambiguous := first
-	ambiguous.ID = testFlowID(2)
-	if err := session.OpenFlow(ambiguous); !errors.Is(err, ErrAmbiguousTuple) {
-		t.Fatalf("ambiguous tuple error = %v", err)
-	}
-	second := testFlow(2, 1, "10.0.0.2:40001", "203.0.113.9:27015")
-	if err := session.OpenFlow(second); err != nil {
-		t.Fatal(err)
-	}
-	third := testFlow(3, 1, "10.0.0.2:40002", "203.0.113.9:27015")
-	if err := session.OpenFlow(third); !errors.Is(err, ErrFlowLimit) {
-		t.Fatalf("flow limit error = %v", err)
-	}
-}
-
-func TestAcceptDatagramBindsLeaseAndRejectsReplay(t *testing.T) {
-	registry, session := testRegistrySession(t, Limits{MaxDatagramSize: 4})
-	if err := session.ActivateGeneration(3); err != nil {
-		t.Fatal(err)
-	}
-	spec := testFlow(1, 3, "10.0.0.2:40000", "203.0.113.9:27015")
-	if err := session.OpenFlow(spec); err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte("ping")
-	got, err := session.AcceptDatagram(Datagram{FlowID: spec.ID, Generation: 3, Sequence: 0, Payload: payload})
+	controller, err := registry.Authenticate("pipe-1", token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload[0] = 'x'
-	if string(got.Payload) != "ping" || got.LocalAddrPort() != spec.Local || got.RemoteAddrPort() != spec.Remote {
-		t.Fatalf("accepted datagram = %+v", got)
+	if _, err := registry.Authenticate("pipe-1", token); !errors.Is(err, ErrControllerActive) {
+		t.Fatalf("second controller error = %v", err)
 	}
-	if _, err := session.AcceptDatagram(Datagram{FlowID: spec.ID, Generation: 3, Sequence: 0}); !errors.Is(err, ErrSequenceReplay) {
-		t.Fatalf("replayed sequence error = %v", err)
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := session.AcceptDatagram(Datagram{FlowID: spec.ID, Generation: 3, Sequence: 1, Payload: []byte("large")}); !errors.Is(err, ErrDatagramTooLarge) {
-		t.Fatalf("oversized datagram error = %v", err)
+	if !registry.Health().Ready {
+		t.Fatal("verified controller with active generation was not ready")
 	}
-	if got := registry.Stats().DatagramsAccepted; got != 1 {
-		t.Fatalf("accepted datagrams = %d, want 1", got)
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	health := registry.Health()
+	if health.Ready || health.TransportAttached || health.ControllerConnected || health.ActiveGeneration != 0 || health.OpenFlows != 0 {
+		t.Fatalf("health after controller disconnect = %+v", health)
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(lease, 0, "late")); !errors.Is(err, ErrControllerRevoked) {
+		t.Fatalf("revoked controller error = %v", err)
 	}
 }
 
-func TestResolveReplyAndCloseFlow(t *testing.T) {
-	_, session := testRegistrySession(t, Limits{})
-	if err := session.ActivateGeneration(5); err != nil {
+func TestGenerationPrepareAbortAndCommitAreTransactional(t *testing.T) {
+	registry, controller := testController(t, Limits{})
+	commitGeneration(t, controller, 10)
+	lease, err := controller.OpenFlow(testFlow(1, 10, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	spec := testFlow(1, 5, "[2001:db8::2]:40000", "[2001:db8::9]:27015")
-	if err := session.OpenFlow(spec); err != nil {
+	transaction, err := controller.PrepareGeneration(11)
+	if err != nil {
 		t.Fatal(err)
 	}
-	replyPayload := []byte("pong")
-	delivery, err := session.ResolveReply(tgp.TunnelDatagram{
-		LocalIP: spec.Local.Addr(), LocalPort: spec.Local.Port(),
-		RemoteIP: spec.Remote.Addr(), RemotePort: spec.Remote.Port(),
-		Payload: replyPayload,
+	health := registry.Health()
+	if health.ActiveGeneration != 10 || health.PreparedGeneration != 11 || health.OpenFlows != 1 {
+		t.Fatalf("health while prepared = %+v", health)
+	}
+	if err := controller.AbortGeneration(transaction); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(lease, 0, "still-active")); err != nil {
+		t.Fatalf("aborted replacement disturbed active generation: %v", err)
+	}
+	transaction, err = controller.PrepareGeneration(11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CommitGeneration(transaction); err != nil {
+		t.Fatal(err)
+	}
+	health = registry.Health()
+	if health.ActiveGeneration != 11 || health.PreparedGeneration != 0 || health.OpenFlows != 0 {
+		t.Fatalf("health after commit = %+v", health)
+	}
+	if _, err := controller.PrepareGeneration(10); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("stale prepare error = %v", err)
+	}
+}
+
+func TestLeaseIdentityPreventsLateReplyDeliveryAfterReuse(t *testing.T) {
+	_, controller := testController(t, Limits{})
+	commitGeneration(t, controller, 1)
+	spec := testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015")
+	oldLease, err := controller.OpenFlow(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPacket, err := controller.AcceptDatagram(testDatagram(oldLease, 0, "old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldWire := oldPacket.Datagram
+	oldPacket.Release()
+
+	commitGeneration(t, controller, 2)
+	spec.Generation = 2
+	newLease, err := controller.OpenFlow(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldLease.LeaseNonce == newLease.LeaseNonce {
+		t.Fatal("reused flow received the same lease nonce")
+	}
+	oldWire.Payload = []byte("late-old-reply")
+	if _, err := controller.ResolveReply(oldWire); !errors.Is(err, ErrUnknownFlow) {
+		t.Fatalf("late old lease reply error = %v", err)
+	}
+
+	newPacket, err := controller.AcceptDatagram(testDatagram(newLease, 0, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := newPacket.Datagram
+	newPacket.Release()
+	reply.Payload = []byte("new-reply")
+	delivery, err := controller.ResolveReply(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer delivery.Release()
+	if delivery.FlowID != newLease.FlowID || delivery.Generation != 2 || delivery.LeaseNonce != newLease.LeaseNonce || string(delivery.Payload) != "new-reply" {
+		t.Fatalf("new lease delivery = %+v", delivery)
+	}
+}
+
+func TestCapturedReplyRejectsLegacyTunnelV1(t *testing.T) {
+	_, controller := testController(t, Limits{})
+	commitGeneration(t, controller, 1)
+	if _, err := controller.ResolveReply(tgp.TunnelDatagram{
+		LocalIP: netip.MustParseAddr("10.0.0.2"), LocalPort: 40000,
+		RemoteIP: netip.MustParseAddr("203.0.113.9"), RemotePort: 27015,
+	}); !errors.Is(err, ErrMissingLeaseIdentity) {
+		t.Fatalf("legacy reply error = %v", err)
+	}
+}
+
+func TestFlowTTLExpiresInactiveLease(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	registry, err := newRegistry(registryOptions{
+		limits:       Limits{FlowTTL: time.Second},
+		now:          func() time.Time { return now },
+		reapInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	replyPayload[0] = 'x'
-	if delivery.FlowID != spec.ID || delivery.Generation != 5 || string(delivery.Payload) != "pong" {
-		t.Fatalf("delivery = %+v", delivery)
-	}
-	if err := session.CloseFlow(5, spec.ID); err != nil {
+	t.Cleanup(func() { _ = registry.Close() })
+	controller := attachController(t, registry, "ttl-pipe")
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.ResolveReply(tgp.TunnelDatagram{
-		LocalIP: spec.Local.Addr(), LocalPort: spec.Local.Port(),
-		RemoteIP: spec.Remote.Addr(), RemotePort: spec.Remote.Port(),
-	}); !errors.Is(err, ErrUnknownFlow) {
-		t.Fatalf("reply after close error = %v", err)
+	now = now.Add(time.Second)
+	registry.expireFlowsAt(now)
+	if registry.Health().OpenFlows != 0 || registry.Stats().FlowsExpired != 1 {
+		t.Fatalf("expired flow state: health=%+v stats=%+v", registry.Health(), registry.Stats())
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(lease, 0, "late")); !errors.Is(err, ErrUnknownFlow) {
+		t.Fatalf("expired flow datagram error = %v", err)
 	}
 }
 
-func TestFlowValidationRejectsFamilyMismatch(t *testing.T) {
-	_, session := testRegistrySession(t, Limits{})
-	if err := session.ActivateGeneration(1); err != nil {
+func TestBufferedByteBudgetRequiresRelease(t *testing.T) {
+	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: 4})
+	commitGeneration(t, controller, 1)
+	first, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	spec := testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015")
-	spec.Family = AddressFamilyIPv6
-	if err := session.OpenFlow(spec); !errors.Is(err, ErrInvalidFlow) {
-		t.Fatalf("family mismatch error = %v", err)
+	second, err := controller.OpenFlow(testFlow(2, 1, "10.0.0.2:40001", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := controller.AcceptDatagram(testDatagram(first, 0, "four"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.Health().BufferedBytes; got != 4 {
+		t.Fatalf("buffered bytes = %d, want 4", got)
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(second, 0, "x")); !errors.Is(err, ErrBufferBudget) {
+		t.Fatalf("buffer budget error = %v", err)
+	}
+	accepted.Release()
+	if got := registry.Health().BufferedBytes; got != 0 {
+		t.Fatalf("buffered bytes after release = %d", got)
+	}
+	accepted, err = controller.AcceptDatagram(testDatagram(second, 1, "x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+}
+
+func TestBufferedByteBudgetCannotBeResetByGenerationReplacement(t *testing.T) {
+	registry, controller := testController(t, Limits{MaxDatagramSize: 4, MaxBufferedBytes: 4})
+	commitGeneration(t, controller, 1)
+	oldLease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := controller.AcceptDatagram(testDatagram(oldLease, 0, "four"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitGeneration(t, controller, 2)
+	if got := registry.Health().BufferedBytes; got != 4 {
+		t.Fatalf("replacement reset outstanding byte budget to %d", got)
+	}
+	newLease, err := controller.OpenFlow(testFlow(1, 2, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.AcceptDatagram(testDatagram(newLease, 0, "x")); !errors.Is(err, ErrBufferBudget) {
+		t.Fatalf("replacement bypassed outstanding byte budget: %v", err)
+	}
+	retained.Release()
+	accepted, err := controller.AcceptDatagram(testDatagram(newLease, 1, "x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Release()
+}
+
+func TestLimitsRejectHardCapViolations(t *testing.T) {
+	tests := []Limits{
+		{MaxFlows: HardMaxFlows + 1},
+		{MaxDatagramSize: HardMaxDatagramSize + 1},
+		{MaxDatagramSize: 1024, MaxBufferedBytes: 512},
+		{FlowTTL: HardMaxFlowTTL + time.Second},
+	}
+	for _, limits := range tests {
+		registry, err := NewRegistry(limits)
+		if err == nil {
+			_ = registry.Close()
+			t.Fatalf("limits %+v unexpectedly accepted", limits)
+		}
 	}
 }
 
-func testRegistrySession(t *testing.T, limits Limits) (*Registry, *Session) {
+func TestPayloadCopiesAreBudgetedOutsideLeaseState(t *testing.T) {
+	_, controller := testController(t, Limits{MaxDatagramSize: 16, MaxBufferedBytes: 16})
+	commitGeneration(t, controller, 1)
+	lease, err := controller.OpenFlow(testFlow(1, 1, "10.0.0.2:40000", "203.0.113.9:27015"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("ping")
+	accepted, err := controller.AcceptDatagram(Datagram{FlowID: lease.FlowID, Generation: lease.Generation,
+		LeaseNonce: lease.LeaseNonce, Sequence: 0, Payload: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accepted.Release()
+	payload[0] = 'x'
+	if string(accepted.Datagram.Payload) != "ping" || accepted.Datagram.Identity != lease.identity() {
+		t.Fatalf("accepted datagram = %+v", accepted.Datagram)
+	}
+}
+
+func testRegistry(t *testing.T, limits Limits) *Registry {
 	t.Helper()
-	token := testToken(7)
-	registry, err := NewRegistry(token[:], limits)
+	registry, err := NewRegistry(limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := registry.Authenticate(token[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	return registry, session
+	t.Cleanup(func() { _ = registry.Close() })
+	return registry
 }
 
-func testToken(value byte) [SessionTokenSize]byte {
-	var token [SessionTokenSize]byte
-	for index := range token {
-		token[index] = value
+func testController(t *testing.T, limits Limits) (*Registry, *Controller) {
+	t.Helper()
+	registry := testRegistry(t, limits)
+	return registry, attachController(t, registry, "verified-test-transport")
+}
+
+func attachController(t *testing.T, registry *Registry, attachmentID string) *Controller {
+	t.Helper()
+	token, err := registry.AttachTransport(verifiedTransportAttachment(attachmentID))
+	if err != nil {
+		t.Fatal(err)
 	}
-	return token
+	controller, err := registry.Authenticate(attachmentID, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+	return controller
+}
+
+func commitGeneration(t *testing.T, controller *Controller, generation uint64) {
+	t.Helper()
+	transaction, err := controller.PrepareGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CommitGeneration(transaction); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testDatagram(lease FlowLease, sequence uint64, payload string) Datagram {
+	return Datagram{FlowID: lease.FlowID, Generation: lease.Generation, LeaseNonce: lease.LeaseNonce,
+		Sequence: sequence, Payload: []byte(payload)}
 }
 
 func testFlowID(value byte) FlowID {
@@ -216,8 +338,5 @@ func testFlow(value byte, generation uint64, local, remote string) FlowSpec {
 	if localAddr.Addr().Is6() && !localAddr.Addr().Is4In6() {
 		family = AddressFamilyIPv6
 	}
-	return FlowSpec{
-		ID: testFlowID(value), Generation: generation, Family: family,
-		Local: localAddr, Remote: remoteAddr,
-	}
+	return FlowSpec{ID: testFlowID(value), Generation: generation, Family: family, Local: localAddr, Remote: remoteAddr}
 }

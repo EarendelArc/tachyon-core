@@ -2,6 +2,15 @@
 
 [Chinese](tgp-spec.zh-CN.md)
 
+## Captured UDP tunnel payload versions
+
+After TGP session establishment, the tunnel payload is protected by the normal
+ChaCha20-Poly1305 data-packet AEAD. `TGD\x01` contains endpoints and payload and
+is retained for the legacy TUN preview. `TGD\x02` additionally carries a
+128-bit Flow ID, 64-bit policy generation, and 128-bit lease nonce. Servers
+must return all v2 identity fields unchanged and include them in relay-flow
+identity. Captured-UDP clients must reject v1 replies and partial v2 identity.
+
 **Version:** TGP/1.1
 
 **Status:** Draft

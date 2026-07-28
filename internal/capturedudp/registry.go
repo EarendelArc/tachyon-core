@@ -2,8 +2,8 @@
 // privileged platform capture helper and Tachyon Core.
 //
 // It intentionally contains no WFP, Wintun, PID lookup, named-pipe, or service
-// implementation. Platform transports authenticate first, then use Registry
-// to enforce generation-bound flow leases before forwarding datagrams to TGP.
+// implementation. Until a platform transport verifies its OS peer, the
+// registry cannot authenticate a controller and never reports ready.
 package capturedudp
 
 import (
@@ -11,36 +11,60 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 )
 
 const (
-	SessionTokenSize       = 32
-	defaultMaxFlows        = 4096
-	defaultMaxDatagramSize = 65507
+	SessionTokenSize = 32
+
+	HardMaxFlows          = 65536
+	HardMaxDatagramSize   = 65507
+	HardMaxBufferedBytes  = 64 << 20
+	HardMaxFlowTTL        = time.Hour
+	MinFlowTTL            = time.Second
+	defaultMaxFlows       = 4096
+	defaultDatagramSize   = 65507
+	defaultBufferedBytes  = 8 << 20
+	defaultFlowTTL        = 2 * time.Minute
+	defaultReapInterval   = 30 * time.Second
+	maxTransportIDLength  = 128
+	estimatedFlowMetaSize = 256
+	hardFlowMetadataBytes = 16 << 20
 )
 
 var (
-	ErrAuthentication      = errors.New("captured UDP authentication failed")
-	ErrClosed              = errors.New("captured UDP registry closed")
-	ErrInvalidFlow         = errors.New("invalid captured UDP flow")
-	ErrUnknownFlow         = errors.New("unknown captured UDP flow")
-	ErrDuplicateFlow       = errors.New("duplicate captured UDP flow")
-	ErrAmbiguousTuple      = errors.New("captured UDP tuple already owned by another flow")
-	ErrInvalidGeneration   = errors.New("invalid captured UDP policy generation")
-	ErrStaleGeneration     = errors.New("stale captured UDP policy generation")
-	ErrGenerationNotActive = errors.New("captured UDP policy generation is not active")
-	ErrSequenceReplay      = errors.New("captured UDP datagram sequence replay")
-	ErrDatagramTooLarge    = errors.New("captured UDP datagram exceeds configured limit")
-	ErrFlowLimit           = errors.New("captured UDP flow limit reached")
+	ErrAuthentication       = errors.New("captured UDP authentication failed")
+	ErrClosed               = errors.New("captured UDP registry closed")
+	ErrInvalidFlow          = errors.New("invalid captured UDP flow")
+	ErrUnknownFlow          = errors.New("unknown captured UDP flow")
+	ErrDuplicateFlow        = errors.New("duplicate captured UDP flow")
+	ErrInvalidGeneration    = errors.New("invalid captured UDP policy generation")
+	ErrStaleGeneration      = errors.New("stale captured UDP policy generation")
+	ErrGenerationNotActive  = errors.New("captured UDP policy generation is not active")
+	ErrSequenceReplay       = errors.New("captured UDP datagram sequence replay")
+	ErrDatagramTooLarge     = errors.New("captured UDP datagram exceeds configured limit")
+	ErrFlowLimit            = errors.New("captured UDP flow limit reached")
+	ErrBufferBudget         = errors.New("captured UDP buffered byte budget exhausted")
+	ErrTransportNotVerified = errors.New("captured UDP transport peer is not verified")
+	ErrTransportMismatch    = errors.New("captured UDP transport attachment mismatch")
+	ErrControllerActive     = errors.New("captured UDP controller already connected")
+	ErrControllerRevoked    = errors.New("captured UDP controller revoked")
+	ErrTransactionActive    = errors.New("captured UDP generation transaction already prepared")
+	ErrUnknownTransaction   = errors.New("unknown captured UDP generation transaction")
+	ErrMissingLeaseIdentity = errors.New("captured UDP reply has no lease identity")
 )
 
-type FlowID [16]byte
-
-func (id FlowID) IsZero() bool { return id == FlowID{} }
+type FlowID = tgp.FlowID
+type LeaseNonce = tgp.LeaseNonce
+type SessionToken [SessionTokenSize]byte
+type controllerID [16]byte
+type transactionID [16]byte
 
 type AddressFamily uint8
 
@@ -50,23 +74,59 @@ const (
 )
 
 type Limits struct {
-	MaxFlows        int
-	MaxDatagramSize int
+	MaxFlows         int
+	MaxDatagramSize  int
+	MaxBufferedBytes int
+	FlowTTL          time.Duration
 }
 
-func (l Limits) normalized() Limits {
-	if l.MaxFlows <= 0 {
-		l.MaxFlows = defaultMaxFlows
+func (limits Limits) normalized() (Limits, error) {
+	if limits.MaxFlows <= 0 {
+		limits.MaxFlows = defaultMaxFlows
 	}
-	if l.MaxDatagramSize <= 0 {
-		l.MaxDatagramSize = defaultMaxDatagramSize
+	if limits.MaxDatagramSize <= 0 {
+		limits.MaxDatagramSize = defaultDatagramSize
 	}
-	return l
+	if limits.MaxBufferedBytes <= 0 {
+		limits.MaxBufferedBytes = defaultBufferedBytes
+	}
+	if limits.FlowTTL <= 0 {
+		limits.FlowTTL = defaultFlowTTL
+	}
+	if limits.MaxFlows > HardMaxFlows || limits.MaxFlows*estimatedFlowMetaSize > hardFlowMetadataBytes {
+		return Limits{}, fmt.Errorf("captured UDP max flows %d exceeds hard metadata budget", limits.MaxFlows)
+	}
+	if limits.MaxDatagramSize > HardMaxDatagramSize {
+		return Limits{}, fmt.Errorf("captured UDP max datagram size %d exceeds hard limit %d", limits.MaxDatagramSize, HardMaxDatagramSize)
+	}
+	if limits.MaxBufferedBytes > HardMaxBufferedBytes || limits.MaxBufferedBytes < limits.MaxDatagramSize {
+		return Limits{}, fmt.Errorf("captured UDP buffered byte budget %d is outside [%d,%d]", limits.MaxBufferedBytes, limits.MaxDatagramSize, HardMaxBufferedBytes)
+	}
+	if limits.FlowTTL < MinFlowTTL || limits.FlowTTL > HardMaxFlowTTL {
+		return Limits{}, fmt.Errorf("captured UDP flow TTL %s is outside [%s,%s]", limits.FlowTTL, MinFlowTTL, HardMaxFlowTTL)
+	}
+	return limits, nil
 }
 
-// FlowSpec is the immutable lease installed by the authenticated helper.
-// Local is the selected application's socket endpoint. Remote is the original
-// destination observed before platform redirection or absorption.
+// TransportAttachment models the result of platform transport setup. The only
+// public constructor creates an unverified attachment. A future named-pipe
+// implementation in this package must set peerVerified only after OS-token and
+// ACL verification.
+type TransportAttachment struct {
+	ID           string
+	peerVerified bool
+}
+
+func NewUnverifiedTransportAttachment(id string) TransportAttachment {
+	return TransportAttachment{ID: strings.TrimSpace(id)}
+}
+
+func verifiedTransportAttachment(id string) TransportAttachment {
+	return TransportAttachment{ID: strings.TrimSpace(id), peerVerified: true}
+}
+
+// FlowSpec is the immutable endpoint portion of a flow lease. LeaseNonce is
+// generated internally and is never accepted from the controller.
 type FlowSpec struct {
 	ID         FlowID
 	Generation uint64
@@ -75,162 +135,342 @@ type FlowSpec struct {
 	Remote     netip.AddrPort
 }
 
+type FlowLease struct {
+	FlowID     FlowID
+	Generation uint64
+	LeaseNonce LeaseNonce
+	ExpiresAt  time.Time
+}
+
+func (lease FlowLease) identity() tgp.TunnelIdentity {
+	return tgp.TunnelIdentity{FlowID: lease.FlowID, Generation: lease.Generation, LeaseNonce: lease.LeaseNonce}
+}
+
 type Datagram struct {
 	FlowID     FlowID
 	Generation uint64
+	LeaseNonce LeaseNonce
 	Sequence   uint64
 	Payload    []byte
 }
 
-type Delivery struct {
-	FlowID     FlowID
-	Generation uint64
-	Payload    []byte
-}
-
 type Health struct {
-	Ready            bool
-	ActiveGeneration uint64
-	OpenFlows        int
+	Ready                 bool
+	TransportAttached     bool
+	TransportPeerVerified bool
+	ControllerConnected   bool
+	ActiveGeneration      uint64
+	PreparedGeneration    uint64
+	OpenFlows             int
+	BufferedBytes         int
 }
 
 type Stats struct {
 	AuthenticationFailures uint64
-	GenerationsActivated   uint64
+	ControllersConnected   uint64
+	ControllerDisconnects  uint64
+	GenerationsPrepared    uint64
+	GenerationsCommitted   uint64
+	GenerationsAborted     uint64
 	GenerationsDisabled    uint64
 	FlowsOpened            uint64
 	FlowsClosed            uint64
 	FlowsEvicted           uint64
+	FlowsExpired           uint64
 	DatagramsAccepted      uint64
 	RepliesResolved        uint64
 	Rejected               uint64
 }
 
-type flowTuple struct {
-	local  netip.AddrPort
-	remote netip.AddrPort
+type Transaction struct {
+	id         transactionID
+	generation uint64
 }
+
+func (transaction Transaction) Generation() uint64 { return transaction.generation }
 
 type flowLease struct {
-	spec        FlowSpec
-	hasSequence bool
-	sequence    uint64
+	spec         FlowSpec
+	nonce        LeaseNonce
+	hasSequence  bool
+	sequence     uint64
+	lastActivity time.Time
 }
 
-// Registry owns active policy generation and flow leases for one Core process.
-// All methods are safe for concurrent use.
+type preparedGeneration struct {
+	id         transactionID
+	generation uint64
+}
+
 type Registry struct {
 	mu sync.Mutex
 
-	token  [SessionTokenSize]byte
-	limits Limits
-	closed bool
+	limits       Limits
+	random       io.Reader
+	now          func() time.Time
+	reapInterval time.Duration
+	stop         chan struct{}
+	done         chan struct{}
+	closed       bool
 
+	attachment      *TransportAttachment
+	token           SessionToken
+	tokenIssued     bool
+	controller      controllerID
+	controllerAlive bool
+
+	prepared         *preparedGeneration
 	activeGeneration uint64
 	lastGeneration   uint64
 	flows            map[FlowID]*flowLease
-	tuples           map[flowTuple]FlowID
+	bufferedBytes    int
 	stats            Stats
 }
 
-// GenerateSessionToken returns a cryptographically random per-launch token.
-func GenerateSessionToken() ([SessionTokenSize]byte, error) {
-	var token [SessionTokenSize]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return token, fmt.Errorf("generate captured UDP session token: %w", err)
-	}
-	return token, nil
+type registryOptions struct {
+	limits       Limits
+	random       io.Reader
+	now          func() time.Time
+	reapInterval time.Duration
 }
 
-func NewRegistry(token []byte, limits Limits) (*Registry, error) {
-	if len(token) != SessionTokenSize {
-		return nil, fmt.Errorf("captured UDP session token must be %d bytes", SessionTokenSize)
+func NewRegistry(limits Limits) (*Registry, error) {
+	return newRegistry(registryOptions{limits: limits})
+}
+
+func newRegistry(options registryOptions) (*Registry, error) {
+	limits, err := options.limits.normalized()
+	if err != nil {
+		return nil, err
+	}
+	if options.random == nil {
+		options.random = rand.Reader
+	}
+	if options.now == nil {
+		options.now = time.Now
+	}
+	if options.reapInterval <= 0 {
+		options.reapInterval = defaultReapInterval
 	}
 	registry := &Registry{
-		limits: limits.normalized(),
-		flows:  make(map[FlowID]*flowLease),
-		tuples: make(map[flowTuple]FlowID),
+		limits: limits, random: options.random, now: options.now,
+		reapInterval: options.reapInterval,
+		stop:         make(chan struct{}), done: make(chan struct{}),
+		flows: make(map[FlowID]*flowLease),
 	}
-	copy(registry.token[:], token)
+	go registry.reapLoop()
 	return registry, nil
 }
 
-// Authenticate creates a capability object after a constant-time token check.
-// A future named-pipe transport must additionally verify the peer OS identity.
-func (r *Registry) Authenticate(token []byte) (*Session, error) {
+// AttachTransport records transport state and issues a fresh one-use token
+// only for an attachment whose OS peer was verified by a platform transport.
+func (r *Registry) AttachTransport(attachment TransportAttachment) (SessionToken, error) {
+	var zero SessionToken
+	if attachment.ID == "" || len(attachment.ID) > maxTransportIDLength {
+		return zero, ErrTransportMismatch
+	}
+	var token SessionToken
+	if attachment.peerVerified {
+		if err := readRandom(r.random, token[:]); err != nil {
+			return zero, err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return zero, ErrClosed
+	}
+	r.revokeControllerLocked(false)
+	r.attachment = &attachment
+	if !attachment.peerVerified {
+		return zero, ErrTransportNotVerified
+	}
+	r.token = token
+	r.tokenIssued = true
+	return token, nil
+}
+
+func (r *Registry) DetachTransport(attachmentID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	if r.attachment == nil || r.attachment.ID != attachmentID {
+		return ErrTransportMismatch
+	}
+	r.revokeControllerLocked(true)
+	r.attachment = nil
+	return nil
+}
+
+// Authenticate consumes the per-attachment token and binds the sole
+// controller capability to that transport attachment.
+func (r *Registry) Authenticate(attachmentID string, token SessionToken) (*Controller, error) {
+	var id controllerID
+	if err := readRandom(r.random, id[:]); err != nil {
+		return nil, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil, ErrClosed
 	}
-	if len(token) != SessionTokenSize || subtle.ConstantTimeCompare(r.token[:], token) != 1 {
+	if r.attachment == nil || r.attachment.ID != attachmentID {
+		r.stats.AuthenticationFailures++
+		return nil, ErrTransportMismatch
+	}
+	if !r.attachment.peerVerified {
+		r.stats.AuthenticationFailures++
+		return nil, ErrTransportNotVerified
+	}
+	if r.controllerAlive {
+		return nil, ErrControllerActive
+	}
+	if !r.tokenIssued || subtle.ConstantTimeCompare(r.token[:], token[:]) != 1 {
 		r.stats.AuthenticationFailures++
 		return nil, ErrAuthentication
 	}
-	return &Session{registry: r}, nil
+	clear(r.token[:])
+	r.tokenIssued = false
+	r.controller = id
+	r.controllerAlive = true
+	r.stats.ControllersConnected++
+	return &Controller{registry: r, id: id, attachmentID: attachmentID}, nil
 }
 
-// Session is an authenticated capability for manipulating the registry. It
-// does not represent a network transport and must not be serialized.
-type Session struct {
+type Controller struct {
+	registry     *Registry
+	id           controllerID
+	attachmentID string
+	closeOnce    sync.Once
+}
+
+func (controller *Controller) Close() error {
+	if controller == nil || controller.registry == nil {
+		return nil
+	}
+	var err error
+	controller.closeOnce.Do(func() {
+		err = controller.registry.disconnectController(controller.id, controller.attachmentID)
+	})
+	return err
+}
+
+func (controller *Controller) PrepareGeneration(generation uint64) (Transaction, error) {
+	if controller == nil || controller.registry == nil {
+		return Transaction{}, ErrControllerRevoked
+	}
+	return controller.registry.prepareGeneration(controller.id, generation)
+}
+
+func (controller *Controller) CommitGeneration(transaction Transaction) error {
+	if controller == nil || controller.registry == nil {
+		return ErrControllerRevoked
+	}
+	return controller.registry.commitGeneration(controller.id, transaction)
+}
+
+func (controller *Controller) AbortGeneration(transaction Transaction) error {
+	if controller == nil || controller.registry == nil {
+		return ErrControllerRevoked
+	}
+	return controller.registry.abortGeneration(controller.id, transaction)
+}
+
+func (controller *Controller) DisableGeneration(generation uint64) error {
+	if controller == nil || controller.registry == nil {
+		return ErrControllerRevoked
+	}
+	return controller.registry.disableGeneration(controller.id, generation)
+}
+
+func (controller *Controller) OpenFlow(spec FlowSpec) (FlowLease, error) {
+	if controller == nil || controller.registry == nil {
+		return FlowLease{}, ErrControllerRevoked
+	}
+	return controller.registry.openFlow(controller.id, spec)
+}
+
+func (controller *Controller) CloseFlow(generation uint64, id FlowID, nonce LeaseNonce) error {
+	if controller == nil || controller.registry == nil {
+		return ErrControllerRevoked
+	}
+	return controller.registry.closeFlow(controller.id, generation, id, nonce)
+}
+
+func (controller *Controller) AcceptDatagram(datagram Datagram) (*AcceptedDatagram, error) {
+	if controller == nil || controller.registry == nil {
+		return nil, ErrControllerRevoked
+	}
+	return controller.registry.acceptDatagram(controller.id, datagram)
+}
+
+func (controller *Controller) ResolveReply(datagram tgp.TunnelDatagram) (*Delivery, error) {
+	if controller == nil || controller.registry == nil {
+		return nil, ErrControllerRevoked
+	}
+	return controller.registry.resolveReply(controller.id, datagram)
+}
+
+type bufferLease struct {
 	registry *Registry
+	bytes    int
+	once     sync.Once
 }
 
-func (s *Session) ActivateGeneration(generation uint64) error {
-	if s == nil || s.registry == nil {
-		return ErrAuthentication
+func (lease *bufferLease) release() {
+	if lease == nil || lease.registry == nil {
+		return
 	}
-	return s.registry.activateGeneration(generation)
+	lease.once.Do(func() {
+		lease.registry.releaseBuffer(lease.bytes)
+	})
 }
 
-func (s *Session) DisableGeneration(generation uint64) error {
-	if s == nil || s.registry == nil {
-		return ErrAuthentication
-	}
-	return s.registry.disableGeneration(generation)
+type AcceptedDatagram struct {
+	Datagram tgp.TunnelDatagram
+	buffer   *bufferLease
 }
 
-func (s *Session) OpenFlow(spec FlowSpec) error {
-	if s == nil || s.registry == nil {
-		return ErrAuthentication
+func (datagram *AcceptedDatagram) Release() {
+	if datagram != nil {
+		datagram.buffer.release()
 	}
-	return s.registry.openFlow(spec)
 }
 
-func (s *Session) CloseFlow(generation uint64, id FlowID) error {
-	if s == nil || s.registry == nil {
-		return ErrAuthentication
-	}
-	return s.registry.closeFlow(generation, id)
+type Delivery struct {
+	FlowID     FlowID
+	Generation uint64
+	LeaseNonce LeaseNonce
+	Payload    []byte
+	buffer     *bufferLease
 }
 
-// AcceptDatagram validates helper input and returns the process-agnostic TGP
-// tunnel representation. The caller remains responsible for TGP transmission.
-func (s *Session) AcceptDatagram(datagram Datagram) (tgp.TunnelDatagram, error) {
-	if s == nil || s.registry == nil {
-		return tgp.TunnelDatagram{}, ErrAuthentication
+func (delivery *Delivery) Release() {
+	if delivery != nil {
+		delivery.buffer.release()
 	}
-	return s.registry.acceptDatagram(datagram)
-}
-
-// ResolveReply maps a TGP response back to the helper flow lease. The current
-// TGP tunnel format identifies flows by their local/remote tuple, so duplicate
-// active tuples are rejected at OpenFlow.
-func (s *Session) ResolveReply(datagram tgp.TunnelDatagram) (Delivery, error) {
-	if s == nil || s.registry == nil {
-		return Delivery{}, ErrAuthentication
-	}
-	return s.registry.resolveReply(datagram)
 }
 
 func (r *Registry) Health() Health {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return Health{
-		Ready:            !r.closed,
-		ActiveGeneration: r.activeGeneration,
-		OpenFlows:        len(r.flows),
+	health := Health{
+		TransportAttached:   r.attachment != nil,
+		ControllerConnected: r.controllerAlive,
+		ActiveGeneration:    r.activeGeneration,
+		OpenFlows:           len(r.flows), BufferedBytes: r.bufferedBytes,
 	}
+	if r.attachment != nil {
+		health.TransportPeerVerified = r.attachment.peerVerified
+	}
+	if r.prepared != nil {
+		health.PreparedGeneration = r.prepared.generation
+	}
+	health.Ready = !r.closed && health.TransportAttached && health.TransportPeerVerified &&
+		health.ControllerConnected && health.ActiveGeneration != 0
+	return health
 }
 
 func (r *Registry) Stats() Stats {
@@ -241,191 +481,334 @@ func (r *Registry) Stats() Stats {
 
 func (r *Registry) Close() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil
 	}
-	r.stats.FlowsEvicted += uint64(len(r.flows))
-	r.clearFlowsLocked()
-	r.activeGeneration = 0
-	clear(r.token[:])
 	r.closed = true
+	r.revokeControllerLocked(false)
+	r.attachment = nil
+	close(r.stop)
+	r.mu.Unlock()
+	<-r.done
 	return nil
 }
 
-func (r *Registry) activateGeneration(generation uint64) error {
+func (r *Registry) prepareGeneration(id controllerID, generation uint64) (Transaction, error) {
+	if generation == 0 {
+		return Transaction{}, ErrInvalidGeneration
+	}
+	var transaction transactionID
+	if err := readRandom(r.random, transaction[:]); err != nil {
+		return Transaction{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return ErrClosed
+	if err := r.requireControllerLocked(id); err != nil {
+		return Transaction{}, err
 	}
-	if generation == 0 {
+	if r.prepared != nil {
+		return Transaction{}, ErrTransactionActive
+	}
+	if generation <= r.lastGeneration || generation == r.activeGeneration {
 		r.stats.Rejected++
-		return ErrInvalidGeneration
+		return Transaction{}, ErrStaleGeneration
 	}
-	if generation == r.activeGeneration {
-		return nil
+	r.prepared = &preparedGeneration{id: transaction, generation: generation}
+	r.stats.GenerationsPrepared++
+	return Transaction{id: transaction, generation: generation}, nil
+}
+
+func (r *Registry) commitGeneration(id controllerID, transaction Transaction) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.requireControllerLocked(id); err != nil {
+		return err
 	}
-	if generation <= r.lastGeneration {
+	if r.prepared == nil || r.prepared.id != transaction.id || r.prepared.generation != transaction.generation {
 		r.stats.Rejected++
-		return ErrStaleGeneration
+		return ErrUnknownTransaction
 	}
-	r.stats.FlowsEvicted += uint64(len(r.flows))
-	r.clearFlowsLocked()
-	r.activeGeneration = generation
-	r.lastGeneration = generation
-	r.stats.GenerationsActivated++
+	r.evictFlowsLocked(false)
+	r.activeGeneration = transaction.generation
+	r.lastGeneration = transaction.generation
+	r.prepared = nil
+	r.stats.GenerationsCommitted++
 	return nil
 }
 
-func (r *Registry) disableGeneration(generation uint64) error {
+func (r *Registry) abortGeneration(id controllerID, transaction Transaction) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return ErrClosed
+	if err := r.requireControllerLocked(id); err != nil {
+		return err
 	}
-	if generation == 0 {
+	if r.prepared == nil || r.prepared.id != transaction.id || r.prepared.generation != transaction.generation {
 		r.stats.Rejected++
-		return ErrInvalidGeneration
+		return ErrUnknownTransaction
 	}
-	if r.activeGeneration == 0 && generation == r.lastGeneration {
-		return nil
+	r.prepared = nil
+	r.stats.GenerationsAborted++
+	return nil
+}
+
+func (r *Registry) disableGeneration(id controllerID, generation uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.requireControllerLocked(id); err != nil {
+		return err
 	}
-	if generation != r.activeGeneration {
+	if generation == 0 || generation != r.activeGeneration {
 		r.stats.Rejected++
 		return ErrGenerationNotActive
 	}
-	r.stats.FlowsEvicted += uint64(len(r.flows))
-	r.clearFlowsLocked()
+	r.prepared = nil
+	r.evictFlowsLocked(false)
 	r.activeGeneration = 0
 	r.stats.GenerationsDisabled++
 	return nil
 }
 
-func (r *Registry) openFlow(spec FlowSpec) error {
+func (r *Registry) openFlow(id controllerID, spec FlowSpec) (FlowLease, error) {
 	if err := validateFlowSpec(spec); err != nil {
 		r.reject()
-		return err
+		return FlowLease{}, err
 	}
+	var nonce LeaseNonce
+	if err := readRandom(r.random, nonce[:]); err != nil {
+		return FlowLease{}, err
+	}
+	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return ErrClosed
+	if err := r.requireControllerLocked(id); err != nil {
+		return FlowLease{}, err
 	}
+	r.expireFlowsLocked(now)
 	if spec.Generation != r.activeGeneration || r.activeGeneration == 0 {
 		r.stats.Rejected++
-		return ErrGenerationNotActive
+		return FlowLease{}, ErrGenerationNotActive
 	}
 	if _, exists := r.flows[spec.ID]; exists {
 		r.stats.Rejected++
-		return ErrDuplicateFlow
+		return FlowLease{}, ErrDuplicateFlow
 	}
 	if len(r.flows) >= r.limits.MaxFlows {
 		r.stats.Rejected++
-		return ErrFlowLimit
+		return FlowLease{}, ErrFlowLimit
 	}
-	tuple := flowTuple{local: spec.Local, remote: spec.Remote}
-	if _, exists := r.tuples[tuple]; exists {
-		r.stats.Rejected++
-		return ErrAmbiguousTuple
-	}
-	r.flows[spec.ID] = &flowLease{spec: spec}
-	r.tuples[tuple] = spec.ID
+	r.flows[spec.ID] = &flowLease{spec: spec, nonce: nonce, lastActivity: now}
 	r.stats.FlowsOpened++
-	return nil
+	return FlowLease{FlowID: spec.ID, Generation: spec.Generation, LeaseNonce: nonce, ExpiresAt: now.Add(r.limits.FlowTTL)}, nil
 }
 
-func (r *Registry) closeFlow(generation uint64, id FlowID) error {
+func (r *Registry) closeFlow(controller controllerID, generation uint64, id FlowID, nonce LeaseNonce) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return ErrClosed
-	}
-	if generation != r.activeGeneration || generation == 0 {
-		r.stats.Rejected++
-		return ErrGenerationNotActive
+	if err := r.requireControllerLocked(controller); err != nil {
+		return err
 	}
 	lease, exists := r.flows[id]
-	if !exists || lease.spec.Generation != generation {
+	if generation != r.activeGeneration || !exists || lease.spec.Generation != generation || lease.nonce != nonce {
 		r.stats.Rejected++
 		return ErrUnknownFlow
 	}
 	delete(r.flows, id)
-	delete(r.tuples, flowTuple{local: lease.spec.Local, remote: lease.spec.Remote})
 	r.stats.FlowsClosed++
 	return nil
 }
 
-func (r *Registry) acceptDatagram(datagram Datagram) (tgp.TunnelDatagram, error) {
-	if len(datagram.Payload) > r.limits.MaxDatagramSize {
-		r.reject()
-		return tgp.TunnelDatagram{}, ErrDatagramTooLarge
-	}
+func (r *Registry) acceptDatagram(controller controllerID, datagram Datagram) (*AcceptedDatagram, error) {
+	now := r.now()
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return tgp.TunnelDatagram{}, ErrClosed
+	if err := r.requireControllerLocked(controller); err != nil {
+		r.mu.Unlock()
+		return nil, err
 	}
-	if datagram.Generation != r.activeGeneration || datagram.Generation == 0 {
+	if len(datagram.Payload) > r.limits.MaxDatagramSize {
 		r.stats.Rejected++
-		return tgp.TunnelDatagram{}, ErrGenerationNotActive
+		r.mu.Unlock()
+		return nil, ErrDatagramTooLarge
 	}
 	lease, exists := r.flows[datagram.FlowID]
-	if !exists || lease.spec.Generation != datagram.Generation {
+	if !exists || r.flowExpiredLocked(datagram.FlowID, lease, now) || datagram.Generation != r.activeGeneration ||
+		lease.spec.Generation != datagram.Generation || lease.nonce != datagram.LeaseNonce {
 		r.stats.Rejected++
-		return tgp.TunnelDatagram{}, ErrUnknownFlow
+		r.mu.Unlock()
+		return nil, ErrUnknownFlow
 	}
 	if lease.hasSequence && datagram.Sequence <= lease.sequence {
 		r.stats.Rejected++
-		return tgp.TunnelDatagram{}, ErrSequenceReplay
+		r.mu.Unlock()
+		return nil, ErrSequenceReplay
+	}
+	buffer, err := r.reserveBufferLocked(len(datagram.Payload))
+	if err != nil {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, err
 	}
 	lease.hasSequence = true
 	lease.sequence = datagram.Sequence
+	lease.lastActivity = now
+	identity := tgp.TunnelIdentity{FlowID: datagram.FlowID, Generation: datagram.Generation, LeaseNonce: datagram.LeaseNonce}
+	local, remote := lease.spec.Local, lease.spec.Remote
 	r.stats.DatagramsAccepted++
-	return tgp.TunnelDatagram{
-		LocalIP:    lease.spec.Local.Addr(),
-		LocalPort:  lease.spec.Local.Port(),
-		RemoteIP:   lease.spec.Remote.Addr(),
-		RemotePort: lease.spec.Remote.Port(),
-		Payload:    append([]byte(nil), datagram.Payload...),
-	}, nil
+	r.mu.Unlock()
+
+	payload := append([]byte(nil), datagram.Payload...)
+	return &AcceptedDatagram{Datagram: tgp.TunnelDatagram{
+		Identity: identity, LocalIP: local.Addr(), LocalPort: local.Port(),
+		RemoteIP: remote.Addr(), RemotePort: remote.Port(), Payload: payload,
+	}, buffer: buffer}, nil
 }
 
-func (r *Registry) resolveReply(datagram tgp.TunnelDatagram) (Delivery, error) {
+func (r *Registry) resolveReply(controller controllerID, datagram tgp.TunnelDatagram) (*Delivery, error) {
+	now := r.now()
+	r.mu.Lock()
+	if err := r.requireControllerLocked(controller); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	if datagram.Identity.IsZero() {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, ErrMissingLeaseIdentity
+	}
 	if len(datagram.Payload) > r.limits.MaxDatagramSize {
-		r.reject()
-		return Delivery{}, ErrDatagramTooLarge
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, ErrDatagramTooLarge
 	}
-	if !datagram.LocalIP.IsValid() || !datagram.RemoteIP.IsValid() {
-		r.reject()
-		return Delivery{}, ErrInvalidFlow
+	lease, exists := r.flows[datagram.Identity.FlowID]
+	if !exists || r.flowExpiredLocked(datagram.Identity.FlowID, lease, now) ||
+		datagram.Identity.Generation != r.activeGeneration || lease.spec.Generation != datagram.Identity.Generation ||
+		lease.nonce != datagram.Identity.LeaseNonce || datagram.LocalAddrPort() != lease.spec.Local ||
+		datagram.RemoteAddrPort() != lease.spec.Remote {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, ErrUnknownFlow
 	}
+	buffer, err := r.reserveBufferLocked(len(datagram.Payload))
+	if err != nil {
+		r.stats.Rejected++
+		r.mu.Unlock()
+		return nil, err
+	}
+	lease.lastActivity = now
+	r.stats.RepliesResolved++
+	r.mu.Unlock()
+
+	payload := append([]byte(nil), datagram.Payload...)
+	return &Delivery{FlowID: datagram.Identity.FlowID, Generation: datagram.Identity.Generation,
+		LeaseNonce: datagram.Identity.LeaseNonce, Payload: payload, buffer: buffer}, nil
+}
+
+func (r *Registry) requireControllerLocked(id controllerID) error {
+	if r.closed {
+		return ErrClosed
+	}
+	if !r.controllerAlive || r.controller != id {
+		return ErrControllerRevoked
+	}
+	return nil
+}
+
+func (r *Registry) disconnectController(id controllerID, attachmentID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return Delivery{}, ErrClosed
+		return ErrClosed
 	}
-	if r.activeGeneration == 0 {
-		r.stats.Rejected++
-		return Delivery{}, ErrGenerationNotActive
+	if !r.controllerAlive || r.controller != id || r.attachment == nil || r.attachment.ID != attachmentID {
+		return ErrControllerRevoked
 	}
-	tuple := flowTuple{local: datagram.LocalAddrPort(), remote: datagram.RemoteAddrPort()}
-	id, exists := r.tuples[tuple]
-	if !exists {
-		r.stats.Rejected++
-		return Delivery{}, ErrUnknownFlow
+	r.revokeControllerLocked(true)
+	r.attachment = nil
+	return nil
+}
+
+func (r *Registry) revokeControllerLocked(countDisconnect bool) {
+	if r.controllerAlive && countDisconnect {
+		r.stats.ControllerDisconnects++
 	}
-	lease, exists := r.flows[id]
-	if !exists || lease.spec.Generation != r.activeGeneration {
-		r.stats.Rejected++
-		return Delivery{}, ErrUnknownFlow
+	clear(r.token[:])
+	r.tokenIssued = false
+	r.controller = controllerID{}
+	r.controllerAlive = false
+	r.prepared = nil
+	r.activeGeneration = 0
+	r.evictFlowsLocked(false)
+}
+
+func (r *Registry) reserveBufferLocked(size int) (*bufferLease, error) {
+	if size < 0 || size > r.limits.MaxDatagramSize {
+		return nil, ErrDatagramTooLarge
 	}
-	r.stats.RepliesResolved++
-	return Delivery{
-		FlowID:     id,
-		Generation: lease.spec.Generation,
-		Payload:    append([]byte(nil), datagram.Payload...),
-	}, nil
+	if r.bufferedBytes > r.limits.MaxBufferedBytes-size {
+		return nil, ErrBufferBudget
+	}
+	r.bufferedBytes += size
+	return &bufferLease{registry: r, bytes: size}, nil
+}
+
+func (r *Registry) releaseBuffer(size int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if size >= r.bufferedBytes {
+		r.bufferedBytes = 0
+	} else {
+		r.bufferedBytes -= size
+	}
+}
+
+func (r *Registry) evictFlowsLocked(expired bool) {
+	count := len(r.flows)
+	if count != 0 {
+		if expired {
+			r.stats.FlowsExpired += uint64(count)
+		} else {
+			r.stats.FlowsEvicted += uint64(count)
+		}
+	}
+	clear(r.flows)
+}
+
+func (r *Registry) flowExpiredLocked(id FlowID, lease *flowLease, now time.Time) bool {
+	if now.Sub(lease.lastActivity) < r.limits.FlowTTL {
+		return false
+	}
+	delete(r.flows, id)
+	r.stats.FlowsExpired++
+	return true
+}
+
+func (r *Registry) expireFlowsLocked(now time.Time) {
+	for id, lease := range r.flows {
+		r.flowExpiredLocked(id, lease, now)
+	}
+}
+
+func (r *Registry) expireFlowsAt(now time.Time) {
+	r.mu.Lock()
+	r.expireFlowsLocked(now)
+	r.mu.Unlock()
+}
+
+func (r *Registry) reapLoop() {
+	ticker := time.NewTicker(r.reapInterval)
+	defer func() {
+		ticker.Stop()
+		close(r.done)
+	}()
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+			r.expireFlowsAt(r.now())
+		}
+	}
 }
 
 func (r *Registry) reject() {
@@ -434,13 +817,8 @@ func (r *Registry) reject() {
 	r.mu.Unlock()
 }
 
-func (r *Registry) clearFlowsLocked() {
-	clear(r.flows)
-	clear(r.tuples)
-}
-
 func validateFlowSpec(spec FlowSpec) error {
-	if spec.ID.IsZero() || spec.Generation == 0 {
+	if spec.ID == (FlowID{}) || spec.Generation == 0 {
 		return ErrInvalidFlow
 	}
 	if !spec.Local.IsValid() || !spec.Remote.IsValid() || spec.Local.Port() == 0 || spec.Remote.Port() == 0 {
@@ -460,6 +838,20 @@ func validateFlowSpec(spec FlowSpec) error {
 		}
 	default:
 		return ErrInvalidFlow
+	}
+	return nil
+}
+
+func readRandom(reader io.Reader, destination []byte) error {
+	if _, err := io.ReadFull(reader, destination); err != nil {
+		return fmt.Errorf("generate captured UDP capability: %w", err)
+	}
+	var aggregate byte
+	for _, value := range destination {
+		aggregate |= value
+	}
+	if aggregate == 0 {
+		return errors.New("generated captured UDP capability is all zero")
 	}
 	return nil
 }

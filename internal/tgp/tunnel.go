@@ -8,11 +8,30 @@ import (
 )
 
 var (
-	tunnelMagic          = [4]byte{0x54, 0x47, 0x44, 0x01} // "TGD\x01"
+	tunnelMagicV1        = [4]byte{0x54, 0x47, 0x44, 0x01} // legacy TUN preview
+	tunnelMagicV2        = [4]byte{0x54, 0x47, 0x44, 0x02} // lease-bound captured UDP
 	ErrInvalidTunnelData = errors.New("invalid tgp tunnel datagram")
 )
 
+type FlowID [16]byte
+type LeaseNonce [16]byte
+
+type TunnelIdentity struct {
+	FlowID     FlowID
+	Generation uint64
+	LeaseNonce LeaseNonce
+}
+
+func (identity TunnelIdentity) IsZero() bool {
+	return identity == TunnelIdentity{}
+}
+
+func (identity TunnelIdentity) valid() bool {
+	return identity.FlowID != FlowID{} && identity.Generation != 0 && identity.LeaseNonce != LeaseNonce{}
+}
+
 type TunnelDatagram struct {
+	Identity   TunnelIdentity
 	LocalIP    netip.Addr
 	LocalPort  uint16
 	RemoteIP   netip.Addr
@@ -36,8 +55,24 @@ func MarshalTunnelDatagram(datagram TunnelDatagram) ([]byte, error) {
 	if len(remoteAddr) != 4 && len(remoteAddr) != 16 {
 		return nil, fmt.Errorf("%w: unsupported remote address length %d", ErrInvalidTunnelData, len(remoteAddr))
 	}
-	out := make([]byte, 0, 4+1+len(localAddr)+2+1+len(remoteAddr)+2+len(datagram.Payload))
-	out = append(out, tunnelMagic[:]...)
+	identitySize := 0
+	magic := tunnelMagicV1
+	if !datagram.Identity.IsZero() {
+		if !datagram.Identity.valid() {
+			return nil, fmt.Errorf("%w: incomplete tunnel identity", ErrInvalidTunnelData)
+		}
+		identitySize = len(datagram.Identity.FlowID) + 8 + len(datagram.Identity.LeaseNonce)
+		magic = tunnelMagicV2
+	}
+	out := make([]byte, 0, 4+identitySize+1+len(localAddr)+2+1+len(remoteAddr)+2+len(datagram.Payload))
+	out = append(out, magic[:]...)
+	if identitySize != 0 {
+		out = append(out, datagram.Identity.FlowID[:]...)
+		var generation [8]byte
+		binary.BigEndian.PutUint64(generation[:], datagram.Identity.Generation)
+		out = append(out, generation[:]...)
+		out = append(out, datagram.Identity.LeaseNonce[:]...)
+	}
 	out = append(out, byte(len(localAddr)))
 	out = append(out, localAddr...)
 	var port [2]byte
@@ -55,27 +90,45 @@ func ParseTunnelDatagram(data []byte) (TunnelDatagram, error) {
 	if len(data) < 4+1+2+1+2 {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
-	if string(data[:4]) != string(tunnelMagic[:]) {
+	offset := 4
+	var identity TunnelIdentity
+	switch [4]byte(data[:4]) {
+	case tunnelMagicV1:
+	case tunnelMagicV2:
+		const identitySize = 16 + 8 + 16
+		if len(data) < offset+identitySize+1+2+1+2 {
+			return TunnelDatagram{}, ErrInvalidTunnelData
+		}
+		copy(identity.FlowID[:], data[offset:offset+16])
+		offset += 16
+		identity.Generation = binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+		copy(identity.LeaseNonce[:], data[offset:offset+16])
+		offset += 16
+		if !identity.valid() {
+			return TunnelDatagram{}, fmt.Errorf("%w: incomplete tunnel identity", ErrInvalidTunnelData)
+		}
+	default:
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
-	localLen := int(data[4])
+	localLen := int(data[offset])
 	if localLen != 4 && localLen != 16 {
 		return TunnelDatagram{}, fmt.Errorf("%w: unsupported local address length %d", ErrInvalidTunnelData, localLen)
 	}
-	if len(data) < 4+1+localLen+2+1+2 {
+	if len(data) < offset+1+localLen+2+1+2 {
 		return TunnelDatagram{}, ErrInvalidTunnelData
 	}
 	var localIP netip.Addr
 	if localLen == 4 {
 		var raw [4]byte
-		copy(raw[:], data[5:9])
+		copy(raw[:], data[offset+1:offset+5])
 		localIP = netip.AddrFrom4(raw)
 	} else {
 		var raw [16]byte
-		copy(raw[:], data[5:21])
+		copy(raw[:], data[offset+1:offset+17])
 		localIP = netip.AddrFrom16(raw)
 	}
-	localPortOffset := 5 + localLen
+	localPortOffset := offset + 1 + localLen
 	localPort := binary.BigEndian.Uint16(data[localPortOffset : localPortOffset+2])
 
 	remoteLenOffset := localPortOffset + 2
@@ -99,6 +152,7 @@ func ParseTunnelDatagram(data []byte) (TunnelDatagram, error) {
 		remoteIP = netip.AddrFrom16(raw)
 	}
 	return TunnelDatagram{
+		Identity:   identity,
 		LocalIP:    localIP,
 		LocalPort:  localPort,
 		RemoteIP:   remoteIP,

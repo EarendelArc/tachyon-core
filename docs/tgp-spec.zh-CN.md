@@ -2,6 +2,14 @@
 
 [English](tgp-spec.md)
 
+## Captured UDP tunnel payload 版本
+
+TGP session 建立后，tunnel payload 由普通 data packet 的 ChaCha20-Poly1305 AEAD
+保护。`TGD\x01` 只包含 endpoint 和 payload，为 legacy TUN preview 保留。
+`TGD\x02` 额外携带 128-bit Flow ID、64-bit policy generation 和 128-bit lease
+nonce。服务端必须原样返回全部 v2 identity 字段，并把它们纳入 relay flow 身份。
+Captured-UDP 客户端必须拒绝 v1 回程和只填写部分字段的 v2 identity。
+
 **版本:** TGP/1.1
 
 **状态:** 草案

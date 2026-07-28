@@ -54,6 +54,89 @@ func TestTunnelDatagramRoundTripIPv6(t *testing.T) {
 	}
 }
 
+func TestTunnelDatagramV2RoundTripPreservesLeaseIdentity(t *testing.T) {
+	original := TunnelDatagram{
+		Identity: TunnelIdentity{
+			FlowID:     testTunnelFlowID(1),
+			Generation: 42,
+			LeaseNonce: testTunnelLeaseNonce(2),
+		},
+		LocalIP:    netip.MustParseAddr("198.18.0.2"),
+		LocalPort:  53000,
+		RemoteIP:   netip.MustParseAddr("203.0.113.10"),
+		RemotePort: 27015,
+		Payload:    []byte("lease-bound"),
+	}
+	wire, err := MarshalTunnelDatagram(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := [4]byte(wire[:4]); got != tunnelMagicV2 {
+		t.Fatalf("wire magic = %x, want v2", got)
+	}
+	parsed, err := ParseTunnelDatagram(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Identity != original.Identity || parsed.LocalAddrPort() != original.LocalAddrPort() ||
+		parsed.RemoteAddrPort() != original.RemoteAddrPort() || !bytes.Equal(parsed.Payload, original.Payload) {
+		t.Fatalf("v2 round trip mismatch: %#v != %#v", parsed, original)
+	}
+}
+
+func TestTunnelDatagramRejectsIncompleteV2Identity(t *testing.T) {
+	_, err := MarshalTunnelDatagram(TunnelDatagram{
+		Identity: TunnelIdentity{FlowID: testTunnelFlowID(1)},
+		LocalIP:  netip.MustParseAddr("198.18.0.2"), LocalPort: 53000,
+		RemoteIP: netip.MustParseAddr("203.0.113.10"), RemotePort: 27015,
+	})
+	if err == nil {
+		t.Fatal("incomplete v2 identity was accepted")
+	}
+}
+
+func TestTunnelDatagramV2IdentityIsInsideAEADPayload(t *testing.T) {
+	identity := TunnelIdentity{FlowID: testTunnelFlowID(3), Generation: 7, LeaseNonce: testTunnelLeaseNonce(4)}
+	tunnelWire, err := MarshalTunnelDatagram(TunnelDatagram{
+		Identity: identity,
+		LocalIP:  netip.MustParseAddr("198.18.0.2"), LocalPort: 53000,
+		RemoteIP: netip.MustParseAddr("203.0.113.10"), RemotePort: 27015,
+		Payload: []byte("protected"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key [trafficKeySize]byte
+	key[0] = 1
+	codec, err := NewCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := NewDataHeader(SessionID{}, capturedPacketStreamID, 1, len(tunnelWire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := codec.Seal(1, header, tunnelWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := codec.Open(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseTunnelDatagram(opened.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Identity != identity {
+		t.Fatalf("opened identity = %+v, want %+v", parsed.Identity, identity)
+	}
+	sealed[len(sealed)-1] ^= 0x01
+	if _, err := codec.Open(sealed); err == nil {
+		t.Fatal("tampered AEAD-protected tunnel identity was accepted")
+	}
+}
+
 func TestDefaultTUNMTUFitsWorstCaseTGPDatagramInPublicPathMTU(t *testing.T) {
 	const (
 		publicPathMTU = 1400
@@ -137,4 +220,16 @@ func TestLowPMTUBudgetProducesBoundedOuterPacket(t *testing.T) {
 	if outerPacketSize != lowPathMTU {
 		t.Fatalf("low-PMTU outer packet = %d, want %d", outerPacketSize, lowPathMTU)
 	}
+}
+
+func testTunnelFlowID(value byte) FlowID {
+	var id FlowID
+	id[len(id)-1] = value
+	return id
+}
+
+func testTunnelLeaseNonce(value byte) LeaseNonce {
+	var nonce LeaseNonce
+	nonce[len(nonce)-1] = value
+	return nonce
 }

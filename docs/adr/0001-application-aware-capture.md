@@ -6,6 +6,10 @@
 - Date: 2026-07-22
 - Scope: Tachyon Core, Tachyon Prism, and privileged platform integration
 
+Implementation note: the process-agnostic generation and flow-lease registry
+described in [Captured UDP Core Contract](../captured-udp-api.md) is implemented.
+The local transport and every platform capture component remain unimplemented.
+
 ## Context
 
 Tachyon must accelerate UDP traffic from selected game applications without

@@ -2,6 +2,10 @@
 
 [English](0001-application-aware-capture.md)
 
+实现说明：[Captured UDP Core 契约](../captured-udp-api.zh-CN.md)所描述的、与进程
+无关的 generation 与 flow lease registry 已实现。本地 transport 和所有平台接管组件
+仍未实现。
+
 - 状态：Proposed
 - 日期：2026-07-22
 - 范围：Tachyon Core、Tachyon Prism 与特权平台集成层

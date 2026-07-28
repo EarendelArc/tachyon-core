@@ -75,6 +75,24 @@ type ClientConfig struct {
 
 	// Proxy is the upstream server this client connects to.
 	Proxy ProxyConfig `yaml:"proxy" json:"proxy"`
+
+	// CapturedUDP controls the privileged application-aware capture boundary.
+	// It is disabled unless mode is explicitly set to "named_pipe".
+	CapturedUDP CapturedUDPConfig `yaml:"captured_udp" json:"captured_udp"`
+}
+
+type CapturedUDPConfig struct {
+	Mode      string                     `yaml:"mode" json:"mode"`
+	NamedPipe CapturedUDPNamedPipeConfig `yaml:"named_pipe,omitempty" json:"named_pipe,omitempty"`
+}
+
+type CapturedUDPNamedPipeConfig struct {
+	Name                 string        `yaml:"name" json:"name"`
+	AllowedSIDs          []string      `yaml:"allowed_sids" json:"allowed_sids"`
+	MinimumIntegrityRID  uint32        `yaml:"minimum_integrity_rid" json:"minimum_integrity_rid"`
+	OperationTimeout     time.Duration `yaml:"operation_timeout" json:"operation_timeout"`
+	IdleTimeout          time.Duration `yaml:"idle_timeout" json:"idle_timeout"`
+	AllowInsecureUserSID bool          `yaml:"allow_insecure_user_sid" json:"allow_insecure_user_sid"`
 }
 
 // TUNConfig describes the TUN device to create.
@@ -383,6 +401,7 @@ func defaults() *Config {
 			Routing: RoutingConfig{
 				DefaultAction: "direct",
 			},
+			CapturedUDP: CapturedUDPConfig{Mode: "disabled"},
 		},
 		Server: ServerConfig{
 			Listen: ":443",
@@ -458,6 +477,9 @@ func (c *Config) Validate() error {
 		if err := validateClientDataPath(c.Client); err != nil {
 			return err
 		}
+		if err := validateCapturedUDP(c.Client.CapturedUDP); err != nil {
+			return err
+		}
 		tunMTU := c.Client.TUN.MTU
 		if tunMTU == 0 {
 			tunMTU = tun.DefaultMTU
@@ -512,6 +534,44 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("server mode requires tgp.auth.psk unless tgp.auth.allow_unauthenticated is true")
 	}
 	return nil
+}
+
+func validateCapturedUDP(config CapturedUDPConfig) error {
+	mode := strings.ToLower(strings.TrimSpace(config.Mode))
+	switch mode {
+	case "", "disabled":
+		return nil
+	case "named_pipe":
+	default:
+		return fmt.Errorf("client.captured_udp.mode %q must be disabled or named_pipe", config.Mode)
+	}
+	pipe := config.NamedPipe
+	if strings.TrimSpace(pipe.Name) == "" {
+		return fmt.Errorf("client.captured_udp.named_pipe.name is required")
+	}
+	if len(pipe.AllowedSIDs) == 0 {
+		return fmt.Errorf("client.captured_udp.named_pipe.allowed_sids requires a helper or service SID")
+	}
+	for index, rawSID := range pipe.AllowedSIDs {
+		sid := strings.TrimSpace(rawSID)
+		if sid == "" {
+			return fmt.Errorf("client.captured_udp.named_pipe.allowed_sids[%d] must not be empty", index)
+		}
+		if !pipe.AllowInsecureUserSID && !isRestrictedHelperSID(sid) {
+			return fmt.Errorf("client.captured_udp.named_pipe.allowed_sids[%d] is not a restricted helper/service SID; set allow_insecure_user_sid only for preview", index)
+		}
+	}
+	if pipe.OperationTimeout < 0 || pipe.OperationTimeout > 30*time.Second {
+		return fmt.Errorf("client.captured_udp.named_pipe.operation_timeout must be between 0 and 30s")
+	}
+	if pipe.IdleTimeout < 0 || pipe.IdleTimeout > 24*time.Hour {
+		return fmt.Errorf("client.captured_udp.named_pipe.idle_timeout must be between 0 and 24h")
+	}
+	return nil
+}
+
+func isRestrictedHelperSID(sid string) bool {
+	return sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" || strings.HasPrefix(sid, "S-1-5-80-")
 }
 
 func validateClientDataPath(cfg ClientConfig) error {

@@ -19,6 +19,7 @@ const (
 	namedPipeFrameHeaderSize        = 12
 	namedPipeDefaultTimeout         = 10 * time.Second
 	namedPipeMaxTimeout             = 30 * time.Second
+	namedPipeMaxIdleTimeout         = 24 * time.Hour
 )
 
 var (
@@ -30,10 +31,17 @@ var (
 )
 
 type NamedPipeConfig struct {
-	Name                string
-	AllowedSIDs         []string
-	MinimumIntegrityRID uint32
-	OperationTimeout    time.Duration
+	Name                 string
+	AllowedSIDs          []string
+	MinimumIntegrityRID  uint32
+	OperationTimeout     time.Duration
+	IdleTimeout          time.Duration
+	AllowInsecureUserSID bool
+}
+
+type NamedPipeServer interface {
+	Run(context.Context) error
+	Close() error
 }
 
 func (config NamedPipeConfig) normalized() (NamedPipeConfig, error) {
@@ -61,6 +69,9 @@ func (config NamedPipeConfig) normalized() (NamedPipeConfig, error) {
 	}
 	if config.OperationTimeout > namedPipeMaxTimeout {
 		return NamedPipeConfig{}, fmt.Errorf("%w: operation timeout exceeds %s", ErrNamedPipeProtocol, namedPipeMaxTimeout)
+	}
+	if config.IdleTimeout < 0 || config.IdleTimeout > namedPipeMaxIdleTimeout {
+		return NamedPipeConfig{}, fmt.Errorf("%w: idle timeout must be between 0 and %s", ErrNamedPipeProtocol, namedPipeMaxIdleTimeout)
 	}
 	return config, nil
 }
@@ -92,20 +103,23 @@ const (
 	pipeMessagePrepareGeneration
 	pipeMessageCommitGeneration
 	pipeMessageAbortGeneration
+	pipeMessageDisableGeneration
 	pipeMessageOpenFlow
 	pipeMessageDatagram
 	pipeMessageReply
 	pipeMessageCloseFlow
 	pipeMessageCloseConnection
+	pipeMessagePing
+	pipeMessagePong
 	pipeMessageResponse namedPipeMessageType = 0x8000
 )
 
 func (messageType namedPipeMessageType) valid() bool {
 	switch messageType {
 	case pipeMessageHello, pipeMessageAuthenticate, pipeMessagePrepareGeneration,
-		pipeMessageCommitGeneration, pipeMessageAbortGeneration, pipeMessageOpenFlow,
+		pipeMessageCommitGeneration, pipeMessageAbortGeneration, pipeMessageDisableGeneration, pipeMessageOpenFlow,
 		pipeMessageDatagram, pipeMessageReply, pipeMessageCloseFlow,
-		pipeMessageCloseConnection, pipeMessageResponse:
+		pipeMessageCloseConnection, pipeMessagePing, pipeMessagePong, pipeMessageResponse:
 		return true
 	default:
 		return false

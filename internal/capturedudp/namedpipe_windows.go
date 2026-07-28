@@ -38,23 +38,56 @@ type windowsPipeConnection struct {
 	closeOnce sync.Once
 }
 
-// ServeNamedPipe accepts and serves one verified controller connection. The
-// caller owns supervision and may call it again after a clean disconnect.
-func ServeNamedPipe(ctx context.Context, registry *Registry, config NamedPipeConfig) error {
+type windowsNamedPipeServer struct {
+	registry           *Registry
+	config             NamedPipeConfig
+	securityAttributes *windows.SecurityAttributes
+	allowedSIDs        map[string]struct{}
+	minimumIntegrity   uint32
+
+	mu      sync.Mutex
+	active  *windowsPipeConnection
+	running bool
+	closed  bool
+}
+
+func NewNamedPipeServer(registry *Registry, config NamedPipeConfig) (NamedPipeServer, error) {
 	if registry == nil {
-		return fmt.Errorf("%w: nil registry", ErrNamedPipeProtocol)
+		return nil, fmt.Errorf("%w: nil registry", ErrNamedPipeProtocol)
 	}
 	config, err := config.normalized()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	securityAttributes, allowedSIDs, minimumIntegrity, err := buildNamedPipeSecurity(config)
 	if err != nil {
+		return nil, err
+	}
+	server := &windowsNamedPipeServer{
+		registry: registry, config: config, securityAttributes: securityAttributes,
+		allowedSIDs: allowedSIDs, minimumIntegrity: minimumIntegrity,
+	}
+	connection, err := server.createConnection()
+	if err != nil {
+		return nil, err
+	}
+	server.active = connection
+	return server, nil
+}
+
+func ServeNamedPipe(ctx context.Context, registry *Registry, config NamedPipeConfig) error {
+	server, err := NewNamedPipeServer(registry, config)
+	if err != nil {
 		return err
 	}
-	name, err := windows.UTF16PtrFromString(config.Name)
+	defer server.Close()
+	return server.Run(ctx)
+}
+
+func (server *windowsNamedPipeServer) createConnection() (*windowsPipeConnection, error) {
+	name, err := windows.UTF16PtrFromString(server.config.Name)
 	if err != nil {
-		return fmt.Errorf("%w: encode pipe name: %v", ErrNamedPipeProtocol, err)
+		return nil, fmt.Errorf("%w: encode pipe name: %v", ErrNamedPipeProtocol, err)
 	}
 	handle, err := windows.CreateNamedPipe(
 		name,
@@ -64,24 +97,96 @@ func ServeNamedPipe(ctx context.Context, registry *Registry, config NamedPipeCon
 		namedPipeBufferSize,
 		namedPipeBufferSize,
 		0,
-		securityAttributes,
+		server.securityAttributes,
 	)
 	if err != nil {
-		return fmt.Errorf("create captured UDP named pipe: %w", err)
+		return nil, fmt.Errorf("create captured UDP named pipe: %w", err)
 	}
-	connection := &windowsPipeConnection{handle: handle}
-	defer connection.Close()
-	if err := connectNamedPipe(ctx, handle); err != nil {
+	return &windowsPipeConnection{handle: handle}, nil
+}
+
+func (server *windowsNamedPipeServer) Run(ctx context.Context) error {
+	server.mu.Lock()
+	if server.closed || server.running {
+		server.mu.Unlock()
+		return ErrClosed
+	}
+	server.running = true
+	server.mu.Unlock()
+	defer func() {
+		server.mu.Lock()
+		server.running = false
+		server.mu.Unlock()
+	}()
+
+	for {
+		server.mu.Lock()
+		connection := server.active
+		closed := server.closed
+		server.mu.Unlock()
+		if closed {
+			return nil
+		}
+		if connection == nil {
+			return ErrClosed
+		}
+		err := server.serveConnection(ctx, connection)
+		_ = connection.Close()
+		server.mu.Lock()
+		if server.active == connection {
+			server.active = nil
+		}
+		closed = server.closed
+		server.mu.Unlock()
+		if ctx.Err() != nil || closed {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		next, createErr := server.createConnection()
+		if createErr != nil {
+			return createErr
+		}
+		server.mu.Lock()
+		if server.closed {
+			server.mu.Unlock()
+			_ = next.Close()
+			return nil
+		}
+		server.active = next
+		server.mu.Unlock()
+	}
+}
+
+func (server *windowsNamedPipeServer) serveConnection(ctx context.Context, connection *windowsPipeConnection) error {
+	if err := connectNamedPipe(ctx, connection.handle); err != nil {
 		return err
 	}
-	if _, err := verifyNamedPipePeer(handle, allowedSIDs, minimumIntegrity); err != nil {
+	if _, err := verifyNamedPipePeer(connection.handle, server.allowedSIDs, server.minimumIntegrity); err != nil {
 		return err
 	}
-	attachment, err := registry.newVerifiedTransportAttachment()
+	attachment, err := server.registry.newVerifiedTransportAttachment()
 	if err != nil {
 		return err
 	}
-	return serveNamedPipeController(ctx, registry, attachment, connection, config.OperationTimeout)
+	return serveNamedPipeController(ctx, server.registry, attachment, connection,
+		server.config.OperationTimeout, server.config.IdleTimeout)
+}
+
+func (server *windowsNamedPipeServer) Close() error {
+	server.mu.Lock()
+	if server.closed {
+		server.mu.Unlock()
+		return nil
+	}
+	server.closed = true
+	connection := server.active
+	server.mu.Unlock()
+	if connection != nil {
+		return connection.Close()
+	}
+	return nil
 }
 
 func buildNamedPipeSecurity(config NamedPipeConfig) (*windows.SecurityAttributes, map[string]struct{}, uint32, error) {
@@ -102,6 +207,9 @@ func buildNamedPipeSecurity(config NamedPipeConfig) (*windows.SecurityAttributes
 			return nil, nil, 0, fmt.Errorf("%w: parse allowed SID: %v", ErrNamedPipeIdentity, parseErr)
 		}
 		canonical := sid.String()
+		if !config.AllowInsecureUserSID && !isRestrictedHelperSID(canonical) {
+			return nil, nil, 0, fmt.Errorf("%w: ordinary user SID requires allow_insecure_user_sid preview mode", ErrNamedPipeIdentity)
+		}
 		if _, exists := allowed[canonical]; exists {
 			return nil, nil, 0, fmt.Errorf("%w: duplicate canonical SID", ErrNamedPipeIdentity)
 		}
@@ -124,6 +232,10 @@ func buildNamedPipeSecurity(config NamedPipeConfig) (*windows.SecurityAttributes
 	return attributes, allowed, minimumIntegrity, nil
 }
 
+func isRestrictedHelperSID(sid string) bool {
+	return sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" || strings.HasPrefix(sid, "S-1-5-80-")
+}
+
 func mandatoryLabelForRID(integrityRID uint32) (string, error) {
 	switch {
 	case integrityRID >= mandatorySystemRID:
@@ -144,18 +256,49 @@ type namedPipePeerIdentity struct {
 	IntegrityRID uint32
 }
 
-func verifyNamedPipePeer(handle windows.Handle, allowedSIDs map[string]struct{}, minimumIntegrity uint32) (identity namedPipePeerIdentity, resultErr error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := impersonateNamedPipeClient(handle); err != nil {
-		return identity, fmt.Errorf("%w: impersonation failed: %v", ErrNamedPipeIdentity, err)
-	}
-	defer func() {
-		if err := windows.RevertToSelf(); err != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("%w: revert impersonation: %v", ErrNamedPipeIdentity, err))
-		}
-	}()
+type namedPipeIdentityHooks struct {
+	impersonate func(windows.Handle) error
+	inspect     func(map[string]struct{}, uint32) (namedPipePeerIdentity, error)
+	revert      func() error
+	failStop    func(error)
+}
 
+func verifyNamedPipePeer(handle windows.Handle, allowedSIDs map[string]struct{}, minimumIntegrity uint32) (namedPipePeerIdentity, error) {
+	hooks := namedPipeIdentityHooks{
+		impersonate: impersonateNamedPipeClient,
+		inspect:     inspectImpersonatedNamedPipePeer,
+		revert:      windows.RevertToSelf,
+		failStop: func(error) {
+			_ = windows.TerminateProcess(windows.CurrentProcess(), 0xe001)
+		},
+	}
+	return verifyNamedPipePeerWithHooks(handle, allowedSIDs, minimumIntegrity, hooks)
+}
+
+func verifyNamedPipePeerWithHooks(
+	handle windows.Handle,
+	allowedSIDs map[string]struct{},
+	minimumIntegrity uint32,
+	hooks namedPipeIdentityHooks,
+) (namedPipePeerIdentity, error) {
+	runtime.LockOSThread()
+	if err := hooks.impersonate(handle); err != nil {
+		runtime.UnlockOSThread()
+		return namedPipePeerIdentity{}, fmt.Errorf("%w: impersonation failed: %v", ErrNamedPipeIdentity, err)
+	}
+	identity, inspectErr := hooks.inspect(allowedSIDs, minimumIntegrity)
+	if err := hooks.revert(); err != nil {
+		failStopErr := fmt.Errorf("%w: revert impersonation: %v", ErrNamedPipeIdentity, err)
+		hooks.failStop(failStopErr)
+		// Never return an impersonating thread to the scheduler, even if an
+		// injected test fail-stop hook returns or process termination fails.
+		runtime.Goexit()
+	}
+	runtime.UnlockOSThread()
+	return identity, inspectErr
+}
+
+func inspectImpersonatedNamedPipePeer(allowedSIDs map[string]struct{}, minimumIntegrity uint32) (identity namedPipePeerIdentity, resultErr error) {
 	var token windows.Token
 	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &token); err != nil {
 		return identity, fmt.Errorf("%w: open impersonation token: %v", ErrNamedPipeIdentity, err)

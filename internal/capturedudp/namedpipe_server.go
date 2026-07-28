@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
@@ -16,6 +17,7 @@ func serveNamedPipeController(
 	attachment *TransportAttachment,
 	transport namedPipeFrameIO,
 	operationTimeout time.Duration,
+	idleTimeout time.Duration,
 ) (resultErr error) {
 	if registry == nil || attachment == nil || transport == nil {
 		return fmt.Errorf("%w: incomplete server state", ErrNamedPipeProtocol)
@@ -43,7 +45,7 @@ func serveNamedPipeController(
 
 	var lastRequestID uint64
 	for {
-		frame, err := readNamedPipeFrameWithTimeout(ctx, transport, operationTimeout)
+		frame, err := readNamedPipeFrameWithIdleTimeout(ctx, transport, idleTimeout)
 		if err != nil {
 			clear(token[:])
 			if isNamedPipeEOF(err) {
@@ -98,6 +100,11 @@ func serveNamedPipeController(
 		responseData, release, terminal, operationErr := handleNamedPipeOperation(controller, frame.Type, decoder)
 		clear(frame.Payload)
 		response := namedPipeResponse(requestID, frame.Type, statusForError(operationErr), responseData)
+		if frame.Type == pipeMessagePing && operationErr == nil {
+			pongPayload := appendRequestID(nil, requestID)
+			pongPayload = append(pongPayload, responseData...)
+			response = namedPipeFrame{Type: pipeMessagePong, Payload: pongPayload}
+		}
 		clear(responseData)
 		writeErr := writeNamedPipeFrameWithTimeout(ctx, transport, response, operationTimeout)
 		clear(response.Payload)
@@ -142,6 +149,13 @@ func handleNamedPipeOperation(
 			return nil, nil, false, controller.CommitGeneration(transaction)
 		}
 		return nil, nil, false, controller.AbortGeneration(transaction)
+
+	case pipeMessageDisableGeneration:
+		generation, decodeErr := decoder.uint64()
+		if decodeErr != nil || decoder.done() != nil {
+			return nil, nil, true, ErrNamedPipeProtocol
+		}
+		return nil, nil, false, controller.DisableGeneration(generation)
 
 	case pipeMessageOpenFlow:
 		spec, decodeErr := decodePipeFlowSpec(decoder)
@@ -217,6 +231,13 @@ func handleNamedPipeOperation(
 			return nil, nil, true, ErrNamedPipeProtocol
 		}
 		return nil, nil, true, nil
+
+	case pipeMessagePing:
+		payload, decodeErr := decoder.take(len(decoder.payload) - decoder.offset)
+		if decodeErr != nil || len(payload) > 32 || decoder.done() != nil {
+			return nil, nil, true, ErrNamedPipeProtocol
+		}
+		return append([]byte(nil), payload...), nil, false, nil
 
 	default:
 		return nil, nil, true, ErrNamedPipeProtocol
@@ -295,11 +316,15 @@ func decodePipeDatagram(decoder *pipeDecoder) (Datagram, error) {
 	}, nil
 }
 
-func readNamedPipeFrameWithTimeout(
+func readNamedPipeFrameWithIdleTimeout(
 	ctx context.Context,
 	transport namedPipeFrameIO,
 	timeout time.Duration,
 ) (namedPipeFrame, error) {
+	if timeout == 0 {
+		frame, err := readNamedPipeFrame(ctx, transport)
+		return frame, normalizeNamedPipeContextError(ctx, err)
+	}
 	operationContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	frame, err := readNamedPipeFrame(operationContext, transport)
@@ -321,6 +346,10 @@ func writeNamedPipeFrameWithTimeout(
 func normalizeNamedPipeContextError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return errors.Join(ErrNamedPipeTimeout, err)
 	}
 	switch ctx.Err() {
 	case context.DeadlineExceeded:

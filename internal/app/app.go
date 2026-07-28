@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tachyon-space/tachyon-core/internal/capturedudp"
 	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/ipc"
 	"github.com/tachyon-space/tachyon-core/internal/observability"
@@ -56,6 +57,7 @@ type clientRuntime struct {
 	stableInterfaceLUID      func(tun.Device) uint64
 	installSelectiveRoutes   func(context.Context, tun.SelectiveRouteOptions) (tun.RouteTransaction, error)
 	newPIDTracker            func() (*pidtrack.Tracker, error)
+	newNamedPipeServer       func(*capturedudp.Registry, capturedudp.NamedPipeConfig) (capturedudp.NamedPipeServer, error)
 }
 
 // New constructs and validates the application without starting any I/O.
@@ -77,6 +79,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 			stableInterfaceLUID:      tun.StableInterfaceLUID,
 			installSelectiveRoutes:   tun.InstallSelectiveRoutes,
 			newPIDTracker:            pidtrack.New,
+			newNamedPipeServer:       capturedudp.NewNamedPipeServer,
 		},
 	}, nil
 }
@@ -99,7 +102,40 @@ func (a *App) Run(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 
 func (a *App) runClient(ctx context.Context) error {
+	ctx, cancelClient := context.WithCancel(ctx)
+	defer cancelClient()
 	a.logger.Info("starting in client mode")
+	errCh := make(chan error, 4)
+
+	if strings.EqualFold(strings.TrimSpace(a.cfg.Client.CapturedUDP.Mode), "named_pipe") {
+		captureRegistry, err := capturedudp.NewRegistry(capturedudp.Limits{
+			MaxTGPDatagramSize: a.cfg.TGP.MaxDatagramSize,
+		})
+		if err != nil {
+			return fmt.Errorf("create captured UDP registry: %w", err)
+		}
+		defer captureRegistry.Close()
+		pipeConfig := a.cfg.Client.CapturedUDP.NamedPipe
+		captureServer, err := a.client.newNamedPipeServer(captureRegistry, capturedudp.NamedPipeConfig{
+			Name: pipeConfig.Name, AllowedSIDs: pipeConfig.AllowedSIDs,
+			MinimumIntegrityRID: pipeConfig.MinimumIntegrityRID,
+			OperationTimeout:    pipeConfig.OperationTimeout, IdleTimeout: pipeConfig.IdleTimeout,
+			AllowInsecureUserSID: pipeConfig.AllowInsecureUserSID,
+		})
+		if err != nil {
+			return fmt.Errorf("start captured UDP named pipe transport: %w", err)
+		}
+		defer captureServer.Close()
+		if pipeConfig.AllowInsecureUserSID {
+			a.logger.Warn("captured UDP named pipe preview allows an ordinary user SID; do not use this setting in production")
+		}
+		go func() {
+			if err := captureServer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("captured UDP named pipe transport: %w", err)
+			}
+		}()
+		a.logger.Info("captured UDP named pipe listening; acceleration remains NotReady until a verified helper authenticates and commits a generation")
+	}
 
 	tunPrefixes, err := parseTUNPrefixes(a.cfg.Client.TUN.Address)
 	if err != nil {
@@ -254,7 +290,6 @@ func (a *App) runClient(ctx context.Context) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 3)
 	go func() {
 		a.logger.Info("IPC HTTP bridge listening", "addr", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -279,6 +314,7 @@ func (a *App) runClient(ctx context.Context) error {
 	case runErr = <-errCh:
 		a.logger.Error("client subsystem failed", "error", runErr)
 	}
+	cancelClient()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

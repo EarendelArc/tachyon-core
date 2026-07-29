@@ -118,6 +118,18 @@ func Usage() string {
 		"    --json          Emit structured JSON for Prism/Core orchestration\n\n" +
 		"  generate-config   Print a JSON config template to stdout\n" +
 		"    --mode/-m       \"client\" or \"server\" (default: client)\n\n" +
+		"  helper            Run the Windows privileged-helper protocol endpoint\n" +
+		"    --console       Run in console mode (default)\n" +
+		"    --service       Run under Windows SCM\n" +
+		"    --test-server   Test-only Core Named Pipe server; never production\n" +
+		"    --allow-sid     Test-only Named Pipe SID allowlist\n" +
+		"    --pipe/-p       Named Pipe v2 name\n" +
+		"    --server-sid    Allowlisted Core server token SID (required)\n" +
+		"    --core-binary   Trusted Core binary path (default: current binary)\n" +
+		"    --core-sha256   Trusted immutable Core binary SHA-256 (default: current binary)\n" +
+		"    --service-name  SCM service name (default: TachyonHelper)\n" +
+		"    --diagnostic-file  Write auditable helper health JSON\n\n" +
+		"    --diagnostic-test-override  Allow explicit test-only diagnostic path\n\n" +
 		"  version           Print version information\n\n" +
 		"EXAMPLES:\n" +
 		"  # Start as a client daemon\n" +
@@ -129,6 +141,16 @@ func Usage() string {
 		"  tachyon-core preflight --config client.json --json\n\n" +
 		"  # Generate a client config template\n" +
 		"  tachyon-core generate-config --mode client > client.json\n"
+}
+
+// FlagPresent reports whether a boolean flag is present.
+func FlagPresent(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // FlagValue returns the value of a CLI flag from args, or fallback when absent.

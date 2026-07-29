@@ -8,6 +8,8 @@
 //	tachyon-core doctor --config config.json --json
 //	tachyon-core generate-config --mode client > config.json
 //	tachyon-core generate-config --mode server > config.json
+//	tachyon-core helper --console --pipe \\\\.\\pipe\\Tachyon\\captured-udp-v2
+//	tachyon-core helper --service --pipe \\\\.\\pipe\\Tachyon\\captured-udp-v2
 package main
 
 import (
@@ -17,11 +19,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/app"
 	"github.com/tachyon-space/tachyon-core/internal/cli"
 	"github.com/tachyon-space/tachyon-core/internal/config"
 	"github.com/tachyon-space/tachyon-core/internal/doctor"
+	"github.com/tachyon-space/tachyon-core/internal/helper"
 )
 
 // Version is injected at build time via -ldflags.
@@ -65,10 +69,53 @@ func run(args []string) error {
 	case "run":
 		return cmdRun(args[1:])
 
+	case "helper":
+		return cmdHelper(args[1:])
+
 	default:
 		fmt.Fprint(os.Stderr, cli.Usage())
 		return fmt.Errorf("unknown command: %q", args[0])
 	}
+}
+
+func cmdHelper(args []string) error {
+	if cli.HasHelp(args) {
+		fmt.Fprint(os.Stderr, cli.Usage())
+		return nil
+	}
+	serviceName := cli.FlagValue(args, "--service-name", "", "TachyonHelper")
+	config := helper.Config{
+		PipeName:            cli.FlagValue(args, "--pipe", "-p", `\\.\pipe\Tachyon\captured-udp-v2`),
+		ServerSIDs:          []string{cli.FlagValue(args, "--server-sid", "", "")},
+		TrustedServerBinary: cli.FlagValue(args, "--core-binary", "", ""),
+		TrustedServerSHA256: cli.FlagValue(args, "--core-sha256", "", ""),
+		ServiceName:         serviceName,
+		DiagnosticFile:      cli.FlagValue(args, "--diagnostic-file", "", ""),
+		DiagnosticOverride:  cli.FlagPresent(args, "--diagnostic-test-override"),
+		OperationTimeout:    10 * time.Second,
+		ReconnectMin:        100 * time.Millisecond,
+		ReconnectMax:        5 * time.Second,
+	}
+	if cli.FlagPresent(args, "--service") {
+		return helper.RunService(serviceName, config)
+	}
+	if cli.FlagPresent(args, "--test-server") {
+		config.AllowedSIDs = []string{cli.FlagValue(args, "--allow-sid", "", "")}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return helper.RunTestServer(ctx, config)
+	}
+	runtime, err := helper.NewRuntime(config)
+	if err != nil {
+		return fmt.Errorf("initialise helper: %w", err)
+	}
+	defer runtime.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := runtime.Run(ctx); err != nil {
+		return fmt.Errorf("helper error: %w", err)
+	}
+	return nil
 }
 
 func cmdRun(args []string) error {

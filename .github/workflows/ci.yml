@@ -64,6 +64,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Build helper service harness binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts/helper-service-harness | Out-Null
+          go build -trimpath -o artifacts/helper-service-harness/tachyon-core.exe ./cmd/tachyon-core
+          if (-not (Test-Path -LiteralPath artifacts/helper-service-harness/tachyon-core.exe)) { throw "helper harness binary was not built" }
+
+      - name: Run elevated helper service/Core pipe harness
+        shell: pwsh
+        run: |
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "helper Service SID harness requires an elevated Windows runner"
+          }
+          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe -RunServiceSIDHarness
+
       - name: Test elevated Windows route journal integration
         shell: pwsh
         run: |

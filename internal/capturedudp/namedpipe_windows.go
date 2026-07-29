@@ -34,6 +34,7 @@ var (
 
 type windowsPipeConnection struct {
 	handle    windows.Handle
+	server    bool
 	readMu    sync.Mutex
 	closeOnce sync.Once
 }
@@ -104,7 +105,7 @@ func (server *windowsNamedPipeServer) createConnection() (*windowsPipeConnection
 	if err != nil {
 		return nil, fmt.Errorf("create captured UDP named pipe: %w", err)
 	}
-	return &windowsPipeConnection{handle: handle}, nil
+	return &windowsPipeConnection{handle: handle, server: true}, nil
 }
 
 func (server *windowsNamedPipeServer) Run(ctx context.Context) error {
@@ -573,9 +574,11 @@ func (connection *windowsPipeConnection) Close() error {
 	var result error
 	connection.closeOnce.Do(func() {
 		_ = windows.CancelIoEx(connection.handle, nil)
-		if err := windows.DisconnectNamedPipe(connection.handle); err != nil &&
-			!errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED) {
-			result = err
+		if connection.server {
+			if err := windows.DisconnectNamedPipe(connection.handle); err != nil &&
+				!errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED) {
+				result = err
+			}
 		}
 		result = errors.Join(result, windows.CloseHandle(connection.handle))
 	})

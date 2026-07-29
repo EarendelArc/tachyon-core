@@ -4,6 +4,16 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.1.0-alpha.23] - 2026-07-29
+
+### Release boundary
+- Alpha.23 is the **Captured UDP Named Pipe v2 Preview**. It contains the
+  Core-side authenticated Named Pipe v2 contract, lease/registry controls,
+  TGP bridge, lifecycle cleanup, and single-writer close hardening.
+- This preview does **not** include the helper, Windows Service, WFP callout,
+  UDP injection, or real process-aware capture. Game acceleration is not
+  usable or validated in this release.
+
 ### Changed
 - Client capture now uses explicit destination CIDRs from
   `client.tun.game_routes`. Windows installs them transactionally and rolls

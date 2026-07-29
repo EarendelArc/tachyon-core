@@ -27,6 +27,12 @@ GNU coreutils, `sha256sum --check SHA256SUMS.txt` verifies all six ZIP files plu
 ## Alpha limitations
 
 - Tachyon Core is alpha software and is not stable or complete.
+- `v9.8.7-alpha.6` is the **Captured UDP Named Pipe v2 Preview**. It contains
+  the Core-side authenticated Named Pipe v2 contract, lease/registry controls,
+  TGP bridge, lifecycle cleanup, and single-writer close hardening.
+- This preview does **not** include the helper, Windows Service, WFP callout,
+  UDP injection, or real process-aware capture. Game acceleration is not
+  usable or validated in this release.
 - System proxy takeover remains disabled by default in Prism-managed alpha flows; Tachyon Core does not modify host proxy settings.
 - Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.
 - Real VPS, real client, and real game UDP acceleration paths still need field testing.

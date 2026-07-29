@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +169,50 @@ client:
 	}
 	if cfg.Client.Proxy.ServerAddr != "vpn.example.com:443" {
 		t.Fatalf("server addr = %q", cfg.Client.Proxy.ServerAddr)
+	}
+}
+
+func TestAlpha22LegacyConfigMigrationGolden(t *testing.T) {
+	for _, mode := range []string{"client", "server"} {
+		t.Run(mode, func(t *testing.T) {
+			jsonPath := filepath.Join("testdata", "alpha22", mode+".json")
+			yamlPath := filepath.Join("testdata", "alpha22", mode+".yaml")
+			jsonBytes, err := os.ReadFile(jsonPath)
+			if err != nil {
+				t.Fatalf("read alpha.22 JSON golden: %v", err)
+			}
+			yamlBytes, err := os.ReadFile(yamlPath)
+			if err != nil {
+				t.Fatalf("read alpha.22 YAML golden: %v", err)
+			}
+			if bytes.Contains(jsonBytes, []byte("captured_udp")) || bytes.Contains(yamlBytes, []byte("captured_udp")) {
+				t.Fatal("alpha.22 golden must not contain the post-alpha.22 captured_udp field")
+			}
+
+			jsonConfig, err := Load(jsonPath)
+			if err != nil {
+				t.Fatalf("load alpha.22 JSON golden: %v", err)
+			}
+			yamlConfig, err := Load(yamlPath)
+			if err != nil {
+				t.Fatalf("load alpha.22 YAML golden: %v", err)
+			}
+
+			if mode == "client" {
+				if jsonConfig.Client.CapturedUDP.Mode != "disabled" || yamlConfig.Client.CapturedUDP.Mode != "disabled" {
+					t.Fatalf("captured_udp mode = JSON %q, YAML %q, want disabled", jsonConfig.Client.CapturedUDP.Mode, yamlConfig.Client.CapturedUDP.Mode)
+				}
+				if !reflect.DeepEqual(jsonConfig.Client.CapturedUDP, CapturedUDPConfig{Mode: "disabled"}) || !reflect.DeepEqual(yamlConfig.Client.CapturedUDP, CapturedUDPConfig{Mode: "disabled"}) {
+					t.Fatalf("default captured_udp config is not the disabled zero state: JSON=%+v YAML=%+v", jsonConfig.Client.CapturedUDP, yamlConfig.Client.CapturedUDP)
+				}
+			}
+
+			jsonConfig.Client.CapturedUDP = CapturedUDPConfig{}
+			yamlConfig.Client.CapturedUDP = CapturedUDPConfig{}
+			if !reflect.DeepEqual(jsonConfig, yamlConfig) {
+				t.Fatalf("alpha.22 JSON/YAML legacy semantics differ:\nJSON=%+v\nYAML=%+v", jsonConfig, yamlConfig)
+			}
+		})
 	}
 }
 

@@ -1,0 +1,52 @@
+{
+  "mode": "server",
+  "server": {
+    "listen": ":443",
+    "relay": {
+      "dial_timeout": "5s",
+      "idle_timeout": "60s",
+      "max_sessions": 1024,
+      "session_queue_size": 256,
+      "handler_concurrency": 1024,
+      "max_flows": 4096,
+      "max_flows_per_session": 256,
+      "allowed_targets": [
+        {
+          "cidr": "203.0.113.0/24",
+          "ports": "27015-27050"
+        },
+        {
+          "domain": "game.example.com",
+          "ports": "27015"
+        }
+      ]
+    }
+  },
+  "tgp": {
+    "auth": {
+      "psk": "alpha22-test-psk-012345",
+      "allow_unauthenticated": false
+    },
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms",
+      "dynamic": true,
+      "adapt_window": 32
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": false,
+    "max_datagram_size": 1352,
+    "handshake_timeout": "5s",
+    "session_idle_timeout": "300s"
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "/var/log/tachyon/tachyon-core.log",
+    "metrics_addr": "127.0.0.1:19090"
+  }
+}

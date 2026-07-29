@@ -45,6 +45,7 @@ type wintunAPI struct {
 	allocateSendPacket   *syscall.LazyProc
 	sendPacket           *syscall.LazyProc
 	getAdapterLUID       *syscall.LazyProc
+	moveMemory           *syscall.LazyProc
 }
 
 const (
@@ -111,13 +112,16 @@ func (t *windowsTUN) ReadPacket(buf []byte) (int, error) {
 			uintptr(unsafe.Pointer(&size)),
 		)
 		if packet != 0 {
-			if int(size) > len(buf) {
+			packetSize, err := validateWintunPacketSize(size, len(buf))
+			if err != nil {
 				t.api.releaseReceivePacket.Call(t.session, packet)
-				return 0, fmt.Errorf("packet size %d exceeds buffer size %d", size, len(buf))
+				return 0, err
 			}
-			copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(packet)), int(size)))
+			if packetSize != 0 {
+				t.api.moveMemory.Call(uintptr(unsafe.Pointer(&buf[0])), packet, uintptr(packetSize))
+			}
 			t.api.releaseReceivePacket.Call(t.session, packet)
-			return int(size), nil
+			return packetSize, nil
 		}
 
 		err := syscallErr(callErr)
@@ -145,7 +149,7 @@ func (t *windowsTUN) WritePacket(buf []byte) error {
 	if packet == 0 {
 		return fmt.Errorf("WintunAllocateSendPacket: %w", syscallErr(callErr))
 	}
-	copy(unsafe.Slice((*byte)(unsafe.Pointer(packet)), len(buf)), buf)
+	t.api.moveMemory.Call(packet, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	t.api.sendPacket.Call(t.session, packet)
 	return nil
 }
@@ -198,6 +202,7 @@ func loadWintunAPI() (*wintunAPI, error) {
 		allocateSendPacket:   dll.NewProc("WintunAllocateSendPacket"),
 		sendPacket:           dll.NewProc("WintunSendPacket"),
 		getAdapterLUID:       dll.NewProc("WintunGetAdapterLUID"),
+		moveMemory:           syscall.NewLazyDLL("kernel32.dll").NewProc("RtlMoveMemory"),
 	}
 	for name, proc := range map[string]*syscall.LazyProc{
 		"WintunCreateAdapter":        api.createAdapter,
@@ -211,12 +216,20 @@ func loadWintunAPI() (*wintunAPI, error) {
 		"WintunAllocateSendPacket":   api.allocateSendPacket,
 		"WintunSendPacket":           api.sendPacket,
 		"WintunGetAdapterLUID":       api.getAdapterLUID,
+		"RtlMoveMemory":              api.moveMemory,
 	} {
 		if err := proc.Find(); err != nil {
 			return nil, fmt.Errorf("find %s in wintun.dll: %w", name, err)
 		}
 	}
 	return api, nil
+}
+
+func validateWintunPacketSize(size uint32, bufferLength int) (int, error) {
+	if bufferLength < 0 || uint64(size) > uint64(bufferLength) {
+		return 0, fmt.Errorf("packet size %d exceeds buffer size %d", size, bufferLength)
+	}
+	return int(size), nil
 }
 
 func (api *wintunAPI) createOrOpenAdapter(name string) (uintptr, error) {

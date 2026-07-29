@@ -23,6 +23,11 @@
 可在提供 GNU coreutils 的系统上运行 `sha256sum --check SHA256SUMS.txt`，校验六个 ZIP
 以及 `RELEASE_NOTES.md`、`RELEASE_NOTES.zh-CN.md`。
 
+## Alpha 预览边界
+
+- `v9.8.7-alpha.6` 是 **Captured UDP Named Pipe v2 Preview（捕获 UDP Named Pipe v2 预览版）**，包含 Core 侧认证 Named Pipe v2 契约、租约与注册表控制、TGP 桥接、生命周期清理以及 single-writer 关闭竞态修复。
+- 本预览版**不包含** helper、Windows Service、WFP callout、UDP 注入或真正的按进程捕获；游戏加速在本版本中不可用，也未经过真实游戏链路验证。
+
 ## Alpha 限制
 
 - Tachyon Core 仍为 alpha 软件，尚不稳定，也不完整。

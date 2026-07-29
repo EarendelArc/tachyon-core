@@ -1,0 +1,86 @@
+{
+  "mode": "client",
+  "client": {
+    "tun": {
+      "name": "",
+      "address": "198.18.0.1/16",
+      "mtu": 1280,
+      "auto_route": false,
+      "dns_hijack": false,
+      "tgp_only": true,
+      "game_routes": []
+    },
+    "routing": {
+      "default_action": "direct",
+      "game_profiles": [
+        {
+          "id": "cs2",
+          "displayName": "Counter-Strike 2",
+          "enabled": true,
+          "manual": true,
+          "priority": 100,
+          "match": {
+            "processNames": ["cs2.exe"],
+            "paths": [],
+            "pathPrefixes": [],
+            "sha256": [],
+            "steamAppIds": [730]
+          },
+          "udpPolicy": "tgp",
+          "tcpPolicy": "auto"
+        }
+      ],
+      "launchers": {
+        "steam": {
+          "enabled": true,
+          "trackChildProcesses": true,
+          "accelerateGameUdp": true,
+          "accelerateSteamDownloads": false
+        }
+      },
+      "rules": [
+        {
+          "cidr": "192.168.0.0/16",
+          "action": "direct",
+          "priority": 50
+        }
+      ]
+    },
+    "proxy": {
+      "server_addr": "your-game-relay.example.com:443",
+      "tgp_server_addr": "your-game-relay.example.com:443",
+      "local_addrs": []
+    }
+  },
+  "tgp": {
+    "auth": {
+      "psk": ""
+    },
+    "fec": {
+      "data_shards": 4,
+      "parity_shards": 2,
+      "group_timeout": "20ms",
+      "dynamic": true,
+      "adapt_window": 32
+    },
+    "pacing": {
+      "initial_rate_pps": 128,
+      "max_rate_pps": 1000
+    },
+    "connection_migration": true,
+    "multipath": false,
+    "max_datagram_size": 1352,
+    "handshake_timeout": "5s",
+    "session_idle_timeout": "60s"
+  },
+  "ipc": {
+    "websocket_addr": "127.0.0.1:55123",
+    "grpc_addr": "127.0.0.1:50051",
+    "telemetry_interval_ms": 500
+  },
+  "observability": {
+    "log_level": "info",
+    "log_file": "",
+    "metrics_addr": ""
+  }
+}

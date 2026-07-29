@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -308,6 +310,152 @@ func TestNamedPipeWriterQueueIsCancelableAndCloseWakesBlockedWrite(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("in-flight writer caller did not wake")
 	}
+}
+
+func TestNamedPipeWriterCloseDrainsAndZeroizesQueuedFrames(t *testing.T) {
+	transport := &blockingWriteFrameIO{started: make(chan struct{}, 1)}
+	writer := newNamedPipeWriter(context.Background(), transport, time.Second)
+
+	first := make(chan error, 1)
+	go func() {
+		first <- writer.WriteFrame(context.Background(), namedPipeFrame{Type: pipeMessagePing, Payload: []byte("in-flight")})
+	}()
+	select {
+	case <-transport.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+
+	queued := make([][]byte, cap(writer.queue))
+	for index := range queued {
+		wire := bytes.Repeat([]byte{byte(index + 1)}, 64)
+		request := namedPipeWriteRequest{
+			ctx:    context.Background(),
+			wire:   wire,
+			result: make(chan error, 1),
+		}
+		if err := writer.enqueue(context.Background(), request); err != nil {
+			clear(wire)
+			writer.Close()
+			t.Fatalf("enqueue queued frame %d: %v", index, err)
+		}
+		queued[index] = wire
+	}
+	if got := len(writer.queue); got != cap(writer.queue) {
+		t.Fatalf("queued frames = %d, want full queue %d", got, cap(writer.queue))
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		writer.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("writer close did not drain queued frames")
+	}
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight writer caller did not wake")
+	}
+
+	for index, wire := range queued {
+		if !allZeroBytes(wire) {
+			t.Fatalf("queued frame %d was not zeroized: %x", index, wire)
+		}
+	}
+}
+
+func TestNamedPipeWriterCloseIsAtomicWithConcurrentEnqueue(t *testing.T) {
+	const (
+		iterations = 8
+		writers    = namedPipeWriteQueueSize * 4
+	)
+
+	for iteration := 0; iteration < iterations; iteration++ {
+		transport := &blockingWriteFrameIO{started: make(chan struct{}, 1)}
+		writer := newNamedPipeWriter(context.Background(), transport, time.Second)
+		first := make(chan error, 1)
+		go func() {
+			first <- writer.WriteFrame(context.Background(), namedPipeFrame{Type: pipeMessagePing, Payload: []byte("in-flight")})
+		}()
+		select {
+		case <-transport.started:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: writer did not start", iteration)
+		}
+
+		start := make(chan struct{})
+		results := make(chan error, writers)
+		var group sync.WaitGroup
+		group.Add(writers)
+		for index := 0; index < writers; index++ {
+			go func(index int) {
+				defer group.Done()
+				<-start
+				results <- writer.WriteFrame(context.Background(), namedPipeFrame{
+					Type:    pipeMessagePing,
+					Payload: bytes.Repeat([]byte{byte(index + 1)}, 128),
+				})
+			}(index)
+		}
+		close(start)
+
+		deadline := time.Now().Add(time.Second)
+		for len(writer.queue) < cap(writer.queue) && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if len(writer.queue) < cap(writer.queue) {
+			writer.Close()
+			t.Fatalf("iteration %d: concurrent writers did not fill queue", iteration)
+		}
+
+		closed := make(chan struct{})
+		go func() {
+			writer.Close()
+			close(closed)
+		}()
+		finished := make(chan struct{})
+		go func() {
+			group.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: concurrent WriteFrame calls did not return", iteration)
+		}
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: close did not return", iteration)
+		}
+		select {
+		case <-first:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: in-flight writer caller did not wake", iteration)
+		}
+
+		for index := 0; index < writers; index++ {
+			if err := <-results; err == nil {
+				t.Fatalf("iteration %d writer %d unexpectedly succeeded after close", iteration, index)
+			}
+		}
+		if err := writer.WriteFrame(context.Background(), namedPipeFrame{Type: pipeMessagePing, Payload: []byte("after-close")}); !errors.Is(err, ErrClosed) {
+			t.Fatalf("iteration %d post-close write error = %v, want ErrClosed", iteration, err)
+		}
+	}
+}
+
+func allZeroBytes(value []byte) bool {
+	for _, item := range value {
+		if item != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func FuzzDecodeNamedPipeFrame(f *testing.F) {

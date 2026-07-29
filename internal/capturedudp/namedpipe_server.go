@@ -33,6 +33,9 @@ type namedPipeWriter struct {
 	timeout   time.Duration
 	queue     chan namedPipeWriteRequest
 	done      chan struct{}
+	stateMu   sync.Mutex
+	stateCond *sync.Cond
+	closed    bool
 }
 
 func newNamedPipeWriter(ctx context.Context, transport namedPipeFrameIO, timeout time.Duration) *namedPipeWriter {
@@ -41,6 +44,7 @@ func newNamedPipeWriter(ctx context.Context, transport namedPipeFrameIO, timeout
 		ctx: writerCtx, cancel: cancel, transport: transport, timeout: timeout,
 		queue: make(chan namedPipeWriteRequest, namedPipeWriteQueueSize), done: make(chan struct{}),
 	}
+	writer.stateCond = sync.NewCond(&writer.stateMu)
 	go writer.run()
 	return writer
 }
@@ -51,14 +55,9 @@ func (writer *namedPipeWriter) WriteFrame(ctx context.Context, frame namedPipeFr
 		return err
 	}
 	request := namedPipeWriteRequest{ctx: ctx, wire: wire, result: make(chan error, 1)}
-	select {
-	case writer.queue <- request:
-	case <-ctx.Done():
+	if err := writer.enqueue(ctx, request); err != nil {
 		clear(wire)
-		return normalizeNamedPipeContextError(ctx, ctx.Err())
-	case <-writer.done:
-		clear(wire)
-		return ErrClosed
+		return err
 	}
 	select {
 	case err := <-request.result:
@@ -70,11 +69,69 @@ func (writer *namedPipeWriter) WriteFrame(ctx context.Context, frame namedPipeFr
 	}
 }
 
-func (writer *namedPipeWriter) run() {
-	defer close(writer.done)
+// enqueue transfers ownership of request.wire to the writer after an atomic,
+// non-blocking queue submission. Waiting for capacity happens outside the
+// channel send, so Close can always acquire stateMu, mark the writer closed,
+// and wake the waiter before draining the queue.
+func (writer *namedPipeWriter) enqueue(ctx context.Context, request namedPipeWriteRequest) error {
+	wake := func() {
+		writer.stateMu.Lock()
+		writer.stateCond.Broadcast()
+		writer.stateMu.Unlock()
+	}
+	stopCaller := context.AfterFunc(ctx, wake)
+	stopWriter := context.AfterFunc(writer.ctx, wake)
+	defer stopCaller()
+	defer stopWriter()
+
+	writer.stateMu.Lock()
+	defer writer.stateMu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return normalizeNamedPipeContextError(ctx, err)
+		}
+		if writer.closed || writer.ctx.Err() != nil {
+			return ErrClosed
+		}
+		select {
+		case writer.queue <- request:
+			return nil
+		default:
+			writer.stateCond.Wait()
+		}
+	}
+}
+
+func (writer *namedPipeWriter) markClosed() {
+	writer.stateMu.Lock()
+	writer.closed = true
+	writer.stateCond.Broadcast()
+	writer.stateMu.Unlock()
+}
+
+func (writer *namedPipeWriter) drainQueue() {
 	for {
 		select {
 		case request := <-writer.queue:
+			clear(request.wire)
+			request.result <- ErrClosed
+		default:
+			return
+		}
+	}
+}
+
+func (writer *namedPipeWriter) run() {
+	defer func() {
+		writer.markClosed()
+		close(writer.done)
+	}()
+	for {
+		select {
+		case request := <-writer.queue:
+			writer.stateMu.Lock()
+			writer.stateCond.Broadcast()
+			writer.stateMu.Unlock()
 			if err := request.ctx.Err(); err != nil {
 				clear(request.wire)
 				request.result <- normalizeNamedPipeContextError(request.ctx, err)
@@ -99,21 +156,25 @@ func (writer *namedPipeWriter) run() {
 				writer.cancel()
 			}
 		case <-writer.ctx.Done():
-			for {
-				select {
-				case request := <-writer.queue:
-					clear(request.wire)
-					request.result <- ErrClosed
-				default:
-					return
-				}
-			}
+			writer.markClosed()
+			writer.drainQueue()
+			return
 		}
 	}
 }
 
 func (writer *namedPipeWriter) Close() {
-	writer.cancel()
+	writer.stateMu.Lock()
+	shouldCancel := false
+	if !writer.closed {
+		writer.closed = true
+		writer.stateCond.Broadcast()
+		shouldCancel = true
+	}
+	writer.stateMu.Unlock()
+	if shouldCancel {
+		writer.cancel()
+	}
 	<-writer.done
 }
 

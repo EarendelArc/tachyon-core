@@ -126,7 +126,7 @@ func Usage() string {
 		"    --pipe/-p       Named Pipe v2 name\n" +
 		"    --server-sid    Allowlisted Core server token SID (required)\n" +
 		"    --core-binary   Trusted Core binary path (default: current binary)\n" +
-		"    --core-sha256   Trusted immutable Core binary SHA-256 (default: current binary)\n" +
+		"    --core-sha256   Externally pinned immutable Core binary SHA-256 (required)\n" +
 		"    --service-name  SCM service name (default: TachyonHelper)\n" +
 		"    --diagnostic-file  Write auditable helper health JSON\n\n" +
 		"    --diagnostic-test-override  Allow explicit test-only diagnostic path\n\n" +

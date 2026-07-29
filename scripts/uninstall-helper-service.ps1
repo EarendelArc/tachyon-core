@@ -18,6 +18,8 @@ if ($PSCmdlet.ShouldProcess($ServiceName, "Stop and remove Tachyon helper servic
         if ($null -eq $service -or $service.Status -eq 'Stopped') { break }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -ne $service -and $service.Status -ne 'Stopped') { throw "service '$ServiceName' did not stop; refusing to delete or report success" }
     & $scPath delete $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed with exit code $LASTEXITCODE" }
     $deadline = (Get-Date).AddSeconds(10)

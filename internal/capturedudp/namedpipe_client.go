@@ -324,6 +324,7 @@ func (client *namedPipeClient) readConnection(ctx context.Context, connection na
 }
 
 func (client *namedPipeClient) call(ctx context.Context, operation namedPipeMessageType, body []byte) ([]byte, error) {
+	defer clear(body)
 	client.requestMu.Lock()
 	client.mu.Lock()
 	if client.closed {
@@ -533,13 +534,13 @@ func (client *namedPipeClient) OpenFlow(ctx context.Context, spec FlowSpec) (Flo
 	client.mu.Lock()
 	requestID = client.nextID
 	client.mu.Unlock()
-	body, err := encodePipeFlowSpec(requestID, spec)
+	encoded, err := encodePipeFlowSpec(requestID, spec)
 	if err != nil {
 		return FlowLease{}, err
 	}
-	body = body[8:]
+	defer clear(encoded)
+	body := encoded[8:]
 	data, err := client.call(ctx, pipeMessageOpenFlow, body)
-	clear(body)
 	if err != nil {
 		return FlowLease{}, err
 	}

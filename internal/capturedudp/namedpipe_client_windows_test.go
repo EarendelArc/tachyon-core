@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsNamedPipeClientProtocolAndReconnectBoundary(t *testing.T) {
@@ -179,7 +180,12 @@ func currentWindowsTestBinary(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, err := sha256File(path)
+	handle, _, err := openImageFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(handle)
+	hash, err := sha256FileHandle(handle)
 	if err != nil {
 		t.Fatal(err)
 	}

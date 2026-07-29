@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"unsafe"
 )
 
 func TestUnavailableCaptureProviderNeverReportsReadyOrProducesPackets(t *testing.T) {
@@ -35,7 +34,7 @@ func TestRequiredWFPDriverContractIsExplicitlyVersioned(t *testing.T) {
 
 func TestWFPABIRejectsWrongVersionKindAndLengths(t *testing.T) {
 	contract := RequiredWFPDriverContract()
-	header := WFPABIHeader{Size: uint32(unsafe.Sizeof(WFPABIHeader{})), Version: WFPDriverABIVersion, Kind: WFPKindDatagram, RequestID: 1}
+	header := WFPABIHeader{Size: WFPABIHeaderWireSize, Version: WFPDriverABIVersion, Kind: WFPKindDatagram, RequestID: 1}
 	if err := ValidateWFPMessageHeader(header, WFPKindDatagram, contract.MaxMessageSize); err != nil {
 		t.Fatal(err)
 	}
@@ -52,8 +51,8 @@ func TestWFPABIRejectsWrongVersionKindAndLengths(t *testing.T) {
 		}
 	}
 	handshake := WFPDriverHandshake{
-		Header:     WFPABIHeader{Size: uint32(unsafe.Sizeof(WFPDriverHandshake{})), Version: WFPDriverABIVersion, Kind: WFPKindHandshake, RequestID: 1},
-		ContractID: WFPDriverContractID, Capabilities: WFPFlagFlowCapture | WFPFlagDatagramCapture | WFPFlagProcessIdentity | WFPFlagKernelInjection | WFPFlagCancelable,
+		Header:     WFPABIHeader{Size: WFPHandshakeWireSize, Version: WFPDriverABIVersion, Kind: WFPKindHandshake, RequestID: 1},
+		ContractID: WFPDriverContractID, Capabilities: WFPRequiredCapabilityMask,
 		MaxMTU: contract.MaxMTU,
 	}
 	if err := handshake.Validate(contract.MaxMessageSize); err != nil {
@@ -62,5 +61,61 @@ func TestWFPABIRejectsWrongVersionKindAndLengths(t *testing.T) {
 	handshake.Header.Size--
 	if err := handshake.Validate(contract.MaxMessageSize); err == nil {
 		t.Fatal("truncated handshake unexpectedly accepted")
+	}
+}
+
+func TestWFPWireCodecIsLittleEndianAndChecksPayloadLength(t *testing.T) {
+	handshake := WFPDriverHandshake{
+		Header:     WFPABIHeader{Version: WFPDriverABIVersion, Kind: WFPKindHandshake, RequestID: 0x0102030405060708},
+		ContractID: WFPDriverContractID, Capabilities: WFPRequiredCapabilityMask, MaxMTU: 1500,
+	}
+	wire, err := MarshalWFPDriverHandshake(handshake, WFPMaxMessageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire[0] != WFPHandshakeWireSize || wire[8] != 0x08 || wire[15] != 0x01 {
+		t.Fatalf("handshake is not little-endian wire data: %x", wire)
+	}
+	decoded, err := UnmarshalWFPDriverHandshake(wire, WFPMaxMessageSize)
+	if err != nil || decoded.Header.RequestID != handshake.Header.RequestID || decoded.ContractID != handshake.ContractID {
+		t.Fatalf("handshake round trip = %+v, error=%v", decoded, err)
+	}
+	message := WFPDatagramMessage{RequestID: 7, Generation: 9, Sequence: 11, Payload: []byte("payload")}
+	message.FlowID[0] = 0xaa
+	datagram, err := MarshalWFPDatagram(message, WFPMaxMessageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedDatagram, err := UnmarshalWFPDatagram(datagram, WFPMaxMessageSize)
+	if err != nil || string(decodedDatagram.Payload) != "payload" || decodedDatagram.FlowID[0] != 0xaa {
+		t.Fatalf("datagram round trip = %+v, error=%v", decodedDatagram, err)
+	}
+	datagram[48]++
+	if _, err := UnmarshalWFPDatagram(datagram, WFPMaxMessageSize); err == nil {
+		t.Fatal("payload size mismatch unexpectedly accepted")
+	}
+	flow := WFPFlowIdentityABI{Header: WFPABIHeader{Version: WFPDriverABIVersion, Kind: WFPKindFlow, RequestID: 13}, Generation: 17, PID: 19, Protocol: 17, AddressFamily: 2, LocalPort: 1000, RemotePort: 2000}
+	flow.FlowID[0] = 0xbb
+	flow.LocalIP[0] = 127
+	flowWire, err := MarshalWFPFlowIdentity(flow, WFPMaxMessageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedFlow, err := UnmarshalWFPFlowIdentity(flowWire, WFPMaxMessageSize)
+	if err != nil || decodedFlow.FlowID[0] != 0xbb || decodedFlow.LocalPort != 1000 || decodedFlow.RemotePort != 2000 {
+		t.Fatalf("flow round trip = %+v, error=%v", decodedFlow, err)
+	}
+}
+
+func TestWFPContractRequiresCleanupAndExactIOCTLs(t *testing.T) {
+	contract := RequiredWFPDriverContract()
+	contract.DynamicSession = false
+	if err := contract.Validate(); err == nil {
+		t.Fatal("dynamic session contract without cleanup unexpectedly accepted")
+	}
+	contract = RequiredWFPDriverContract()
+	contract.InjectIOCTL = contract.CaptureIOCTL
+	if err := contract.Validate(); err == nil {
+		t.Fatal("duplicate IOCTL contract unexpectedly accepted")
 	}
 }

@@ -16,6 +16,14 @@ type lifecycleProvider struct {
 	stopped  chan struct{}
 }
 
+type invalidContractProvider struct{ lifecycleProvider }
+
+func (provider *invalidContractProvider) Contract() WFPDriverContract {
+	contract := RequiredWFPDriverContract()
+	contract.CancelIOCTL = contract.CaptureIOCTL
+	return contract
+}
+
 func (provider *lifecycleProvider) Contract() WFPDriverContract { return RequiredWFPDriverContract() }
 
 func (provider *lifecycleProvider) Start(context.Context, CaptureCallbacks) error {
@@ -64,6 +72,24 @@ func TestRuntimeStopsProviderAfterPartialStartFailure(t *testing.T) {
 	case <-injector.closed:
 	case <-time.After(time.Second):
 		t.Fatal("injector Close was not called after Start failure")
+	}
+}
+
+func TestRuntimeRejectsInvalidProviderContractAndStopsProvider(t *testing.T) {
+	provider := &invalidContractProvider{lifecycleProvider: lifecycleProvider{started: make(chan struct{}), stopped: make(chan struct{})}}
+	injector := &lifecycleInjector{closed: make(chan struct{})}
+	runtime := &Runtime{provider: provider, injector: injector}
+	runtime.client = &blockingTestClient{}
+	if err := runtime.Run(context.Background()); !errors.Is(err, ErrInvalidCaptureContract) {
+		t.Fatalf("invalid provider contract error = %v", err)
+	}
+	select {
+	case <-provider.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("provider Stop was not called after contract rejection")
+	}
+	if health := runtime.Health(); health.ProviderCleanup != "confirmed" {
+		t.Fatalf("provider cleanup state = %q", health.ProviderCleanup)
 	}
 }
 

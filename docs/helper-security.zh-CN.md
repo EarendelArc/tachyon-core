@@ -19,7 +19,8 @@ Core 的 Named Pipe ACL 必须只允许目标 restricted helper/service SID；Se
 安装不会启用 allow_insecure_user_sid。
 
 ~~~powershell
-.\scripts\install-helper-service.ps1 -BinaryPath .\tachyon-core.exe
+$coreHash = (Get-FileHash .\tachyon-core.exe -Algorithm SHA256).Hash
+.\scripts\install-helper-service.ps1 -BinaryPath .\tachyon-core.exe -TrustedServerBinary .\tachyon-core.exe -TrustedServerSHA256 $coreHash
 .\scripts\diagnose-helper-service.ps1
 .\scripts\test-helper-security.ps1 -RunServiceSIDHarness
 .\scripts\test-helper-security.ps1 -RunGoHarness
@@ -32,6 +33,8 @@ Core 的 Named Pipe ACL 必须只允许目标 restricted helper/service SID；Se
 即使失败也会停止并删除唯一的临时 SCM 服务。Go harness 覆盖错误 SID ACL
 拒绝、低完整性拒绝和启用的 service group 匹配。需要特权测试的 CI 或发布机
 必须把管理员 harness 缺失视为门禁失败。
+生产安装必须显式提供外部固定的服务端 SHA-256（或经过审查的 publisher
+pin 实现）；helper 不会静默信任当前正在运行的自身文件哈希。
 
 ## 威胁模型
 

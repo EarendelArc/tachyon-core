@@ -8,8 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"unsafe"
@@ -52,6 +50,10 @@ func verifyNamedPipeServerIdentity(handle windows.Handle, config NamedPipeClient
 		return fmt.Errorf("%w: open server process: %v", ErrNamedPipeIdentity, err)
 	}
 	defer windows.CloseHandle(process)
+	var creationStart, exitTime, kernelTime, userTime windows.Filetime
+	if err := windows.GetProcessTimes(process, &creationStart, &exitTime, &kernelTime, &userTime); err != nil {
+		return fmt.Errorf("%w: get server process creation time: %v", ErrNamedPipeIdentity, err)
+	}
 	var token windows.Token
 	if err := windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token); err != nil {
 		return fmt.Errorf("%w: open server process token: %v", ErrNamedPipeIdentity, err)
@@ -80,15 +82,79 @@ func verifyNamedPipeServerIdentity(handle windows.Handle, config NamedPipeClient
 	if err != nil {
 		return fmt.Errorf("%w: query server image path: %v", ErrNamedPipeIdentity, err)
 	}
-	trustedPath, err := filepath.Abs(config.TrustedServerBinary)
-	if err != nil || !strings.EqualFold(filepath.Clean(imagePath), filepath.Clean(trustedPath)) {
-		return fmt.Errorf("%w: server image path %q does not match trusted %q", ErrNamedPipeIdentity, imagePath, trustedPath)
+	imageFile, finalImagePath, err := openImageFile(imagePath)
+	if err != nil {
+		return fmt.Errorf("%w: open server image file: %v", ErrNamedPipeIdentity, err)
 	}
-	hash, err := sha256File(imagePath)
+	defer windows.CloseHandle(imageFile)
+	trustedPath, err := filepath.Abs(config.TrustedServerBinary)
+	if err != nil {
+		return fmt.Errorf("%w: resolve trusted image path: %v", ErrNamedPipeIdentity, err)
+	}
+	trustedFile, finalTrustedPath, err := openImageFile(trustedPath)
+	if err != nil {
+		return fmt.Errorf("%w: open trusted image file: %v", ErrNamedPipeIdentity, err)
+	}
+	defer windows.CloseHandle(trustedFile)
+	if !strings.EqualFold(filepath.Clean(finalImagePath), filepath.Clean(finalTrustedPath)) {
+		return fmt.Errorf("%w: server final image path %q does not match trusted %q", ErrNamedPipeIdentity, finalImagePath, finalTrustedPath)
+	}
+	hash, err := sha256FileHandle(imageFile)
 	if err != nil || !strings.EqualFold(hash, config.TrustedServerSHA256) {
-		return fmt.Errorf("%w: server image hash does not match trusted immutable hash: %v", ErrNamedPipeIdentity, err)
+		return fmt.Errorf("%w: server image handle hash does not match trusted immutable hash: %v", ErrNamedPipeIdentity, err)
+	}
+	var creationEnd windows.Filetime
+	if err := windows.GetProcessTimes(process, &creationEnd, &exitTime, &kernelTime, &userTime); err != nil {
+		return fmt.Errorf("%w: recheck server process creation time: %v", ErrNamedPipeIdentity, err)
+	}
+	var processIDEnd uint32
+	if err := windows.GetNamedPipeServerProcessId(handle, &processIDEnd); err != nil || processIDEnd != processID || creationStart != creationEnd {
+		return fmt.Errorf("%w: server process identity changed during verification", ErrNamedPipeIdentity)
 	}
 	return nil
+}
+
+func openImageFile(path string) (windows.Handle, string, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, "", err
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return 0, "", err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, "", err
+	}
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		_ = windows.CloseHandle(handle)
+		return 0, "", errors.New("image file is a reparse point")
+	}
+	finalPath, err := finalPathByHandle(handle)
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, "", err
+	}
+	return handle, finalPath, nil
+}
+
+func finalPathByHandle(handle windows.Handle) (string, error) {
+	buffer := make([]uint16, windows.MAX_PATH)
+	for len(buffer) <= 32768 {
+		size, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
+		if err == nil {
+			return windows.UTF16ToString(buffer[:size]), nil
+		}
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+			return "", err
+		}
+		buffer = make([]uint16, len(buffer)*2)
+	}
+	return "", errors.New("final image path exceeds maximum length")
 }
 
 func processImagePath(process windows.Handle) (string, error) {
@@ -124,15 +190,20 @@ func tokenIntegrityRIDForClient(token windows.Token) (uint32, error) {
 	return label.Label.Sid.SubAuthority(uint32(label.Label.Sid.SubAuthorityCount() - 1)), nil
 }
 
-func sha256File(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
+func sha256FileHandle(handle windows.Handle) (string, error) {
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", err
+	buffer := make([]byte, 64*1024)
+	for {
+		var read uint32
+		if err := windows.ReadFile(handle, buffer, &read, nil); err != nil {
+			return "", err
+		}
+		if read == 0 {
+			break
+		}
+		if _, err := hasher.Write(buffer[:read]); err != nil {
+			return "", err
+		}
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

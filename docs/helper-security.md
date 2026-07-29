@@ -25,7 +25,8 @@ is not used by the service installation.
 Usage:
 
 ~~~powershell
-.\scripts\install-helper-service.ps1 -BinaryPath .\tachyon-core.exe
+$coreHash = (Get-FileHash .\tachyon-core.exe -Algorithm SHA256).Hash
+.\scripts\install-helper-service.ps1 -BinaryPath .\tachyon-core.exe -TrustedServerBinary .\tachyon-core.exe -TrustedServerSHA256 $coreHash
 .\scripts\diagnose-helper-service.ps1
 .\scripts\test-helper-security.ps1 -RunServiceSIDHarness
 .\scripts\test-helper-security.ps1 -RunGoHarness
@@ -41,6 +42,9 @@ service even on failure. The Go harness covers wrong-SID ACL denial,
 low-integrity rejection, and enabled service-group matching. A CI or release
 machine must treat a missing administrator harness as a gate failure when
 privileged testing is required.
+Production installation must provide an externally pinned server SHA-256 (or
+a reviewed publisher-pin implementation); the helper never silently trusts the
+currently running image hash.
 
 ## Threat model
 

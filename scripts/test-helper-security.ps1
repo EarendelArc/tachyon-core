@@ -36,9 +36,11 @@ if ($RunServiceSIDHarness) {
     $diag = Join-Path $env:TEMP "$name.json"
     $serverSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
     $coreProcess = $null
+    $trustedHash = (Get-FileHash -LiteralPath $resolvedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     Remove-Item -LiteralPath $diag -Force -ErrorAction SilentlyContinue
     $quotedBinary = [char]34 + $resolvedBinary + [char]34
-    $image = "$quotedBinary helper --service --service-name $name --pipe $corePipe --server-sid $serverSID --diagnostic-file $diag --diagnostic-test-override"
+    $quotedTrustedBinary = [char]34 + $resolvedBinary + [char]34
+    $image = "$quotedBinary helper --service --service-name $name --pipe $corePipe --server-sid $serverSID --core-binary $quotedTrustedBinary --core-sha256 $trustedHash --diagnostic-file $diag --diagnostic-test-override"
     try {
         & $scPath create $name binPath= $image start= demand obj= "NT AUTHORITY\LocalService" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service creation failed" }
@@ -85,6 +87,11 @@ if ($RunServiceSIDHarness) {
             while (Get-Service -Name $name -ErrorAction SilentlyContinue) {
                 if ((Get-Date) -gt $deleteDeadline) { throw "temporary service '$name' still exists after cleanup" }
                 Start-Sleep -Milliseconds 200
+            }
+            if (Test-Path -LiteralPath $diag) {
+                $stoppedHealth = Get-Content -LiteralPath $diag -Raw | ConvertFrom-Json
+                if ($stoppedHealth.stop_timed_out) { throw "helper shutdown reported a timeout" }
+                if ($stoppedHealth.provider_cleanup -ne 'confirmed') { throw "provider cleanup was not confirmed: $($stoppedHealth.provider_cleanup)" }
             }
         }
         finally {

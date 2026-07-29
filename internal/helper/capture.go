@@ -5,11 +5,11 @@ package helper
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
 	"time"
-	"unsafe"
 )
 
 const WFPDriverContractVersion = "tachyon-wfp-callout-v1"
@@ -28,6 +28,14 @@ const (
 	WFPFlagProcessIdentity
 	WFPFlagKernelInjection
 	WFPFlagCancelable
+)
+
+const (
+	WFPABIHeaderWireSize      = 16
+	WFPHandshakeWireSize      = 36
+	WFPFlowIdentityWireSize   = 84
+	WFPDatagramHeaderWireSize = 56
+	WFPRequiredCapabilityMask = WFPFlagFlowCapture | WFPFlagDatagramCapture | WFPFlagProcessIdentity | WFPFlagKernelInjection | WFPFlagCancelable
 )
 
 var ErrCaptureUnavailable = errors.New("no verified Windows capture provider is installed")
@@ -95,18 +103,20 @@ type Injector interface {
 }
 
 type WFPDriverContract struct {
-	Version              string
-	ABIVersion           uint16
-	ContractID           uint32
-	DevicePath           string
-	CaptureIOCTL         uint32
-	InjectIOCTL          uint32
-	GetCapabilitiesIOCTL uint32
-	CancelIOCTL          uint32
-	MaxMTU               uint32
-	MaxMessageSize       uint32
-	SupportsCancel       bool
-	Capabilities         CaptureCapabilities
+	Version                string
+	ABIVersion             uint16
+	ContractID             uint32
+	DevicePath             string
+	CaptureIOCTL           uint32
+	InjectIOCTL            uint32
+	GetCapabilitiesIOCTL   uint32
+	CancelIOCTL            uint32
+	MaxMTU                 uint32
+	MaxMessageSize         uint32
+	SupportsCancel         bool
+	DynamicSession         bool
+	StopCleansDynamicState bool
+	Capabilities           CaptureCapabilities
 }
 
 // WFPABIHeader is the fixed little-endian prefix of every proposed driver
@@ -150,6 +160,14 @@ type WFPDatagramABI struct {
 	Payload     [0]byte
 }
 
+type WFPDatagramMessage struct {
+	RequestID  uint64
+	FlowID     [16]byte
+	Generation uint64
+	Sequence   uint64
+	Payload    []byte
+}
+
 func (contract WFPDriverContract) Validate() error {
 	if contract.Version != WFPDriverContractVersion || contract.ABIVersion != WFPDriverABIVersion || contract.ContractID != WFPDriverContractID {
 		return fmt.Errorf("WFP contract version or ID mismatch")
@@ -165,47 +183,167 @@ func (contract WFPDriverContract) Validate() error {
 			}
 		}
 	}
-	if contract.MaxMTU < 576 || contract.MaxMTU > 65535 || contract.MaxMessageSize < uint32(unsafe.Sizeof(WFPDatagramABI{})) || contract.MaxMessageSize > WFPMaxMessageSize {
+	if contract.MaxMTU < 576 || contract.MaxMTU > 65535 || contract.MaxMessageSize < WFPDatagramHeaderWireSize || contract.MaxMessageSize > WFPMaxMessageSize {
 		return fmt.Errorf("WFP contract has invalid message or MTU bounds")
 	}
-	if !contract.SupportsCancel || !contract.Capabilities.Cancelable || !contract.Capabilities.FlowCapture || !contract.Capabilities.DatagramCapture || !contract.Capabilities.ProcessIdentity || !contract.Capabilities.PerFlowMTU || !contract.Capabilities.KernelInjection {
+	if !contract.SupportsCancel || !contract.DynamicSession || !contract.StopCleansDynamicState || !contract.Capabilities.Cancelable || !contract.Capabilities.FlowCapture || !contract.Capabilities.DatagramCapture || !contract.Capabilities.ProcessIdentity || !contract.Capabilities.PerFlowMTU || !contract.Capabilities.KernelInjection {
 		return fmt.Errorf("WFP contract lacks required capabilities")
 	}
 	return nil
 }
 
 func (handshake WFPDriverHandshake) Validate(maxMessageSize uint32) error {
-	if handshake.Header.Kind != WFPKindHandshake || handshake.Header.Version != WFPDriverABIVersion || handshake.Header.Size != uint32(unsafe.Sizeof(handshake)) || handshake.Header.Size > maxMessageSize {
+	if handshake.Header.Kind != WFPKindHandshake || handshake.Header.Version != WFPDriverABIVersion || handshake.Header.Size != WFPHandshakeWireSize || handshake.Header.Size > maxMessageSize || handshake.Header.RequestID == 0 {
 		return fmt.Errorf("invalid WFP handshake header")
 	}
-	requiredCapabilities := WFPFlagFlowCapture | WFPFlagDatagramCapture | WFPFlagProcessIdentity | WFPFlagKernelInjection | WFPFlagCancelable
-	if handshake.ContractID != WFPDriverContractID || handshake.Capabilities&requiredCapabilities != requiredCapabilities || handshake.MaxMTU < 576 || handshake.MaxMTU > 65535 {
+	if handshake.ContractID != WFPDriverContractID || handshake.Capabilities&WFPRequiredCapabilityMask != WFPRequiredCapabilityMask || handshake.MaxMTU < 576 || handshake.MaxMTU > 65535 {
 		return fmt.Errorf("invalid WFP handshake contract")
 	}
 	return nil
 }
 
 func ValidateWFPMessageHeader(header WFPABIHeader, expectedKind uint16, maxMessageSize uint32) error {
-	minimum := uint32(unsafe.Sizeof(WFPABIHeader{}))
-	if header.Size < minimum || header.Size > maxMessageSize || header.Version != WFPDriverABIVersion || header.Kind != expectedKind || header.RequestID == 0 {
+	if header.Size < WFPABIHeaderWireSize || header.Size > maxMessageSize || header.Version != WFPDriverABIVersion || header.Kind != expectedKind || header.RequestID == 0 {
 		return fmt.Errorf("invalid WFP message header")
 	}
 	return nil
 }
 
+func MarshalWFPDriverHandshake(handshake WFPDriverHandshake, maxMessageSize uint32) ([]byte, error) {
+	handshake.Header.Size = WFPHandshakeWireSize
+	if err := handshake.Validate(maxMessageSize); err != nil {
+		return nil, err
+	}
+	data := make([]byte, WFPHandshakeWireSize)
+	encodeWFPABIHeader(data, handshake.Header)
+	binary.LittleEndian.PutUint32(data[16:20], handshake.ContractID)
+	binary.LittleEndian.PutUint64(data[20:28], handshake.Capabilities)
+	binary.LittleEndian.PutUint32(data[28:32], handshake.MaxMTU)
+	binary.LittleEndian.PutUint32(data[32:36], handshake.Reserved)
+	return data, nil
+}
+
+func UnmarshalWFPDriverHandshake(data []byte, maxMessageSize uint32) (WFPDriverHandshake, error) {
+	if len(data) != WFPHandshakeWireSize {
+		return WFPDriverHandshake{}, fmt.Errorf("invalid WFP handshake length")
+	}
+	header, err := decodeWFPABIHeader(data[:WFPABIHeaderWireSize])
+	if err != nil {
+		return WFPDriverHandshake{}, err
+	}
+	handshake := WFPDriverHandshake{Header: header,
+		ContractID:   binary.LittleEndian.Uint32(data[16:20]),
+		Capabilities: binary.LittleEndian.Uint64(data[20:28]),
+		MaxMTU:       binary.LittleEndian.Uint32(data[28:32]),
+		Reserved:     binary.LittleEndian.Uint32(data[32:36]),
+	}
+	return handshake, handshake.Validate(maxMessageSize)
+}
+
+func MarshalWFPDatagram(message WFPDatagramMessage, maxMessageSize uint32) ([]byte, error) {
+	if message.RequestID == 0 || uint32(WFPDatagramHeaderWireSize+len(message.Payload)) > maxMessageSize || maxMessageSize > WFPMaxMessageSize {
+		return nil, fmt.Errorf("invalid WFP datagram length or request ID")
+	}
+	data := make([]byte, WFPDatagramHeaderWireSize+len(message.Payload))
+	encodeWFPABIHeader(data, WFPABIHeader{Size: uint32(len(data)), Version: WFPDriverABIVersion, Kind: WFPKindDatagram, RequestID: message.RequestID})
+	copy(data[16:32], message.FlowID[:])
+	binary.LittleEndian.PutUint64(data[32:40], message.Generation)
+	binary.LittleEndian.PutUint64(data[40:48], message.Sequence)
+	binary.LittleEndian.PutUint32(data[48:52], uint32(len(message.Payload)))
+	copy(data[WFPDatagramHeaderWireSize:], message.Payload)
+	return data, nil
+}
+
+func UnmarshalWFPDatagram(data []byte, maxMessageSize uint32) (WFPDatagramMessage, error) {
+	if len(data) < WFPDatagramHeaderWireSize || uint32(len(data)) > maxMessageSize {
+		return WFPDatagramMessage{}, fmt.Errorf("invalid WFP datagram length")
+	}
+	header, err := decodeWFPABIHeader(data[:WFPABIHeaderWireSize])
+	if err != nil {
+		return WFPDatagramMessage{}, err
+	}
+	if header.Kind != WFPKindDatagram || header.Size != uint32(len(data)) {
+		return WFPDatagramMessage{}, fmt.Errorf("invalid WFP datagram header")
+	}
+	payloadSize := binary.LittleEndian.Uint32(data[48:52])
+	if payloadSize != uint32(len(data)-WFPDatagramHeaderWireSize) {
+		return WFPDatagramMessage{}, fmt.Errorf("WFP datagram payload size mismatch")
+	}
+	var flowID [16]byte
+	copy(flowID[:], data[16:32])
+	return WFPDatagramMessage{RequestID: header.RequestID, FlowID: flowID,
+		Generation: binary.LittleEndian.Uint64(data[32:40]),
+		Sequence:   binary.LittleEndian.Uint64(data[40:48]),
+		Payload:    append([]byte(nil), data[WFPDatagramHeaderWireSize:]...)}, nil
+}
+
+func MarshalWFPFlowIdentity(identity WFPFlowIdentityABI, maxMessageSize uint32) ([]byte, error) {
+	identity.Header.Size = WFPFlowIdentityWireSize
+	if identity.Header.Kind != WFPKindFlow || identity.Header.Version != WFPDriverABIVersion || identity.Header.RequestID == 0 || uint32(WFPFlowIdentityWireSize) > maxMessageSize {
+		return nil, fmt.Errorf("invalid WFP flow identity")
+	}
+	data := make([]byte, WFPFlowIdentityWireSize)
+	encodeWFPABIHeader(data, identity.Header)
+	copy(data[16:32], identity.FlowID[:])
+	binary.LittleEndian.PutUint64(data[32:40], identity.Generation)
+	binary.LittleEndian.PutUint32(data[40:44], identity.PID)
+	data[44] = identity.Protocol
+	data[45] = identity.AddressFamily
+	binary.LittleEndian.PutUint16(data[46:48], identity.Reserved)
+	copy(data[48:64], identity.LocalIP[:])
+	copy(data[64:80], identity.RemoteIP[:])
+	binary.LittleEndian.PutUint16(data[80:82], identity.LocalPort)
+	binary.LittleEndian.PutUint16(data[82:84], identity.RemotePort)
+	return data, nil
+}
+
+func UnmarshalWFPFlowIdentity(data []byte, maxMessageSize uint32) (WFPFlowIdentityABI, error) {
+	if len(data) != WFPFlowIdentityWireSize || uint32(len(data)) > maxMessageSize {
+		return WFPFlowIdentityABI{}, fmt.Errorf("invalid WFP flow identity length")
+	}
+	header, err := decodeWFPABIHeader(data[:WFPABIHeaderWireSize])
+	if err != nil {
+		return WFPFlowIdentityABI{}, err
+	}
+	if header.Kind != WFPKindFlow || header.Size != WFPFlowIdentityWireSize {
+		return WFPFlowIdentityABI{}, fmt.Errorf("invalid WFP flow identity header")
+	}
+	identity := WFPFlowIdentityABI{Header: header, Generation: binary.LittleEndian.Uint64(data[32:40]), PID: binary.LittleEndian.Uint32(data[40:44]), Protocol: data[44], AddressFamily: data[45], Reserved: binary.LittleEndian.Uint16(data[46:48]), LocalPort: binary.LittleEndian.Uint16(data[80:82]), RemotePort: binary.LittleEndian.Uint16(data[82:84])}
+	copy(identity.FlowID[:], data[16:32])
+	copy(identity.LocalIP[:], data[48:64])
+	copy(identity.RemoteIP[:], data[64:80])
+	return identity, nil
+}
+
+func encodeWFPABIHeader(destination []byte, header WFPABIHeader) {
+	binary.LittleEndian.PutUint32(destination[0:4], header.Size)
+	binary.LittleEndian.PutUint16(destination[4:6], header.Version)
+	binary.LittleEndian.PutUint16(destination[6:8], header.Kind)
+	binary.LittleEndian.PutUint64(destination[8:16], header.RequestID)
+}
+
+func decodeWFPABIHeader(data []byte) (WFPABIHeader, error) {
+	if len(data) != WFPABIHeaderWireSize {
+		return WFPABIHeader{}, fmt.Errorf("invalid WFP ABI header length")
+	}
+	return WFPABIHeader{Size: binary.LittleEndian.Uint32(data[0:4]), Version: binary.LittleEndian.Uint16(data[4:6]), Kind: binary.LittleEndian.Uint16(data[6:8]), RequestID: binary.LittleEndian.Uint64(data[8:16])}, nil
+}
+
 func RequiredWFPDriverContract() WFPDriverContract {
 	return WFPDriverContract{
-		Version:              WFPDriverContractVersion,
-		ABIVersion:           WFPDriverABIVersion,
-		ContractID:           WFPDriverContractID,
-		DevicePath:           `\\.\TachyonWFP`,
-		CaptureIOCTL:         0x00222000,
-		InjectIOCTL:          0x00222004,
-		GetCapabilitiesIOCTL: 0x00222008,
-		CancelIOCTL:          0x0022200c,
-		MaxMTU:               1500,
-		MaxMessageSize:       WFPMaxMessageSize,
-		SupportsCancel:       true,
+		Version:                WFPDriverContractVersion,
+		ABIVersion:             WFPDriverABIVersion,
+		ContractID:             WFPDriverContractID,
+		DevicePath:             `\\.\TachyonWFP`,
+		CaptureIOCTL:           0x00222000,
+		InjectIOCTL:            0x00222004,
+		GetCapabilitiesIOCTL:   0x00222008,
+		CancelIOCTL:            0x0022200c,
+		MaxMTU:                 1500,
+		MaxMessageSize:         WFPMaxMessageSize,
+		SupportsCancel:         true,
+		DynamicSession:         true,
+		StopCleansDynamicState: true,
 		Capabilities: CaptureCapabilities{
 			FlowCapture: true, DatagramCapture: true, ProcessIdentity: true,
 			PerFlowMTU: true, Cancelable: true, KernelInjection: true,

@@ -2,18 +2,19 @@ package helper
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/capturedudp"
+)
+
+var (
+	ErrInvalidCaptureContract = errors.New("capture provider contract is not an exact supported contract")
+	ErrRuntimeStopTimeout     = errors.New("helper runtime shutdown timed out")
 )
 
 type Config struct {
@@ -50,6 +51,7 @@ type Health struct {
 	Lifecycle           string              `json:"lifecycle"`
 	LastError           string              `json:"last_error,omitempty"`
 	StopTimedOut        bool                `json:"stop_timed_out"`
+	ProviderCleanup     string              `json:"provider_cleanup"`
 }
 
 type Runtime struct {
@@ -86,19 +88,8 @@ func NewRuntime(config Config) (*Runtime, error) {
 	if config.Injector == nil {
 		config.Injector = NewUnavailableInjector()
 	}
-	if config.TrustedServerBinary == "" {
-		path, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("resolve trusted Core binary: %w", err)
-		}
-		config.TrustedServerBinary = path
-	}
-	if config.TrustedServerSHA256 == "" {
-		hash, err := hashFile(config.TrustedServerBinary)
-		if err != nil {
-			return nil, fmt.Errorf("hash trusted Core binary: %w", err)
-		}
-		config.TrustedServerSHA256 = hash
+	if config.TrustedServerBinary == "" || config.TrustedServerSHA256 == "" {
+		return nil, errors.New("trusted Core binary path and externally pinned SHA-256 are required")
 	}
 	runtime := &Runtime{config: config, provider: config.Provider, injector: config.Injector}
 	client, err := capturedudp.NewNamedPipeClient(capturedudp.NamedPipeClientConfig{
@@ -114,6 +105,28 @@ func NewRuntime(config Config) (*Runtime, error) {
 	runtime.client = client
 	runtime.refreshHealth()
 	return runtime, nil
+}
+
+// ValidateCaptureProviderContract rejects providers that only claim the
+// required shape. The helper starts a provider only when every ABI, device,
+// IOCTL, MTU, capability, and cleanup field is an exact match.
+func ValidateCaptureProviderContract(provider CaptureProvider) error {
+	if provider == nil {
+		return fmt.Errorf("%w: provider is nil", ErrInvalidCaptureContract)
+	}
+	actual := provider.Contract()
+	if err := actual.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidCaptureContract, err)
+	}
+	expected := RequiredWFPDriverContract()
+	if actual.Version != expected.Version || actual.ABIVersion != expected.ABIVersion || actual.ContractID != expected.ContractID ||
+		actual.DevicePath != expected.DevicePath || actual.CaptureIOCTL != expected.CaptureIOCTL || actual.InjectIOCTL != expected.InjectIOCTL ||
+		actual.GetCapabilitiesIOCTL != expected.GetCapabilitiesIOCTL || actual.CancelIOCTL != expected.CancelIOCTL || actual.MaxMTU != expected.MaxMTU ||
+		actual.MaxMessageSize != expected.MaxMessageSize || actual.SupportsCancel != expected.SupportsCancel || actual.DynamicSession != expected.DynamicSession ||
+		actual.StopCleansDynamicState != expected.StopCleansDynamicState || actual.Capabilities != expected.Capabilities {
+		return fmt.Errorf("%w: provider contract differs from required contract", ErrInvalidCaptureContract)
+	}
+	return nil
 }
 
 func (runtime *Runtime) Run(ctx context.Context) error {
@@ -135,6 +148,12 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 		close(runtime.runDone)
 		runtime.runMu.Unlock()
 	}()
+	runtime.setLifecycle("starting", "")
+	if err := ValidateCaptureProviderContract(runtime.provider); err != nil {
+		runtime.setLifecycle("failed", err.Error())
+		_ = runtime.writeDiagnostic()
+		return err
+	}
 	runtime.setLifecycle("running", "")
 	runtime.refreshHealth()
 	monitorDone := make(chan struct{})
@@ -182,8 +201,16 @@ func (runtime *Runtime) Shutdown(ctx context.Context) error {
 		case <-runDone:
 		case <-ctx.Done():
 			runtime.setLifecycle("stop_timeout", ctx.Err().Error())
-			_ = runtime.writeDiagnostic()
-			return errors.Join(errors.New("helper runtime shutdown timed out"), ctx.Err())
+			diagnosticErr := runtime.writeDiagnostic()
+			cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			providerErr := runtime.stopProviderWithContext(cleanupContext)
+			injectorErr := runtime.closeInjectorWithContext(cleanupContext)
+			cleanupCancel()
+			if providerErr != nil || injectorErr != nil {
+				runtime.setLifecycle("failed", errors.Join(providerErr, injectorErr).Error())
+			}
+			cleanupDiagnosticErr := runtime.writeDiagnostic()
+			return errors.Join(ErrRuntimeStopTimeout, ctx.Err(), diagnosticErr, providerErr, injectorErr, cleanupDiagnosticErr)
 		}
 	} else {
 		runtime.stopProvider()
@@ -232,6 +259,7 @@ func (runtime *Runtime) refreshHealth() {
 		Authenticated: pipeHealth.Authenticated, WFPContractVersion: WFPDriverContractVersion,
 		ServiceSIDPresent: tokenSecurity.ServiceSIDPresent, RestrictedSIDCount: tokenSecurity.RestrictedSIDCount,
 		PID: os.Getpid(), UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		ProviderCleanup: runtime.health.ProviderCleanup,
 	}
 	runtime.health.Lifecycle = lifecycle
 	runtime.health.LastError = lastError
@@ -248,25 +276,45 @@ func (runtime *Runtime) setLifecycle(lifecycle, lastError string) {
 }
 
 func (runtime *Runtime) stopProvider() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = runtime.stopProviderWithContext(ctx)
+}
+
+func (runtime *Runtime) stopProviderWithContext(ctx context.Context) error {
 	runtime.providerStopOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		runtime.mu.Lock()
+		runtime.health.ProviderCleanup = "stopping"
+		runtime.mu.Unlock()
 		runtime.providerStopErr = runtime.provider.Stop(ctx)
+		runtime.mu.Lock()
+		if runtime.providerStopErr == nil {
+			runtime.health.ProviderCleanup = "confirmed"
+		} else {
+			runtime.health.ProviderCleanup = "failed"
+		}
+		runtime.mu.Unlock()
 		if runtime.providerStopErr != nil {
 			runtime.setLifecycle("failed", runtime.providerStopErr.Error())
 		}
 	})
+	return runtime.providerStopErr
 }
 
 func (runtime *Runtime) closeInjector() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = runtime.closeInjectorWithContext(ctx)
+}
+
+func (runtime *Runtime) closeInjectorWithContext(ctx context.Context) error {
 	runtime.injectorCloseOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		runtime.injectorCloseErr = runtime.injector.Close(ctx)
 		if runtime.injectorCloseErr != nil {
 			runtime.setLifecycle("failed", runtime.injectorCloseErr.Error())
 		}
 	})
+	return runtime.injectorCloseErr
 }
 
 func (runtime *Runtime) handleCapture(ctx context.Context, captured CapturedDatagram) error {
@@ -307,23 +355,7 @@ func (runtime *Runtime) writeDiagnostic() error {
 	if err != nil {
 		return fmt.Errorf("marshal helper health: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(runtime.config.DiagnosticFile), 0o700); err != nil {
-		return fmt.Errorf("create helper diagnostic directory: %w", err)
-	}
-	if err := secureDiagnosticPath(filepath.Dir(runtime.config.DiagnosticFile)); err != nil {
-		return err
-	}
-	temporary := runtime.config.DiagnosticFile + ".tmp"
-	if err := validateDiagnosticPath(temporary, runtime.config.DiagnosticOverride); err != nil {
-		return err
-	}
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
-		return fmt.Errorf("write helper health: %w", err)
-	}
-	if err := secureDiagnosticPath(temporary); err != nil {
-		return err
-	}
-	return os.Rename(temporary, runtime.config.DiagnosticFile)
+	return writeDiagnosticAtomic(runtime.config.DiagnosticFile, data, runtime.config.DiagnosticOverride)
 }
 
 func (runtime *Runtime) monitorDiagnostic(ctx context.Context, done <-chan struct{}) {
@@ -340,17 +372,4 @@ func (runtime *Runtime) monitorDiagnostic(ctx context.Context, done <-chan struc
 			_ = runtime.writeDiagnostic()
 		}
 	}
-}
-
-func hashFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

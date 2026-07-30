@@ -32,8 +32,12 @@ type Config struct {
 	ServiceName               string
 	DiagnosticFile            string
 	DiagnosticOverride        bool
-	Provider                  CaptureProvider
-	Injector                  Injector
+	// FailStop is invoked only after the sole provider shutdown operation has
+	// exceeded its absolute deadline. Production Windows uses TerminateProcess;
+	// tests inject a harmless implementation.
+	FailStop func(context.Context) error
+	Provider CaptureProvider
+	Injector Injector
 }
 
 type Health struct {
@@ -55,21 +59,29 @@ type Health struct {
 }
 
 type Runtime struct {
-	config   Config
-	provider CaptureProvider
-	injector Injector
-	client   capturedudp.NamedPipeClient
+	config     Config
+	provider   CaptureProvider
+	injector   Injector
+	client     capturedudp.NamedPipeClient
+	diagnostic diagnosticFile
+	failStop   func(context.Context) error
 
-	mu                sync.RWMutex
-	health            Health
-	diagnosticMu      sync.Mutex
-	runMu             sync.Mutex
-	runDone           chan struct{}
-	running           bool
-	providerStopOnce  sync.Once
-	providerStopErr   error
-	injectorCloseOnce sync.Once
-	injectorCloseErr  error
+	mu           sync.RWMutex
+	health       Health
+	diagnosticMu sync.Mutex
+	runMu        sync.Mutex
+	runDone      chan struct{}
+	running      bool
+	providerStop providerShutdown
+	injectorStop providerShutdown
+}
+
+type providerShutdown struct {
+	mu        sync.Mutex
+	started   bool
+	completed bool
+	done      chan struct{}
+	err       error
 }
 
 func NewRuntime(config Config) (*Runtime, error) {
@@ -91,7 +103,15 @@ func NewRuntime(config Config) (*Runtime, error) {
 	if config.TrustedServerBinary == "" || config.TrustedServerSHA256 == "" {
 		return nil, errors.New("trusted Core binary path and externally pinned SHA-256 are required")
 	}
-	runtime := &Runtime{config: config, provider: config.Provider, injector: config.Injector}
+	diagnostic, err := openDiagnosticFile(config.DiagnosticFile, config.DiagnosticOverride)
+	if err != nil {
+		return nil, err
+	}
+	failStop := config.FailStop
+	if failStop == nil {
+		failStop = defaultFailStop
+	}
+	runtime := &Runtime{config: config, provider: config.Provider, injector: config.Injector, diagnostic: diagnostic, failStop: failStop}
 	client, err := capturedudp.NewNamedPipeClient(capturedudp.NamedPipeClientConfig{
 		Name: config.PipeName, ServerSIDs: config.ServerSIDs,
 		MinimumServerIntegrityRID: config.MinimumServerIntegrityRID,
@@ -100,6 +120,7 @@ func NewRuntime(config Config) (*Runtime, error) {
 		ReconnectMin:     config.ReconnectMin, ReconnectMax: config.ReconnectMax,
 	}, runtime.handleDelivery)
 	if err != nil {
+		_ = diagnostic.Close()
 		return nil, err
 	}
 	runtime.client = client
@@ -129,7 +150,7 @@ func ValidateCaptureProviderContract(provider CaptureProvider) error {
 	return nil
 }
 
-func (runtime *Runtime) Run(ctx context.Context) error {
+func (runtime *Runtime) Run(ctx context.Context) (result error) {
 	runtime.runMu.Lock()
 	if runtime.running {
 		runtime.runMu.Unlock()
@@ -139,14 +160,20 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 	runtime.runDone = make(chan struct{})
 	runtime.runMu.Unlock()
 	defer func() {
-		runtime.stopProvider()
-		runtime.closeInjector()
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), runtime.providerStopDeadline(context.Background()))
+		providerErr := runtime.stopProviderWithContext(cleanupContext)
+		injectorErr := runtime.closeInjectorWithContext(cleanupContext)
+		cleanupCancel()
+		if result == nil && (providerErr != nil || injectorErr != nil) {
+			result = errors.Join(providerErr, injectorErr)
+		}
 		runtime.refreshHealth()
 		_ = runtime.writeDiagnostic()
 		runtime.runMu.Lock()
 		runtime.running = false
 		close(runtime.runDone)
 		runtime.runMu.Unlock()
+		_ = runtime.closeDiagnostic()
 	}()
 	runtime.setLifecycle("starting", "")
 	if err := ValidateCaptureProviderContract(runtime.provider); err != nil {
@@ -192,6 +219,7 @@ func (runtime *Runtime) Shutdown(ctx context.Context) error {
 	if runtime.client != nil {
 		_ = runtime.client.Close()
 	}
+	providerErr := runtime.stopProviderWithContext(ctx)
 	runtime.runMu.Lock()
 	runDone := runtime.runDone
 	running := runtime.running
@@ -202,10 +230,7 @@ func (runtime *Runtime) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			runtime.setLifecycle("stop_timeout", ctx.Err().Error())
 			diagnosticErr := runtime.writeDiagnostic()
-			cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			providerErr := runtime.stopProviderWithContext(cleanupContext)
-			injectorErr := runtime.closeInjectorWithContext(cleanupContext)
-			cleanupCancel()
+			injectorErr := runtime.closeInjectorWithContext(ctx)
 			if providerErr != nil || injectorErr != nil {
 				runtime.setLifecycle("failed", errors.Join(providerErr, injectorErr).Error())
 			}
@@ -213,14 +238,17 @@ func (runtime *Runtime) Shutdown(ctx context.Context) error {
 			return errors.Join(ErrRuntimeStopTimeout, ctx.Err(), diagnosticErr, providerErr, injectorErr, cleanupDiagnosticErr)
 		}
 	} else {
-		runtime.stopProvider()
-		runtime.closeInjector()
+		injectorErr := runtime.closeInjectorWithContext(ctx)
+		if providerErr != nil || injectorErr != nil {
+			return errors.Join(providerErr, injectorErr)
+		}
+		_ = runtime.closeDiagnostic()
 	}
-	if runtime.providerStopErr != nil {
-		return runtime.providerStopErr
+	if providerErr != nil {
+		return providerErr
 	}
-	if runtime.injectorCloseErr != nil {
-		return runtime.injectorCloseErr
+	if injectorErr := runtime.injectorStopError(); injectorErr != nil {
+		return injectorErr
 	}
 	runtime.setLifecycle("stopped", "")
 	_ = runtime.writeDiagnostic()
@@ -275,30 +303,98 @@ func (runtime *Runtime) setLifecycle(lifecycle, lastError string) {
 	runtime.mu.Unlock()
 }
 
-func (runtime *Runtime) stopProvider() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = runtime.stopProviderWithContext(ctx)
+func (runtime *Runtime) stopProviderWithContext(ctx context.Context) error {
+	done := runtime.startProviderStop(ctx)
+	select {
+	case <-done:
+		return runtime.providerStopError()
+	case <-ctx.Done():
+		return errors.Join(ErrRuntimeStopTimeout, ctx.Err())
+	}
 }
 
-func (runtime *Runtime) stopProviderWithContext(ctx context.Context) error {
-	runtime.providerStopOnce.Do(func() {
+func (runtime *Runtime) startProviderStop(ctx context.Context) <-chan struct{} {
+	runtime.providerStop.mu.Lock()
+	if runtime.providerStop.started {
+		done := runtime.providerStop.done
+		runtime.providerStop.mu.Unlock()
+		return done
+	}
+	runtime.providerStop.started = true
+	runtime.providerStop.done = make(chan struct{})
+	done := runtime.providerStop.done
+	timeout := runtime.providerStopDeadline(ctx)
+	runtime.providerStop.mu.Unlock()
+	go func() {
 		runtime.mu.Lock()
 		runtime.health.ProviderCleanup = "stopping"
 		runtime.mu.Unlock()
-		runtime.providerStopErr = runtime.provider.Stop(ctx)
-		runtime.mu.Lock()
-		if runtime.providerStopErr == nil {
-			runtime.health.ProviderCleanup = "confirmed"
+		stopContext, stopCancel := context.WithTimeout(context.Background(), timeout)
+		defer stopCancel()
+		stopResult := make(chan error, 1)
+		go func() { stopResult <- runtime.provider.Stop(stopContext) }()
+		select {
+		case err := <-stopResult:
+			runtime.finishProviderStop(err)
+		case <-stopContext.Done():
+			runtime.setLifecycle("stop_timeout", stopContext.Err().Error())
+			diagnosticErr := runtime.writeDiagnostic()
+			failStopContext, failStopCancel := context.WithTimeout(context.Background(), time.Second)
+			failStopErr := runtime.failStop(failStopContext)
+			failStopCancel()
+			runtime.finishProviderStop(errors.Join(ErrRuntimeStopTimeout, stopContext.Err(), diagnosticErr, failStopErr))
+		}
+	}()
+	return done
+}
+
+func (runtime *Runtime) providerStopDeadline(ctx context.Context) time.Duration {
+	timeout := runtime.config.OperationTimeout
+	if timeout <= 0 || timeout > 10*time.Second {
+		timeout = 5 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return time.Nanosecond
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return timeout
+}
+
+func (runtime *Runtime) finishProviderStop(err error) {
+	runtime.providerStop.mu.Lock()
+	if runtime.providerStop.completed || runtime.providerStop.done == nil {
+		runtime.providerStop.mu.Unlock()
+		return
+	}
+	runtime.providerStop.completed = true
+	runtime.providerStop.err = err
+	close(runtime.providerStop.done)
+	runtime.providerStop.mu.Unlock()
+	runtime.mu.Lock()
+	if err == nil {
+		runtime.health.ProviderCleanup = "confirmed"
+	} else {
+		runtime.health.ProviderCleanup = "failed"
+	}
+	runtime.mu.Unlock()
+	if err != nil {
+		if errors.Is(err, ErrRuntimeStopTimeout) {
+			runtime.setLifecycle("stop_timeout", err.Error())
 		} else {
-			runtime.health.ProviderCleanup = "failed"
+			runtime.setLifecycle("failed", err.Error())
 		}
-		runtime.mu.Unlock()
-		if runtime.providerStopErr != nil {
-			runtime.setLifecycle("failed", runtime.providerStopErr.Error())
-		}
-	})
-	return runtime.providerStopErr
+	}
+}
+
+func (runtime *Runtime) providerStopError() error {
+	runtime.providerStop.mu.Lock()
+	defer runtime.providerStop.mu.Unlock()
+	return runtime.providerStop.err
 }
 
 func (runtime *Runtime) closeInjector() {
@@ -308,13 +404,61 @@ func (runtime *Runtime) closeInjector() {
 }
 
 func (runtime *Runtime) closeInjectorWithContext(ctx context.Context) error {
-	runtime.injectorCloseOnce.Do(func() {
-		runtime.injectorCloseErr = runtime.injector.Close(ctx)
-		if runtime.injectorCloseErr != nil {
-			runtime.setLifecycle("failed", runtime.injectorCloseErr.Error())
+	done := runtime.startInjectorClose(ctx)
+	select {
+	case <-done:
+		return runtime.injectorStopError()
+	case <-ctx.Done():
+		return errors.Join(ErrRuntimeStopTimeout, ctx.Err())
+	}
+}
+
+func (runtime *Runtime) startInjectorClose(ctx context.Context) <-chan struct{} {
+	runtime.injectorStop.mu.Lock()
+	if runtime.injectorStop.started {
+		done := runtime.injectorStop.done
+		runtime.injectorStop.mu.Unlock()
+		return done
+	}
+	runtime.injectorStop.started = true
+	runtime.injectorStop.done = make(chan struct{})
+	done := runtime.injectorStop.done
+	timeout := runtime.providerStopDeadline(ctx)
+	runtime.injectorStop.mu.Unlock()
+	go func() {
+		closeContext, closeCancel := context.WithTimeout(context.Background(), timeout)
+		defer closeCancel()
+		closeResult := make(chan error, 1)
+		go func() { closeResult <- runtime.injector.Close(closeContext) }()
+		select {
+		case err := <-closeResult:
+			runtime.finishInjectorClose(err)
+		case <-closeContext.Done():
+			runtime.finishInjectorClose(errors.Join(ErrRuntimeStopTimeout, closeContext.Err()))
 		}
-	})
-	return runtime.injectorCloseErr
+	}()
+	return done
+}
+
+func (runtime *Runtime) finishInjectorClose(err error) {
+	runtime.injectorStop.mu.Lock()
+	if runtime.injectorStop.completed || runtime.injectorStop.done == nil {
+		runtime.injectorStop.mu.Unlock()
+		return
+	}
+	runtime.injectorStop.completed = true
+	runtime.injectorStop.err = err
+	close(runtime.injectorStop.done)
+	runtime.injectorStop.mu.Unlock()
+	if err != nil {
+		runtime.setLifecycle("failed", err.Error())
+	}
+}
+
+func (runtime *Runtime) injectorStopError() error {
+	runtime.injectorStop.mu.Lock()
+	defer runtime.injectorStop.mu.Unlock()
+	return runtime.injectorStop.err
 }
 
 func (runtime *Runtime) handleCapture(ctx context.Context, captured CapturedDatagram) error {
@@ -346,7 +490,7 @@ func (runtime *Runtime) handleDelivery(ctx context.Context, delivery capturedudp
 }
 
 func (runtime *Runtime) writeDiagnostic() error {
-	if runtime.config.DiagnosticFile == "" {
+	if runtime.diagnostic == nil {
 		return nil
 	}
 	runtime.diagnosticMu.Lock()
@@ -355,7 +499,18 @@ func (runtime *Runtime) writeDiagnostic() error {
 	if err != nil {
 		return fmt.Errorf("marshal helper health: %w", err)
 	}
-	return writeDiagnosticAtomic(runtime.config.DiagnosticFile, data, runtime.config.DiagnosticOverride)
+	return runtime.diagnostic.Write(data)
+}
+
+func (runtime *Runtime) closeDiagnostic() error {
+	runtime.diagnosticMu.Lock()
+	defer runtime.diagnosticMu.Unlock()
+	if runtime.diagnostic == nil {
+		return nil
+	}
+	err := runtime.diagnostic.Close()
+	runtime.diagnostic = nil
+	return err
 }
 
 func (runtime *Runtime) monitorDiagnostic(ctx context.Context, done <-chan struct{}) {

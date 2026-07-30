@@ -203,7 +203,9 @@ func (handshake WFPDriverHandshake) Validate(maxMessageSize uint32) error {
 }
 
 func ValidateWFPMessageHeader(header WFPABIHeader, expectedKind uint16, maxMessageSize uint32) error {
-	if header.Size < WFPABIHeaderWireSize || header.Size > maxMessageSize || header.Version != WFPDriverABIVersion || header.Kind != expectedKind || header.RequestID == 0 {
+	if maxMessageSize < WFPABIHeaderWireSize || maxMessageSize > WFPMaxMessageSize ||
+		header.Size < WFPABIHeaderWireSize || header.Size > maxMessageSize ||
+		header.Version != WFPDriverABIVersion || header.Kind != expectedKind || header.RequestID == 0 {
 		return fmt.Errorf("invalid WFP message header")
 	}
 	return nil
@@ -230,6 +232,12 @@ func UnmarshalWFPDriverHandshake(data []byte, maxMessageSize uint32) (WFPDriverH
 	header, err := decodeWFPABIHeader(data[:WFPABIHeaderWireSize])
 	if err != nil {
 		return WFPDriverHandshake{}, err
+	}
+	if err := ValidateWFPMessageHeader(header, WFPKindHandshake, maxMessageSize); err != nil {
+		return WFPDriverHandshake{}, err
+	}
+	if header.Size != WFPHandshakeWireSize {
+		return WFPDriverHandshake{}, fmt.Errorf("invalid WFP handshake size")
 	}
 	handshake := WFPDriverHandshake{Header: header,
 		ContractID:   binary.LittleEndian.Uint32(data[16:20]),
@@ -262,7 +270,10 @@ func UnmarshalWFPDatagram(data []byte, maxMessageSize uint32) (WFPDatagramMessag
 	if err != nil {
 		return WFPDatagramMessage{}, err
 	}
-	if header.Kind != WFPKindDatagram || header.Size != uint32(len(data)) {
+	if err := ValidateWFPMessageHeader(header, WFPKindDatagram, maxMessageSize); err != nil {
+		return WFPDatagramMessage{}, err
+	}
+	if header.Size != uint32(len(data)) {
 		return WFPDatagramMessage{}, fmt.Errorf("invalid WFP datagram header")
 	}
 	payloadSize := binary.LittleEndian.Uint32(data[48:52])
@@ -305,7 +316,10 @@ func UnmarshalWFPFlowIdentity(data []byte, maxMessageSize uint32) (WFPFlowIdenti
 	if err != nil {
 		return WFPFlowIdentityABI{}, err
 	}
-	if header.Kind != WFPKindFlow || header.Size != WFPFlowIdentityWireSize {
+	if err := ValidateWFPMessageHeader(header, WFPKindFlow, maxMessageSize); err != nil {
+		return WFPFlowIdentityABI{}, err
+	}
+	if header.Size != WFPFlowIdentityWireSize {
 		return WFPFlowIdentityABI{}, fmt.Errorf("invalid WFP flow identity header")
 	}
 	identity := WFPFlowIdentityABI{Header: header, Generation: binary.LittleEndian.Uint64(data[32:40]), PID: binary.LittleEndian.Uint32(data[40:44]), Protocol: data[44], AddressFamily: data[45], Reserved: binary.LittleEndian.Uint16(data[46:48]), LocalPort: binary.LittleEndian.Uint16(data[80:82]), RemotePort: binary.LittleEndian.Uint16(data[82:84])}

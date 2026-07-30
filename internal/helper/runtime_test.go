@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +45,24 @@ func (provider *lifecycleProvider) Health() ProviderHealth {
 
 type lifecycleInjector struct {
 	closed chan struct{}
+}
+
+type unresponsiveStopProvider struct {
+	lifecycleProvider
+	stopCalls atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (provider *unresponsiveStopProvider) Stop(context.Context) error {
+	provider.stopCalls.Add(1)
+	select {
+	case <-provider.entered:
+	default:
+		close(provider.entered)
+	}
+	<-provider.release
+	return nil
 }
 
 func (injector *lifecycleInjector) Inject(context.Context, Delivery) error { return nil }
@@ -91,6 +110,73 @@ func TestRuntimeRejectsInvalidProviderContractAndStopsProvider(t *testing.T) {
 	if health := runtime.Health(); health.ProviderCleanup != "confirmed" {
 		t.Fatalf("provider cleanup state = %q", health.ProviderCleanup)
 	}
+}
+
+func TestRuntimeProviderStopHasOneOwnerAndFailsClosedAtDeadline(t *testing.T) {
+	provider := &unresponsiveStopProvider{lifecycleProvider: lifecycleProvider{
+		started: make(chan struct{}), stopped: make(chan struct{}),
+	}, entered: make(chan struct{}), release: make(chan struct{})}
+	injector := &lifecycleInjector{closed: make(chan struct{})}
+	var failStopCalls atomic.Int32
+	runtime := &Runtime{
+		config: Config{OperationTimeout: 30 * time.Millisecond, FailStop: func(context.Context) error {
+			failStopCalls.Add(1)
+			return nil
+		}},
+		provider: provider, injector: injector, client: &blockingTestClient{},
+		failStop: func(context.Context) error {
+			failStopCalls.Add(1)
+			return nil
+		},
+	}
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background()) }()
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+	start := time.Now()
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	shutdownResult := make(chan error, 8)
+	var waitGroup sync.WaitGroup
+	for range 8 {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			shutdownResult <- runtime.Shutdown(shutdownContext)
+		}()
+	}
+	waitGroup.Wait()
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("shutdown blocked past absolute deadline: %s", elapsed)
+	}
+	for range 8 {
+		if err := <-shutdownResult; !errors.Is(err, ErrRuntimeStopTimeout) {
+			t.Fatalf("shutdown error = %v, want stop timeout", err)
+		}
+	}
+	if provider.stopCalls.Load() != 1 {
+		t.Fatalf("provider Stop calls = %d, want 1", provider.stopCalls.Load())
+	}
+	if failStopCalls.Load() != 1 {
+		t.Fatalf("fail-stop calls = %d, want 1", failStopCalls.Load())
+	}
+	select {
+	case <-provider.entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Stop was not started")
+	}
+	select {
+	case err := <-runResult:
+		if !errors.Is(err, ErrRuntimeStopTimeout) {
+			t.Fatalf("Run error = %v, want stop timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after fail-stop")
+	}
+	close(provider.release)
 }
 
 type blockingTestClient struct {

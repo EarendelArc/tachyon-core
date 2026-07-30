@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync"
 
 	"golang.org/x/sys/windows"
 )
@@ -47,7 +47,7 @@ func rejectDiagnosticReparsePoints(path string) error {
 			return fmt.Errorf("inspect diagnostic path component: %w", err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("diagnostic path contains a symlink")
+			return errors.New("diagnostic path contains a symlink")
 		}
 		name, err := windows.UTF16PtrFromString(current)
 		if err != nil {
@@ -61,22 +61,33 @@ func rejectDiagnosticReparsePoints(path string) error {
 			return err
 		}
 		if attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-			return fmt.Errorf("diagnostic path contains a reparse point")
+			return errors.New("diagnostic path contains a reparse point")
 		}
 	}
 	return nil
 }
 
-func secureDiagnosticPath(path string) error {
-	securityDescriptor, err := windows.SecurityDescriptorFromString("O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;SU)")
+func diagnosticDACL() (*windows.ACL, error) {
+	// Owner Rights keeps an explicitly requested diagnostic override testable by
+	// its owner while the production ProgramData directory remains owned by the
+	// service account. It does not grant access to unrelated users.
+	securityDescriptor, err := windows.SecurityDescriptorFromString("O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;SU)(A;;FA;;;OW)")
 	if err != nil {
-		return fmt.Errorf("build diagnostic ACL: %w", err)
+		return nil, fmt.Errorf("build diagnostic ACL: %w", err)
 	}
 	dacl, _, err := securityDescriptor.DACL()
 	if err != nil {
-		return fmt.Errorf("read diagnostic ACL: %w", err)
+		return nil, fmt.Errorf("read diagnostic ACL: %w", err)
 	}
-	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+	return dacl, nil
+}
+
+func secureDiagnosticHandle(handle windows.Handle) error {
+	dacl, err := diagnosticDACL()
+	if err != nil {
+		return err
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil); err != nil {
 		return fmt.Errorf("apply diagnostic ACL: %w", err)
@@ -84,69 +95,125 @@ func secureDiagnosticPath(path string) error {
 	return nil
 }
 
-func writeDiagnosticAtomic(path string, data []byte, override bool) error {
+func verifyDiagnosticHandle(handle windows.Handle, directory bool) error {
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		return fmt.Errorf("inspect diagnostic handle: %w", err)
+	}
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.New("diagnostic handle is a reparse point")
+	}
+	if directory && information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return errors.New("diagnostic parent is not a directory")
+	}
+	return nil
+}
+
+func openVerifiedDiagnosticDirectory(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.WRITE_DAC,
+		0, nil, windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return 0, fmt.Errorf("open diagnostic directory: %w", err)
+	}
+	if err := verifyDiagnosticHandle(handle, true); err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, err
+	}
+	if err := secureDiagnosticHandle(handle); err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, err
+	}
+	return handle, nil
+}
+
+type windowsDiagnosticFile struct {
+	mu     sync.Mutex
+	handle windows.Handle
+}
+
+func openDiagnosticFile(path string, override bool) (diagnosticFile, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Errorf("resolve diagnostic path: %w", err)
+		return nil, fmt.Errorf("resolve diagnostic path: %w", err)
 	}
 	if err := validateDiagnosticPath(absolute, override); err != nil {
-		return err
+		return nil, err
 	}
 	parent := filepath.Dir(absolute)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return fmt.Errorf("create helper diagnostic directory: %w", err)
-	}
-	if err := secureDiagnosticPath(parent); err != nil {
-		return err
-	}
-	temporary := fmt.Sprintf("%s.tmp.%d.%d", absolute, os.Getpid(), time.Now().UnixNano())
-	if err := validateDiagnosticPath(temporary, true); err != nil {
-		return err
-	}
-	temporaryName, err := windows.UTF16PtrFromString(temporary)
-	if err != nil {
-		return err
-	}
-	handle, err := windows.CreateFile(temporaryName, windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
-		windows.CREATE_NEW, windows.FILE_FLAG_WRITE_THROUGH|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
-	if err != nil {
-		return fmt.Errorf("create diagnostic temporary file: %w", err)
-	}
-	writeErr := func() error {
-		for len(data) > 0 {
-			var written uint32
-			if err := windows.WriteFile(handle, data, &written, nil); err != nil {
-				return err
-			}
-			if written == 0 {
-				return fmt.Errorf("diagnostic write made no progress")
-			}
-			data = data[written:]
-		}
-		return windows.FlushFileBuffers(handle)
-	}()
-	closeErr := windows.CloseHandle(handle)
-	if writeErr != nil || closeErr != nil {
-		_ = os.Remove(temporary)
-		return fmt.Errorf("write diagnostic temporary file: %w", errors.Join(writeErr, closeErr))
-	}
-	if err := secureDiagnosticPath(temporary); err != nil {
-		_ = os.Remove(temporary)
-		return err
+		return nil, fmt.Errorf("create helper diagnostic directory: %w", err)
 	}
 	if err := validateDiagnosticPath(absolute, override); err != nil {
-		_ = os.Remove(temporary)
-		return err
+		return nil, err
 	}
-	destinationName, err := windows.UTF16PtrFromString(absolute)
+	directory, err := openVerifiedDiagnosticDirectory(parent)
 	if err != nil {
-		_ = os.Remove(temporary)
-		return err
+		return nil, err
 	}
-	if err := windows.MoveFileEx(temporaryName, destinationName, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
-		_ = os.Remove(temporary)
-		return fmt.Errorf("atomically replace diagnostic: %w", err)
+	defer windows.CloseHandle(directory)
+	name, err := windows.UTF16PtrFromString(absolute)
+	if err != nil {
+		return nil, err
 	}
-	return secureDiagnosticPath(absolute)
+	// No sharing keeps one fixed, non-reparse file handle for this helper
+	// instance. All diagnostics are subsequently rewritten through this handle.
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.WRITE_DAC,
+		0, nil, windows.OPEN_ALWAYS,
+		windows.FILE_FLAG_WRITE_THROUGH|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open fixed diagnostic file: %w", err)
+	}
+	if err := verifyDiagnosticHandle(handle, false); err != nil {
+		_ = windows.CloseHandle(handle)
+		return nil, err
+	}
+	if err := secureDiagnosticHandle(handle); err != nil {
+		_ = windows.CloseHandle(handle)
+		return nil, err
+	}
+	return &windowsDiagnosticFile{handle: handle}, nil
+}
+
+func (file *windowsDiagnosticFile) Write(data []byte) error {
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if file.handle == windows.InvalidHandle {
+		return errors.New("diagnostic file is closed")
+	}
+	if _, err := windows.SetFilePointer(file.handle, 0, nil, windows.FILE_BEGIN); err != nil {
+		return fmt.Errorf("seek diagnostic file: %w", err)
+	}
+	if err := windows.SetEndOfFile(file.handle); err != nil {
+		return fmt.Errorf("truncate diagnostic file: %w", err)
+	}
+	for len(data) > 0 {
+		var written uint32
+		if err := windows.WriteFile(file.handle, data, &written, nil); err != nil {
+			return fmt.Errorf("write diagnostic file: %w", err)
+		}
+		if written == 0 {
+			return errors.New("diagnostic write made no progress")
+		}
+		data = data[written:]
+	}
+	if err := windows.FlushFileBuffers(file.handle); err != nil {
+		return fmt.Errorf("flush diagnostic file: %w", err)
+	}
+	return nil
+}
+
+func (file *windowsDiagnosticFile) Close() error {
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if file.handle == windows.InvalidHandle {
+		return nil
+	}
+	err := windows.CloseHandle(file.handle)
+	file.handle = windows.InvalidHandle
+	return err
 }

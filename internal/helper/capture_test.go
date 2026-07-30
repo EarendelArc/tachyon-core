@@ -50,6 +50,9 @@ func TestWFPABIRejectsWrongVersionKindAndLengths(t *testing.T) {
 			t.Fatalf("mutated header unexpectedly accepted: %+v", copy)
 		}
 	}
+	if err := ValidateWFPMessageHeader(header, WFPKindDatagram, WFPMaxMessageSize+1); err == nil {
+		t.Fatal("oversized decode limit unexpectedly accepted")
+	}
 	handshake := WFPDriverHandshake{
 		Header:     WFPABIHeader{Size: WFPHandshakeWireSize, Version: WFPDriverABIVersion, Kind: WFPKindHandshake, RequestID: 1},
 		ContractID: WFPDriverContractID, Capabilities: WFPRequiredCapabilityMask,
@@ -104,6 +107,38 @@ func TestWFPWireCodecIsLittleEndianAndChecksPayloadLength(t *testing.T) {
 	decodedFlow, err := UnmarshalWFPFlowIdentity(flowWire, WFPMaxMessageSize)
 	if err != nil || decodedFlow.FlowID[0] != 0xbb || decodedFlow.LocalPort != 1000 || decodedFlow.RemotePort != 2000 {
 		t.Fatalf("flow round trip = %+v, error=%v", decodedFlow, err)
+	}
+}
+
+func TestWFPUnmarshalRejectsEveryInvalidHeaderField(t *testing.T) {
+	datagram, err := MarshalWFPDatagram(WFPDatagramMessage{RequestID: 1, Payload: []byte("x")}, WFPMaxMessageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow, err := MarshalWFPFlowIdentity(WFPFlowIdentityABI{Header: WFPABIHeader{Version: WFPDriverABIVersion, Kind: WFPKindFlow, RequestID: 1}}, WFPMaxMessageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func([]byte){
+		"version": func(wire []byte) { wire[4]++ },
+		"kind":    func(wire []byte) { wire[6]++ },
+		"size":    func(wire []byte) { wire[0]++ },
+		"request": func(wire []byte) { clear(wire[8:16]) },
+	} {
+		t.Run("datagram/"+name, func(t *testing.T) {
+			wire := append([]byte(nil), datagram...)
+			mutate(wire)
+			if _, err := UnmarshalWFPDatagram(wire, WFPMaxMessageSize); err == nil {
+				t.Fatal("invalid datagram header accepted")
+			}
+		})
+		t.Run("flow/"+name, func(t *testing.T) {
+			wire := append([]byte(nil), flow...)
+			mutate(wire)
+			if _, err := UnmarshalWFPFlowIdentity(wire, WFPMaxMessageSize); err == nil {
+				t.Fatal("invalid flow header accepted")
+			}
+		})
 	}
 }
 

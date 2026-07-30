@@ -7,7 +7,9 @@ import (
 )
 
 func TestDiagnosticFileKeepsExclusiveHandleAndRewritesInPlace(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "private", "helper-health.json")
+	programData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	path := filepath.Join(programData, "Tachyon", "Harness", "0123456789abcdef0123456789abcdef", "helper-health.json")
 	diagnostic, err := openDiagnosticFile(path, true)
 	if err != nil {
 		t.Fatal(err)

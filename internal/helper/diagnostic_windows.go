@@ -26,10 +26,39 @@ func validateDiagnosticPath(path string, override bool) error {
 	if err != nil {
 		return fmt.Errorf("invalid diagnostic path: %w", err)
 	}
-	if !override && !strings.EqualFold(filepath.Clean(absolute), filepath.Clean(defaultDiagnosticPath())) {
-		return fmt.Errorf("diagnostic path must be the protected ProgramData path")
+	if strings.EqualFold(filepath.Clean(absolute), filepath.Clean(defaultDiagnosticPath())) {
+		return rejectDiagnosticReparsePoints(absolute)
+	}
+	if !override || !isHarnessDiagnosticPath(absolute) {
+		return fmt.Errorf("diagnostic path must be the protected ProgramData path or a managed harness path")
 	}
 	return rejectDiagnosticReparsePoints(absolute)
+}
+
+func isHarnessDiagnosticPath(path string) bool {
+	programData := os.Getenv("ProgramData")
+	if programData == "" {
+		programData = `C:\ProgramData`
+	}
+	root := filepath.Join(programData, "Tachyon", "Harness")
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") || filepath.IsAbs(relative) {
+		return false
+	}
+	parts := strings.FieldsFunc(relative, func(r rune) bool { return r == '\\' || r == '/' })
+	return len(parts) == 2 && isHarnessGUID(parts[0]) && strings.EqualFold(parts[1], "helper-health.json")
+}
+
+func isHarnessGUID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') && (character < 'A' || character > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func rejectDiagnosticReparsePoints(path string) error {
@@ -160,10 +189,11 @@ func openDiagnosticFile(path string, override bool) (diagnosticFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	// No sharing keeps one fixed, non-reparse file handle for this helper
-	// instance. All diagnostics are subsequently rewritten through this handle.
+	// Read sharing permits an administrator-owned harness to inspect health while
+	// the service is running. Write/delete sharing remains denied, leaving one
+	// fixed, non-reparse writer handle for this helper instance.
 	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.WRITE_DAC,
-		0, nil, windows.OPEN_ALWAYS,
+		windows.FILE_SHARE_READ, nil, windows.OPEN_ALWAYS,
 		windows.FILE_FLAG_WRITE_THROUGH|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open fixed diagnostic file: %w", err)

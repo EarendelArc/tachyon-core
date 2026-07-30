@@ -66,22 +66,36 @@ function Resolve-ServiceSID {
     return $Matches[0]
 }
 
+function New-VerifiedHarnessPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$HarnessID,
+        [string]$ProgramDataPath = $env:ProgramData
+    )
+    if ($HarnessID -notmatch '^[0-9a-f]{32}$') { throw "Harness GUID validation failed." }
+    $root = Get-HarnessRoot $ProgramDataPath
+    $directory = Join-Path $root $HarnessID
+    $diagnostic = Assert-HarnessDiagnosticPath (Join-Path $directory 'helper-health.json') $ProgramDataPath
+    foreach ($path in @((Split-Path -Parent $root), $root, $directory)) {
+        # Paths are derived from ProgramData plus a validated GUID. Directory's
+        # API has no wildcard expansion and is supported by Windows PowerShell 5.1.
+        Assert-NoReparsePointPath $path
+        try { [void][IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($path)) }
+        catch { throw "Create protected harness directory failed: $($_.Exception.Message)" }
+        Assert-NoReparsePointPath $path
+    }
+    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic }
+}
+
 function New-ProtectedHarnessDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$HarnessID,
         [Parameter(Mandatory = $true)][string]$ServiceName,
         [Parameter(Mandatory = $true)][string]$ServiceSID
     )
-    if ($HarnessID -notmatch '^[0-9a-f]{32}$') { throw "Harness GUID validation failed." }
     $serviceAccountSID = [Security.Principal.NTAccount]::new('NT SERVICE', $ServiceName).Translate([Security.Principal.SecurityIdentifier])
     if ($serviceAccountSID.Value -ne $ServiceSID) { throw "NT SERVICE account SID does not match SCM Service SID." }
-    $root = Get-HarnessRoot
-    $directory = Join-Path $root $HarnessID
-    $diagnostic = Assert-HarnessDiagnosticPath (Join-Path $directory 'helper-health.json')
-    foreach ($path in @((Split-Path -Parent $root), $root, $directory)) {
-        if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -LiteralPath $path -Force | Out-Null }
-        Assert-NoReparsePointPath $path
-    }
+    $harness = New-VerifiedHarnessPath $HarnessID
+    $directory = $harness.Directory
 
     $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
     $none = [Security.AccessControl.PropagationFlags]::None
@@ -111,7 +125,7 @@ function New-ProtectedHarnessDirectory {
         }
         if (-not $matched) { throw "Harness ACL is missing required access for SID $($expected.SID.Value)." }
     }
-    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic }
+    return $harness
 }
 
 function Invoke-ScDiagnostic {
@@ -178,10 +192,18 @@ function Invoke-HarnessPathSecurityTests {
             try { [void](Assert-HarnessDiagnosticPath $invalid $programData) } catch { $accepted = $false }
             if ($accepted) { throw "Unsafe harness path was accepted: $invalid" }
         }
+        $created = New-VerifiedHarnessPath '0123456789abcdef0123456789abcdef' $programData
+        if (-not (Test-Path -LiteralPath $created.Directory) -or $created.Diagnostic -ne $valid) {
+            throw "Verified harness directory was not created at the expected canonical path."
+        }
+        Assert-NoReparsePointPath $created.Directory
         Write-Host "Harness path security tests passed."
     }
     finally {
-        Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $programData) {
+            Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $programData) { throw "Harness path security test cleanup left a residual directory." }
+        }
     }
 }
 

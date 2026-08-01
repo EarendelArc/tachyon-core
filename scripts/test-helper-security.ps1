@@ -1,10 +1,15 @@
 [CmdletBinding()]
 param(
     [string]$BinaryPath = "",
+    [string]$EvidenceDirectory = "",
+    [string]$CommitSHA = "",
+    [string]$RunID = "",
+    [string]$RunAttempt = "",
     [switch]$RunServiceSIDHarness,
     [switch]$RunGoHarness,
     [switch]$RunPathSecurityTests,
-    [switch]$RunProvisioningSecurityTests
+    [switch]$RunProvisioningSecurityTests,
+    [switch]$RunEvidenceFailureTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -416,6 +421,311 @@ function Write-SafeHarnessFailureDiagnostics {
     }
 }
 
+function Stop-VerifiedHarnessProcess {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)][int]$ExpectedProcessID,
+        [Parameter(Mandatory = $true)][long]$ExpectedStartTicks,
+        [int]$WaitMilliseconds = 5000,
+        [scriptblock]$KillProcess = { param($Target) $Target.Kill() },
+        [scriptblock]$KillProcessTree = { param($Target) $Target.Kill($true) },
+        [scriptblock]$WaitForExit = { param($Target, $Timeout) return $Target.WaitForExit($Timeout) },
+        [scriptblock]$FindProcessByID = { param($ProcessID) return Get-Process -Id $ProcessID -ErrorAction SilentlyContinue }
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $result = [ordered]@{
+        pid = $ExpectedProcessID
+        start_ticks_utc = $ExpectedStartTicks
+        initially_exited = $false
+        process_kill_attempted = $false
+        initial_wait_completed = $false
+        tree_kill_attempted = $false
+        tree_wait_completed = $false
+        final_has_exited = $false
+        pid_residual = $false
+        pid_reused = $false
+        success = $false
+        errors = @()
+    }
+    $identityVerified = $true
+    try {
+        if ([int]$Process.Id -ne $ExpectedProcessID) { throw "Core process object PID changed." }
+        if ([long]$Process.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) { throw "Core process object start time changed." }
+        $result.initially_exited = [bool]$Process.HasExited
+    }
+    catch {
+        $errors.Add("Core process identity verification failed: $($_.Exception.Message)")
+        $identityVerified = $false
+    }
+
+    if ($identityVerified -and $result.initially_exited) {
+        try { $result.initial_wait_completed = [bool](& $WaitForExit $Process 0) }
+        catch { $errors.Add("Exited Core process wait confirmation failed: $($_.Exception.Message)") }
+    }
+    elseif ($identityVerified) {
+        try {
+            $result.process_kill_attempted = $true
+            & $KillProcess $Process
+        }
+        catch {
+            try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process termination failed: $($_.Exception.Message)") } }
+            catch { $errors.Add("Core process termination and state check failed: $($_.Exception.Message)") }
+        }
+        try { $result.initial_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
+        catch {
+            try { if ([bool]$Process.HasExited) { $result.initial_wait_completed = $true } else { $errors.Add("Core process initial wait failed: $($_.Exception.Message)") } }
+            catch { $errors.Add("Core process initial wait and state check failed: $($_.Exception.Message)") }
+        }
+
+        $stillRunning = $true
+        try { $stillRunning = -not [bool]$Process.HasExited }
+        catch { $errors.Add("Core process state check failed: $($_.Exception.Message)") }
+        if (-not $result.initial_wait_completed -or $stillRunning) {
+            try {
+                if ([int]$Process.Id -ne $ExpectedProcessID -or [long]$Process.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) {
+                    throw "Core process identity changed before tree termination."
+                }
+                $result.tree_kill_attempted = $true
+                & $KillProcessTree $Process
+            }
+            catch {
+                try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process tree termination failed: $($_.Exception.Message)") } }
+                catch { $errors.Add("Core process tree termination and state check failed: $($_.Exception.Message)") }
+            }
+            try { $result.tree_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
+            catch {
+                try { if ([bool]$Process.HasExited) { $result.tree_wait_completed = $true } else { $errors.Add("Core process tree wait failed: $($_.Exception.Message)") } }
+                catch { $errors.Add("Core process tree wait and state check failed: $($_.Exception.Message)") }
+            }
+        }
+    }
+
+    try { $result.final_has_exited = [bool]$Process.HasExited }
+    catch { $errors.Add("Core process final state check failed: $($_.Exception.Message)") }
+    try {
+        $resident = & $FindProcessByID $ExpectedProcessID
+        if ($null -ne $resident) {
+            $residentStartTicks = [long]$resident.StartTime.ToUniversalTime().Ticks
+            if ($residentStartTicks -eq $ExpectedStartTicks) {
+                $result.pid_residual = $true
+                $errors.Add("Core process PID $ExpectedProcessID with the original start time is still running.")
+            }
+            else {
+                # PID reuse is evidence, never authority to terminate an unrelated process.
+                $result.pid_reused = $true
+            }
+        }
+    }
+    catch { $errors.Add("Core process PID residual check failed: $($_.Exception.Message)") }
+    $result.errors = @($errors)
+    $waitConfirmed = $result.initial_wait_completed -or $result.tree_wait_completed
+    $result.success = $identityVerified -and $waitConfirmed -and $result.final_has_exited -and -not $result.pid_residual -and $errors.Count -eq 0
+    return [PSCustomObject]$result
+}
+
+function ConvertTo-SafeHealthEvidence {
+    param($Health)
+    if ($null -eq $Health) { return $null }
+    $lastError = [string]$Health.last_error
+    $lastError = $lastError -replace '(?i)(token\s*[=:]\s*)[^\s,;]+', '$1[redacted]'
+    $lastError = $lastError -replace '(?i)\b[0-9a-f]{64}\b', '[redacted-sha256]'
+    return [PSCustomObject][ordered]@{
+        status = $Health.status
+        capture_provider = $Health.capture_provider
+        pipe_connected = [bool]$Health.pipe_connected
+        authenticated = [bool]$Health.authenticated
+        stage = $Health.stage
+        attempt = $Health.attempt
+        reconnects = $Health.reconnects
+        last_error = $lastError
+        lifecycle = $Health.lifecycle
+        service_sid_present = [bool]$Health.service_sid_present
+        restricted_sid_count = $Health.restricted_sid_count
+        pid = $Health.pid
+        updated_at = $Health.updated_at
+        stop_timed_out = [bool]$Health.stop_timed_out
+        provider_cleanup = $Health.provider_cleanup
+    }
+}
+
+function ConvertTo-SafeReadyEvidence {
+    param($Ready)
+    if ($null -eq $Ready) { return $null }
+    return [PSCustomObject][ordered]@{ stage = $Ready.stage; pid = $Ready.pid; pipe = $Ready.pipe }
+}
+
+function Assert-HarnessSuccessEvidence {
+    param(
+        [Parameter(Mandatory = $true)]$Health,
+        [Parameter(Mandatory = $true)]$Ready,
+        [Parameter(Mandatory = $true)][int]$CoreProcessID,
+        [Parameter(Mandatory = $true)][int]$ServiceProcessID,
+        [Parameter(Mandatory = $true)][string]$ExpectedPipe,
+        [Parameter(Mandatory = $true)][string]$ServiceSID
+    )
+    if ($Health.status -ne 'not_ready' -or $Health.capture_provider -ne 'not_ready') { throw "helper fail-closed health state is invalid" }
+    if (-not $Health.pipe_connected -or -not $Health.authenticated -or $Health.stage -ne 'authenticated') { throw "helper authenticated pipe health is invalid" }
+    $attempt = [uint64]$Health.attempt
+    $reconnects = [uint64]$Health.reconnects
+    if ($attempt -lt 1 -or $attempt -gt 3 -or $reconnects -gt 2 -or $reconnects + 1 -ne $attempt) { throw "helper reconnect evidence is outside the bounded policy" }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Health.last_error)) { throw "successful helper health retained a pipe error" }
+    if ($Health.lifecycle -ne 'running' -or [int]$Health.pid -ne $ServiceProcessID) { throw "helper lifecycle or PID evidence is invalid" }
+    if (-not $Health.service_sid_present -or [int]$Health.restricted_sid_count -lt 1 -or $ServiceSID -notmatch '^S-1-5-80-[0-9-]+$') { throw "helper Service SID evidence is invalid" }
+    if ($Ready.stage -ne 'listening' -or [int]$Ready.pid -ne $CoreProcessID -or $Ready.pipe -ne $ExpectedPipe) { throw "Core ready PID or pipe evidence is invalid" }
+}
+
+function Write-HarnessEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        $Health,
+        $Ready,
+        [Parameter(Mandatory = $true)]$Cleanup,
+        [string]$Commit,
+        [string]$ActionsRunID,
+        [string]$ActionsRunAttempt,
+        [string]$ServiceName,
+        [string]$ServiceSID
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Commit) -and $Commit -notmatch '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$') { throw "evidence commit SHA is invalid" }
+    if (-not [string]::IsNullOrWhiteSpace($ActionsRunID) -and $ActionsRunID -notmatch '^[0-9]+$') { throw "evidence run ID is invalid" }
+    if (-not [string]::IsNullOrWhiteSpace($ActionsRunAttempt) -and $ActionsRunAttempt -notmatch '^[0-9]+$') { throw "evidence run attempt is invalid" }
+    $absolute = [IO.Path]::GetFullPath($Directory)
+    [void][IO.Directory]::CreateDirectory($absolute)
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $documents = [ordered]@{
+        'health.sanitized.json' = $Health
+        'ready.sanitized.json' = $Ready
+        'cleanup.json' = $Cleanup
+    }
+    $hashes = [ordered]@{}
+    foreach ($entry in $documents.GetEnumerator()) {
+        $path = Join-Path $absolute $entry.Key
+        [IO.File]::WriteAllText($path, ($entry.Value | ConvertTo-Json -Depth 8), $utf8)
+        $hashes[$entry.Key] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $manifest = [PSCustomObject][ordered]@{
+        schema_version = 1
+        commit_sha = $Commit.ToLowerInvariant()
+        run_id = $ActionsRunID
+        run_attempt = $ActionsRunAttempt
+        workflow = $env:GITHUB_WORKFLOW
+        job = $env:GITHUB_JOB
+        generated_at = [DateTime]::UtcNow.ToString('o')
+        service_name = $ServiceName
+        service_sid = $ServiceSID
+        files = $hashes
+    }
+    $manifestPath = Join-Path $absolute 'manifest.json'
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
+    $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText((Join-Path $absolute 'manifest.sha256'), "$manifestHash  manifest.json`n", $utf8)
+}
+
+function Invoke-EvidenceFailureTests {
+    $baselineHealth = [PSCustomObject]@{
+        status = 'not_ready'; capture_provider = 'not_ready'; pipe_connected = $true; authenticated = $true
+        stage = 'authenticated'; attempt = 1; reconnects = 0; last_error = $null; lifecycle = 'running'
+        service_sid_present = $true; restricted_sid_count = 1; pid = 200
+    }
+    $baselineReady = [PSCustomObject]@{ stage = 'listening'; pid = 100; pipe = '\\.\pipe\Tachyon\evidence-test' }
+    foreach ($case in @(
+        @{ Name = 'wrong stage'; Mutate = { param($Health, $Ready) $Health.stage = 'connect_failed' } },
+        @{ Name = 'missing attempt'; Mutate = { param($Health, $Ready) $Health.attempt = 0 } },
+        @{ Name = 'unexpected reconnect'; Mutate = { param($Health, $Ready) $Health.reconnects = 1 } },
+        @{ Name = 'retained error'; Mutate = { param($Health, $Ready) $Health.last_error = 'injected' } },
+        @{ Name = 'wrong helper PID'; Mutate = { param($Health, $Ready) $Health.pid = 201 } },
+        @{ Name = 'wrong pipe'; Mutate = { param($Health, $Ready) $Ready.pipe = '\\.\pipe\Tachyon\wrong' } },
+        @{ Name = 'missing Service SID'; Mutate = { param($Health, $Ready) $Health.service_sid_present = $false } }
+    )) {
+        $health = $baselineHealth | ConvertTo-Json | ConvertFrom-Json
+        $ready = $baselineReady | ConvertTo-Json | ConvertFrom-Json
+        & $case.Mutate $health $ready
+        $rejected = $false
+        try { Assert-HarnessSuccessEvidence $health $ready 100 200 '\\.\pipe\Tachyon\evidence-test' 'S-1-5-80-1-2-3-4-5' }
+        catch { $rejected = $true }
+        if (-not $rejected) { throw "Evidence failure fixture '$($case.Name)' was accepted." }
+    }
+
+    $start = [DateTime]::UtcNow
+    $stuck = [PSCustomObject]@{ Id = 4242; StartTime = $start; HasExited = $false }
+    $stuckResult = Stop-VerifiedHarnessProcess $stuck 4242 $start.Ticks -WaitMilliseconds 1 `
+        -KillProcess { param($Target) } -KillProcessTree { param($Target) } `
+        -WaitForExit { param($Target, $Timeout) return $false } -FindProcessByID { param($ProcessID) return $stuck }
+    if ($stuckResult.success -or -not $stuckResult.tree_kill_attempted -or -not $stuckResult.pid_residual) { throw "Stuck Core cleanup fixture was not rejected." }
+
+    $escalated = [PSCustomObject]@{ Id = 4292; StartTime = $start; HasExited = $false }
+    $escalatedResult = Stop-VerifiedHarnessProcess $escalated 4292 $start.Ticks -WaitMilliseconds 1 `
+        -KillProcess { param($Target) } -KillProcessTree { param($Target) $Target.HasExited = $true } `
+        -WaitForExit { param($Target, $Timeout) return [bool]$Target.HasExited } -FindProcessByID { param($ProcessID) return $null }
+    if (-not $escalatedResult.success -or -not $escalatedResult.tree_kill_attempted -or -not $escalatedResult.tree_wait_completed) { throw "Core tree-kill escalation fixture did not prove exit." }
+
+    $exited = [PSCustomObject]@{ Id = 4343; StartTime = $start; HasExited = $true }
+    $replacement = [PSCustomObject]@{ Id = 4343; StartTime = $start.AddSeconds(1); HasExited = $false }
+    $killCalls = [PSCustomObject]@{ Value = 0 }
+    $reusedResult = Stop-VerifiedHarnessProcess $exited 4343 $start.Ticks `
+        -KillProcess { param($Target) $killCalls.Value++ } -KillProcessTree { param($Target) $killCalls.Value++ } `
+        -WaitForExit { param($Target, $Timeout) return $true } -FindProcessByID { param($ProcessID) return $replacement }
+    if (-not $reusedResult.success -or -not $reusedResult.pid_reused -or $killCalls.Value -ne 0) { throw "PID reuse fixture was killed or rejected." }
+
+    $mismatched = [PSCustomObject]@{ Id = 4444; StartTime = $start; HasExited = $false }
+    $mismatchKillCalls = [PSCustomObject]@{ Value = 0 }
+    $mismatchResult = Stop-VerifiedHarnessProcess $mismatched 4445 $start.Ticks `
+        -KillProcess { param($Target) $mismatchKillCalls.Value++ } -KillProcessTree { param($Target) $mismatchKillCalls.Value++ } `
+        -FindProcessByID { param($ProcessID) return $null }
+    if ($mismatchResult.success -or $mismatchKillCalls.Value -ne 0) { throw "Mismatched Core identity fixture was killed or accepted." }
+
+    $testProcess = $null
+    try {
+        $powerShellPath = (Get-Process -Id $PID).Path
+        $testProcess = Start-Process -FilePath $powerShellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden
+        $testStartTicks = [long]$testProcess.StartTime.ToUniversalTime().Ticks
+        $realCleanup = Stop-VerifiedHarnessProcess $testProcess $testProcess.Id $testStartTicks
+        if (-not $realCleanup.success -or -not $realCleanup.initial_wait_completed -or -not $realCleanup.final_has_exited -or $realCleanup.pid_residual) {
+            throw "Real console cleanup did not prove bounded process exit."
+        }
+    }
+    finally {
+        if ($null -ne $testProcess) {
+            try {
+                if (-not $testProcess.HasExited) { $testProcess.Kill($true); [void]$testProcess.WaitForExit(5000) }
+            }
+            catch { throw "Real console cleanup test left a process that could not be terminated: $($_.Exception.Message)" }
+        }
+    }
+
+    $evidenceDirectory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-evidence-$([guid]::NewGuid().ToString('N'))"
+    try {
+        $secretHealth = $baselineHealth | ConvertTo-Json | ConvertFrom-Json
+        $secretHealth.last_error = "token=do-not-publish hash=$('b' * 64)"
+        $sanitizedSecretHealth = ConvertTo-SafeHealthEvidence $secretHealth
+        if ($sanitizedSecretHealth.last_error -match 'do-not-publish' -or $sanitizedSecretHealth.last_error -match ('b' * 64)) {
+            throw "Health evidence did not redact token or SHA-256 values."
+        }
+        $cleanup = [PSCustomObject]@{ success = $true; failures = @(); core = $escalatedResult }
+        Write-HarnessEvidence $evidenceDirectory (ConvertTo-SafeHealthEvidence $baselineHealth) (ConvertTo-SafeReadyEvidence $baselineReady) $cleanup `
+            ('a' * 40) '12345' '2' 'TachyonHelperHarness-evidence' 'S-1-5-80-1-2-3-4-5'
+        foreach ($name in @('health.sanitized.json', 'ready.sanitized.json', 'cleanup.json', 'manifest.json', 'manifest.sha256')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $evidenceDirectory $name))) { throw "Evidence file '$name' was not generated." }
+        }
+        $manifest = Get-Content -LiteralPath (Join-Path $evidenceDirectory 'manifest.json') -Raw | ConvertFrom-Json
+        foreach ($name in @('health.sanitized.json', 'ready.sanitized.json', 'cleanup.json')) {
+            $actualHash = (Get-FileHash -LiteralPath (Join-Path $evidenceDirectory $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($manifest.files.$name -ne $actualHash) { throw "Evidence hash mismatch for '$name'." }
+        }
+        $manifestHash = (Get-FileHash -LiteralPath (Join-Path $evidenceDirectory 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $recordedHash = ((Get-Content -LiteralPath (Join-Path $evidenceDirectory 'manifest.sha256') -Raw).Trim() -split ' ')[0]
+        if ($recordedHash -ne $manifestHash -or $manifest.commit_sha -ne ('a' * 40) -or $manifest.run_id -ne '12345' -or $manifest.run_attempt -ne '2') {
+            throw "Evidence manifest metadata or hash is invalid."
+        }
+        $allEvidence = (Get-ChildItem -LiteralPath $evidenceDirectory -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+        if ($allEvidence -match '(?i)token|trusted_server_sha256|core_sha256') { throw "Evidence output contains a forbidden secret field name." }
+    }
+    finally {
+        if (Test-Path -LiteralPath $evidenceDirectory) { Remove-Item -LiteralPath $evidenceDirectory -Recurse -Force -ErrorAction Stop }
+    }
+    Write-Host "Harness evidence and cleanup failure tests passed."
+}
+
 function Wait-HarnessServiceState {
     param([Parameter(Mandatory = $true)][string]$ServiceName, [Parameter(Mandatory = $true)][string]$State, [int]$TimeoutSeconds = 10)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -589,6 +899,7 @@ if ($RunGoHarness) {
 
 if ($RunPathSecurityTests) { Invoke-HarnessPathSecurityTests }
 if ($RunProvisioningSecurityTests) { Invoke-ProvisioningSecurityTests }
+if ($RunEvidenceFailureTests) { Invoke-EvidenceFailureTests }
 
 if ($RunServiceSIDHarness) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -606,13 +917,29 @@ if ($RunServiceSIDHarness) {
     $serverSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
     $diagnosticOwnerSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
     $coreProcess = $null
+    $coreStartTicks = [long]0
     $harness = $null
+    $health = $null
+    $ready = $null
+    $safeHealth = $null
+    $safeReady = $null
+    $serviceSID = ""
     $harnessPath = Resolve-VerifiedHarnessPath $harnessID
     $trustedHash = (Get-FileHash -LiteralPath $resolvedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     $quotedBinary = [char]34 + $resolvedBinary + [char]34
     $quotedTrustedBinary = [char]34 + $resolvedBinary + [char]34
     $failure = $null
     $cleanupFailures = [System.Collections.Generic.List[string]]::new()
+    $cleanupEvidence = [ordered]@{
+        service_stop_confirmed = $false
+        service_delete_confirmed = $false
+        core = $null
+        diagnostic_removed = $false
+        ready_removed = $false
+        harness_directory_removed = $false
+        success = $false
+        failures = @()
+    }
     try {
         & $scPath create $name binPath= "$quotedBinary helper --service --service-name $name --pipe $corePipe --server-sid $serverSID --core-binary $quotedTrustedBinary --core-sha256 $trustedHash" start= demand obj= "NT AUTHORITY\LocalService" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service creation failed with exit code $LASTEXITCODE" }
@@ -628,6 +955,7 @@ if ($RunServiceSIDHarness) {
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
         $coreProcess = Start-Process -FilePath $resolvedBinary -ArgumentList @('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready) -PassThru -WindowStyle Hidden
+        $coreStartTicks = [long]$coreProcess.StartTime.ToUniversalTime().Ticks
         $readyDeadline = (Get-Date).AddSeconds(10)
         do {
             if ($coreProcess.HasExited) { throw "test Core exited before pipe readiness; exit_code=$($coreProcess.ExitCode)" }
@@ -638,6 +966,7 @@ if ($RunServiceSIDHarness) {
                     if ($ready.stage -ne 'listening' -or [int]$ready.pid -ne $coreProcess.Id -or $ready.pipe -ne $corePipe) {
                         throw "test Core ready identity does not match the launched listener"
                     }
+                    $safeReady = ConvertTo-SafeReadyEvidence $ready
                     break
                 }
             }
@@ -662,13 +991,24 @@ if ($RunServiceSIDHarness) {
         } while ($true)
         if ($health.status -ne "not_ready") { throw "helper unexpectedly reported status '$($health.status)'" }
         if ($health.capture_provider -ne "not_ready") { throw "capture provider was not fail-closed" }
-        if (-not $health.pipe_connected -or -not $health.authenticated) { throw "Core pipe was not authenticated" }
-        if (-not $health.service_sid_present) { throw "temporary service token did not contain a service SID" }
-        if ($health.restricted_sid_count -lt 1) { throw "temporary service token did not contain a restricted SID" }
+        $serviceInstance = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'"
+        if ($null -eq $serviceInstance -or $serviceInstance.State -ne 'Running' -or [int]$serviceInstance.ProcessId -le 0) { throw "temporary helper service PID was not available" }
+        Assert-HarnessSuccessEvidence $health $ready $coreProcess.Id ([int]$serviceInstance.ProcessId) $corePipe $serviceSID
+        $safeHealth = ConvertTo-SafeHealthEvidence $health
         Write-Host "Temporary restricted Service SID harness passed; helper health is NotReady as required."
     }
     catch {
         $failure = $_
+        if ($null -eq $safeReady -and $null -ne $ready) { $safeReady = ConvertTo-SafeReadyEvidence $ready }
+        if ($null -eq $safeHealth -and $null -ne $health) { $safeHealth = ConvertTo-SafeHealthEvidence $health }
+        if ($null -eq $safeHealth -and (Test-Path -LiteralPath $harnessPath.Diagnostic)) {
+            try { $safeHealth = ConvertTo-SafeHealthEvidence (Get-Content -LiteralPath $harnessPath.Diagnostic -Raw | ConvertFrom-Json) }
+            catch { Write-Warning "Failed health evidence could not be parsed for artifact output." }
+        }
+        if ($null -eq $safeReady -and (Test-Path -LiteralPath $harnessPath.Ready)) {
+            try { $safeReady = ConvertTo-SafeReadyEvidence (Get-Content -LiteralPath $harnessPath.Ready -Raw | ConvertFrom-Json) }
+            catch { Write-Warning "Failed ready evidence could not be parsed for artifact output." }
+        }
         Write-DiagnosticAclDiagnostics 'directory' $harnessPath.Directory
         Write-DiagnosticAclDiagnostics 'diagnostic' $harnessPath.Diagnostic
         Write-SafeHarnessFailureDiagnostics $scPath $name $harnessPath.Diagnostic
@@ -677,37 +1017,60 @@ if ($RunServiceSIDHarness) {
         try {
             if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
                 [void](Invoke-ScDiagnostic $scPath 'stop' @('stop', $name))
-                if (-not (Wait-HarnessServiceState $name 'Stopped')) { $cleanupFailures.Add("temporary service '$name' did not stop") }
+                if (Wait-HarnessServiceState $name 'Stopped') { $cleanupEvidence.service_stop_confirmed = $true }
+                else { $cleanupFailures.Add("temporary service '$name' did not stop") }
                 [void](Invoke-ScDiagnostic $scPath 'delete' @('delete', $name))
-                if (-not (Wait-HarnessServiceState $name 'Deleted')) { $cleanupFailures.Add("temporary service '$name' was not deleted") }
+                if (Wait-HarnessServiceState $name 'Deleted') { $cleanupEvidence.service_delete_confirmed = $true }
+                else { $cleanupFailures.Add("temporary service '$name' was not deleted") }
+            }
+            else {
+                $cleanupEvidence.service_stop_confirmed = $true
+                $cleanupEvidence.service_delete_confirmed = $true
             }
         }
         catch { $cleanupFailures.Add("service cleanup failed: $($_.Exception.Message)") }
         if ($null -ne $coreProcess) {
             try {
-                if (-not $coreProcess.HasExited) { Stop-Process -Id $coreProcess.Id -Force -ErrorAction Stop }
-                [void]$coreProcess.WaitForExit(5000)
+                $coreCleanup = Stop-VerifiedHarnessProcess $coreProcess $coreProcess.Id $coreStartTicks
+                $cleanupEvidence.core = $coreCleanup
+                if (-not $coreCleanup.success) { $cleanupFailures.Add("test Core cleanup did not prove process exit: $($coreCleanup.errors -join '; ')") }
             }
             catch { $cleanupFailures.Add("test Core cleanup failed: $($_.Exception.Message)") }
         }
+        else { $cleanupEvidence.core = [PSCustomObject]@{ success = $true; not_started = $true } }
         try { Remove-VerifiedHarnessArtifacts $harnessPath }
         catch { $cleanupFailures.Add("harness artifact cleanup failed: $($_.Exception.Message)") }
         try {
             if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $cleanupFailures.Add("temporary service '$name' still exists after cleanup") }
+            else { $cleanupEvidence.service_delete_confirmed = $true }
         }
         catch { $cleanupFailures.Add("temporary service residual check failed: $($_.Exception.Message)") }
         try {
             if (Test-Path -LiteralPath $harnessPath.Diagnostic) { $cleanupFailures.Add("diagnostic '$($harnessPath.Diagnostic)' still exists after cleanup") }
+            else { $cleanupEvidence.diagnostic_removed = $true }
         }
         catch { $cleanupFailures.Add("diagnostic residual check failed: $($_.Exception.Message)") }
         try {
             if (Test-Path -LiteralPath $harnessPath.Ready) { $cleanupFailures.Add("ready file '$($harnessPath.Ready)' still exists after cleanup") }
+            else { $cleanupEvidence.ready_removed = $true }
         }
         catch { $cleanupFailures.Add("ready-file residual check failed: $($_.Exception.Message)") }
         try {
             if (Test-Path -LiteralPath $harnessPath.Directory) { $cleanupFailures.Add("directory '$($harnessPath.Directory)' still exists after cleanup") }
+            else { $cleanupEvidence.harness_directory_removed = $true }
         }
         catch { $cleanupFailures.Add("directory residual check failed: $($_.Exception.Message)") }
+    }
+    $cleanupEvidence.failures = @($cleanupFailures)
+    $cleanupEvidence.success = $cleanupFailures.Count -eq 0
+    Write-Host ("Harness cleanup result: " + (([PSCustomObject]$cleanupEvidence) | ConvertTo-Json -Depth 8 -Compress))
+    if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
+        try { Write-HarnessEvidence $EvidenceDirectory $safeHealth $safeReady ([PSCustomObject]$cleanupEvidence) $CommitSHA $RunID $RunAttempt $name $serviceSID }
+        catch {
+            $cleanupFailures.Add("harness evidence write failed: $($_.Exception.Message)")
+            $cleanupEvidence.failures = @($cleanupFailures)
+            $cleanupEvidence.success = $false
+        }
     }
     if ($cleanupFailures.Count -gt 0) {
         Write-SafeHarnessFailureDiagnostics $scPath $name $harnessPath.Diagnostic
@@ -721,6 +1084,6 @@ if ($RunServiceSIDHarness) {
     }
 }
 
-if (-not $RunServiceSIDHarness -and -not $RunGoHarness -and -not $RunPathSecurityTests -and -not $RunProvisioningSecurityTests) {
-    Write-Host "No harness selected. Use -RunServiceSIDHarness (administrator), -RunGoHarness, -RunPathSecurityTests, and/or -RunProvisioningSecurityTests."
+if (-not $RunServiceSIDHarness -and -not $RunGoHarness -and -not $RunPathSecurityTests -and -not $RunProvisioningSecurityTests -and -not $RunEvidenceFailureTests) {
+    Write-Host "No harness selected. Use -RunServiceSIDHarness (administrator), -RunGoHarness, -RunPathSecurityTests, -RunProvisioningSecurityTests, and/or -RunEvidenceFailureTests."
 }

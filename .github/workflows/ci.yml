@@ -77,12 +77,28 @@ jobs:
 
       - name: Run elevated helper service/Core pipe harness
         shell: pwsh
+        env:
+          TACHYON_EVIDENCE_COMMIT: ${{ github.sha }}
+          TACHYON_EVIDENCE_RUN_ID: ${{ github.run_id }}
+          TACHYON_EVIDENCE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "helper Service SID harness requires an elevated Windows runner"
           }
-          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe -RunPathSecurityTests -RunProvisioningSecurityTests -RunServiceSIDHarness
+          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe `
+            -EvidenceDirectory .\artifacts\helper-service-evidence `
+            -CommitSHA $env:TACHYON_EVIDENCE_COMMIT -RunID $env:TACHYON_EVIDENCE_RUN_ID -RunAttempt $env:TACHYON_EVIDENCE_RUN_ATTEMPT `
+            -RunPathSecurityTests -RunProvisioningSecurityTests -RunEvidenceFailureTests -RunServiceSIDHarness
+
+      - name: Upload helper service evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: helper-service-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/helper-service-evidence
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Test elevated Windows route journal integration
         shell: pwsh

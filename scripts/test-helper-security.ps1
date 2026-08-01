@@ -102,6 +102,16 @@ function New-ProtectedHarnessDirectory {
     return $harness
 }
 
+function Get-ExactDiagnosticSDDL {
+    param(
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
+        [switch]$File
+    )
+    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    return "O:$($OwnerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x$($limitedRights.ToString('X'));;;LS)(A;;0x$($limitedRights.ToString('X'));;;$($ServiceSID.Value))"
+}
+
 function New-ExactDiagnosticSecurity {
     param(
         [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
@@ -109,18 +119,8 @@ function New-ExactDiagnosticSecurity {
         [switch]$File
     )
     $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
-    $systemSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $administratorsSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-    $security.SetAccessRuleProtection($true, $false)
-    $limitedRights = if ($File) { [Security.AccessControl.FileSystemRights]0x120086 } else { [Security.AccessControl.FileSystemRights]0x120080 }
-    foreach ($rule in @(
-        [PSCustomObject]@{ SID = $systemSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = $administratorsSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null); Rights = $limitedRights },
-        [PSCustomObject]@{ SID = $ServiceSID; Rights = $limitedRights }
-    )) {
-        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($rule.SID, $rule.Rights, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-    }
+    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+    $security.SetSecurityDescriptorSddlForm((Get-ExactDiagnosticSDDL $ServiceSID $OwnerSID -File:$File), $sections)
     return $security
 }
 
@@ -132,25 +132,37 @@ function Assert-ExactDiagnosticSecurityObject {
         [switch]$File,
         [switch]$SkipOwnerVerification
     )
-    $systemSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $administratorsSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
     if ((-not $SkipOwnerVerification -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $OwnerSID.Value) -or -not $acl.AreAccessRulesProtected) {
         throw "Diagnostic owner or inheritance policy is not exact."
     }
-    $limitedRights = if ($File) { [Security.AccessControl.FileSystemRights]0x120086 } else { [Security.AccessControl.FileSystemRights]0x120080 }
-    $expected = @(
-        [PSCustomObject]@{ SID = $systemSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = $administratorsSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null); Rights = $limitedRights },
-        [PSCustomObject]@{ SID = $ServiceSID; Rights = $limitedRights }
-    )
-    if ($acl.Access.Count -ne $expected.Count) { throw "Diagnostic ACL contains unexpected ACEs." }
-    foreach ($wanted in $expected) {
-        $matches = @($acl.Access | Where-Object {
-            try { $sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { return $false }
-            $sid -eq $wanted.SID.Value -and -not $_.IsInherited -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.FileSystemRights -eq $wanted.Rights
-        })
-        if ($matches.Count -ne 1) { throw "Diagnostic ACL is missing or broadens SID $($wanted.SID.Value)." }
+    if (-not $acl.AreAccessRulesCanonical) { throw "Diagnostic ACL is not canonical." }
+    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    $expected = @{}
+    $expected['S-1-5-18'] = [uint32]0x1F01FF
+    $expected['S-1-5-32-544'] = [uint32]0x1F01FF
+    $expected['S-1-5-19'] = $limitedRights
+    $expected[$ServiceSID.Value] = $limitedRights
+    $actual = @{}
+    foreach ($accessRule in $acl.Access) {
+        if ($accessRule.IsInherited -or $accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $accessRule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
+            $accessRule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
+            throw "Diagnostic ACL contains a non-explicit allow ACE."
+        }
+        try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+        catch { throw "Diagnostic ACL contains an unresolvable SID." }
+        if (-not $expected.ContainsKey($sid)) { throw "Diagnostic ACL grants unexpected SID $sid." }
+        $rights = [uint32]$accessRule.FileSystemRights
+        $expectedRights = [uint32]$expected[$sid]
+        if ($rights -eq 0) { throw "Diagnostic ACL contains an empty ACE for SID $sid." }
+        if (($rights -bor $expectedRights) -ne $expectedRights) { throw "Diagnostic ACL broadens SID $sid." }
+        $currentRights = if ($actual.ContainsKey($sid)) { [uint32]$actual[$sid] } else { [uint32]0 }
+        $actual[$sid] = [uint32]($currentRights -bor $rights)
+    }
+    foreach ($sid in $expected.Keys) {
+        if (-not $actual.ContainsKey($sid) -or [uint32]$actual[$sid] -ne [uint32]$expected[$sid]) {
+            throw "Diagnostic ACL is missing required access for SID $sid."
+        }
     }
 }
 
@@ -290,6 +302,15 @@ function Invoke-ProvisioningSecurityTests {
                 throw "Least-privilege diagnostic ACE grants ChangePermissions."
             }
         }
+        $splitACL = [Security.AccessControl.FileSecurity]::new()
+        $splitSDDL = "O:$($ownerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120080;;;$($serviceSID.Value))(A;;0x6;;;$($serviceSID.Value))"
+        $splitACL.SetSecurityDescriptorSddlForm($splitSDDL, [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access)
+        Assert-ExactDiagnosticSecurityObject $splitACL $serviceSID $ownerSID -File
+        $unexpectedACL = [Security.AccessControl.FileSecurity]::new()
+        $unexpectedACL.SetSecurityDescriptorSddlForm("$splitSDDL(A;;0x2;;;BU)", [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access)
+        $unexpectedAccepted = $true
+        try { Assert-ExactDiagnosticSecurityObject $unexpectedACL $serviceSID $ownerSID -File } catch { $unexpectedAccepted = $false }
+        if ($unexpectedAccepted) { throw "Unexpected Users ACE was accepted by diagnostic policy." }
         if (-not $isAdministrator) { Write-Host "Provisioning ACL object policy passed; elevated CI covers persisted ACL verification and LocalService E2E." }
         Write-Host "Harness diagnostic provisioning security tests passed."
     }

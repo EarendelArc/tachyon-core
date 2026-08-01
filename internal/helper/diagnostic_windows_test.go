@@ -4,7 +4,9 @@ package helper
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -74,5 +76,83 @@ func TestExpectedDiagnosticSecurityIsBoundToServiceSID(t *testing.T) {
 	}
 	if first.String() == third.String() {
 		t.Fatal("diagnostic ACL is not bound to the installer owner SID")
+	}
+}
+
+func TestDiagnosticSecurityAcceptsCanonicalSplitACEs(t *testing.T) {
+	const (
+		serviceSID = "S-1-5-80-1-2-3-4-5"
+		ownerSID   = "S-1-5-21-1-2-3-4"
+	)
+	descriptor, err := windows.SecurityDescriptorFromString(
+		fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120080;;;%s)(A;;0x6;;;%s)", ownerSID, serviceSID, serviceSID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dacl.AceCount <= 4 {
+		t.Fatalf("split-ACE fixture was normalized to %d ACEs", dacl.AceCount)
+	}
+	if err := verifyDiagnosticSecurityDescriptor(descriptor, true, serviceSID, ownerSID); err != nil {
+		t.Fatalf("semantically exact split ACEs rejected: %v", err)
+	}
+}
+
+func TestDiagnosticSecurityRejectsBroadOrUnexpectedACEs(t *testing.T) {
+	const (
+		serviceSID = "S-1-5-80-1-2-3-4-5"
+		ownerSID   = "S-1-5-21-1-2-3-4"
+	)
+	tests := []struct {
+		name string
+		sddl string
+		want string
+	}{
+		{
+			name: "unexpected trustee",
+			sddl: fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120086;;;%s)(A;;0x2;;;BU)", ownerSID, serviceSID),
+			want: "unexpected SID",
+		},
+		{
+			name: "service WRITE_DAC",
+			sddl: fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x160086;;;%s)", ownerSID, serviceSID),
+			want: "broadens access",
+		},
+		{
+			name: "inherited ACE",
+			sddl: fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;ID;0x120086;;;%s)", ownerSID, serviceSID),
+			want: "non-explicit allow",
+		},
+		{
+			name: "missing append permission",
+			sddl: fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120082;;;%s)", ownerSID, serviceSID),
+			want: "does not match policy",
+		},
+		{
+			name: "unprotected DACL",
+			sddl: fmt.Sprintf("O:%sD:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120086;;;%s)", ownerSID, serviceSID),
+			want: "not protected",
+		},
+		{
+			name: "wrong owner",
+			sddl: fmt.Sprintf("O:S-1-5-21-4-3-2-1D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120086;;;%s)", serviceSID),
+			want: "owner does not match",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			descriptor, err := windows.SecurityDescriptorFromString(test.sddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = verifyDiagnosticSecurityDescriptor(descriptor, true, serviceSID, ownerSID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("verification error = %v; want substring %q", err, test.want)
+			}
+		})
 	}
 }

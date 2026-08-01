@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -99,6 +100,7 @@ func rejectDiagnosticReparsePoints(path string) error {
 const (
 	diagnosticDirectoryAccess windows.ACCESS_MASK = windows.READ_CONTROL | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE
 	diagnosticFileAccess      windows.ACCESS_MASK = diagnosticDirectoryAccess | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+	diagnosticAdminAccess     windows.ACCESS_MASK = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff
 )
 
 // diagnosticSecurityError is intentionally mapped to ERROR_ACCESS_DENIED by
@@ -135,6 +137,87 @@ func expectedDiagnosticSecurity(serviceSID, ownerSID string, file bool) (*window
 	return descriptor, nil
 }
 
+func expectedDiagnosticAccess(serviceSID string, file bool) (map[string]windows.ACCESS_MASK, error) {
+	service, err := windows.StringToSid(serviceSID)
+	if err != nil {
+		return nil, newDiagnosticSecurityError("invalid diagnostic service SID: %v", err)
+	}
+	limited := diagnosticDirectoryAccess
+	if file {
+		limited = diagnosticFileAccess
+	}
+	return map[string]windows.ACCESS_MASK{
+		"S-1-5-18":       diagnosticAdminAccess,
+		"S-1-5-32-544":   diagnosticAdminAccess,
+		"S-1-5-19":       limited,
+		service.String(): limited,
+	}, nil
+}
+
+func verifyDiagnosticSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR, file bool, serviceSID, ownerSID string) error {
+	owner, defaultedOwner, err := descriptor.Owner()
+	if err != nil {
+		return newDiagnosticSecurityError("read diagnostic owner: %v", err)
+	}
+	expectedOwner, err := windows.StringToSid(ownerSID)
+	if err != nil {
+		return newDiagnosticSecurityError("invalid diagnostic owner SID: %v", err)
+	}
+	if defaultedOwner || owner == nil || !owner.Equals(expectedOwner) {
+		return newDiagnosticSecurityError("diagnostic owner does not match pre-provisioned policy")
+	}
+	control, _, err := descriptor.Control()
+	if err != nil {
+		return newDiagnosticSecurityError("read diagnostic descriptor control: %v", err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		return newDiagnosticSecurityError("diagnostic DACL is not protected from inheritance")
+	}
+	dacl, defaultedDACL, err := descriptor.DACL()
+	if err != nil || dacl == nil {
+		return newDiagnosticSecurityError("read diagnostic DACL: %v", err)
+	}
+	if defaultedDACL {
+		return newDiagnosticSecurityError("diagnostic DACL must be explicitly provisioned")
+	}
+	expected, err := expectedDiagnosticAccess(serviceSID, file)
+	if err != nil {
+		return err
+	}
+	actual := make(map[string]windows.ACCESS_MASK, len(expected))
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			return newDiagnosticSecurityError("read diagnostic ACE %d: %v", index, err)
+		}
+		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 {
+			return newDiagnosticSecurityError("diagnostic DACL contains a non-explicit allow ACE")
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sid.IsValid() {
+			return newDiagnosticSecurityError("diagnostic DACL contains an invalid SID")
+		}
+		sidText := sid.String()
+		expectedMask, ok := expected[sidText]
+		if !ok {
+			return newDiagnosticSecurityError("diagnostic DACL grants an unexpected SID %s", sidText)
+		}
+		if ace.Mask == 0 {
+			return newDiagnosticSecurityError("diagnostic DACL contains an empty ACE for SID %s", sidText)
+		}
+		if ace.Mask&^expectedMask != 0 {
+			return newDiagnosticSecurityError("diagnostic DACL broadens access for SID %s", sidText)
+		}
+		actual[sidText] |= ace.Mask
+	}
+	for sid, expectedMask := range expected {
+		if actual[sid] != expectedMask {
+			return newDiagnosticSecurityError("diagnostic DACL access does not match policy for SID %s", sid)
+		}
+	}
+	return nil
+}
+
 func verifyDiagnosticHandle(handle windows.Handle, directory bool, serviceSID, ownerSID string) error {
 	var information windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
@@ -151,14 +234,7 @@ func verifyDiagnosticHandle(handle windows.Handle, directory bool, serviceSID, o
 	if err != nil {
 		return newDiagnosticSecurityError("read diagnostic security descriptor: %v", err)
 	}
-	expected, err := expectedDiagnosticSecurity(serviceSID, ownerSID, !directory)
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(actual.String(), expected.String()) {
-		return newDiagnosticSecurityError("diagnostic ACL or owner does not match pre-provisioned policy")
-	}
-	return nil
+	return verifyDiagnosticSecurityDescriptor(actual, !directory, serviceSID, ownerSID)
 }
 
 func openVerifiedDiagnosticDirectory(path, serviceSID, ownerSID string) (windows.Handle, error) {

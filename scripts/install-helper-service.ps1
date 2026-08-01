@@ -46,21 +46,25 @@ function Resolve-ServiceSID {
     return $Matches[0]
 }
 
+function Get-ExactDiagnosticSDDL {
+    param(
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
+        [switch]$File
+    )
+    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    return "O:$($OwnerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x$($limitedRights.ToString('X'));;;LS)(A;;0x$($limitedRights.ToString('X'));;;$($ServiceSID.Value))"
+}
+
 function New-ExactDiagnosticSecurity {
-    param([Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID, [switch]$File)
+    param(
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
+        [switch]$File
+    )
     $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
-    $systemSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $administratorsSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-    $security.SetAccessRuleProtection($true, $false)
-    $limited = if ($File) { [Security.AccessControl.FileSystemRights]0x120086 } else { [Security.AccessControl.FileSystemRights]0x120080 }
-    foreach ($rule in @(
-        [PSCustomObject]@{ SID = $systemSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = $administratorsSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
-        [PSCustomObject]@{ SID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null); Rights = $limited },
-        [PSCustomObject]@{ SID = $ServiceSID; Rights = $limited }
-    )) {
-        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($rule.SID, $rule.Rights, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-    }
+    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+    $security.SetSecurityDescriptorSddlForm((Get-ExactDiagnosticSDDL $ServiceSID $OwnerSID -File:$File), $sections)
     return $security
 }
 
@@ -71,14 +75,38 @@ function Assert-PreprovisionedDiagnosticSecurity {
         [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
         [switch]$File
     )
-    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
     $actual = Get-Acl -LiteralPath $Path
-    $expected = New-ExactDiagnosticSecurity $ServiceSID -File:$File
-    $expected.SetOwner($OwnerSID)
-    $actualSDDL = $actual.GetSecurityDescriptorSddlForm($sections)
-    $expectedSDDL = $expected.GetSecurityDescriptorSddlForm($sections)
-    if (-not [string]::Equals($actualSDDL, $expectedSDDL, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Diagnostic ACL or owner does not match the pre-provisioned policy."
+    if ($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $OwnerSID.Value -or -not $actual.AreAccessRulesProtected) {
+        throw "Diagnostic owner or inheritance policy is not exact."
+    }
+    if (-not $actual.AreAccessRulesCanonical) { throw "Diagnostic ACL is not canonical." }
+    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    $expected = @{}
+    $expected['S-1-5-18'] = [uint32]0x1F01FF
+    $expected['S-1-5-32-544'] = [uint32]0x1F01FF
+    $expected['S-1-5-19'] = $limitedRights
+    $expected[$ServiceSID.Value] = $limitedRights
+    $seen = @{}
+    foreach ($accessRule in $actual.Access) {
+        if ($accessRule.IsInherited -or $accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $accessRule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
+            $accessRule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
+            throw "Diagnostic ACL contains a non-explicit allow ACE."
+        }
+        try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+        catch { throw "Diagnostic ACL contains an unresolvable SID." }
+        if (-not $expected.ContainsKey($sid)) { throw "Diagnostic ACL grants unexpected SID $sid." }
+        $rights = [uint32]$accessRule.FileSystemRights
+        $expectedRights = [uint32]$expected[$sid]
+        if ($rights -eq 0) { throw "Diagnostic ACL contains an empty ACE for SID $sid." }
+        if (($rights -bor $expectedRights) -ne $expectedRights) { throw "Diagnostic ACL broadens SID $sid." }
+        $currentRights = if ($seen.ContainsKey($sid)) { [uint32]$seen[$sid] } else { [uint32]0 }
+        $seen[$sid] = [uint32]($currentRights -bor $rights)
+    }
+    foreach ($sid in $expected.Keys) {
+        if (-not $seen.ContainsKey($sid) -or [uint32]$seen[$sid] -ne [uint32]$expected[$sid]) {
+            throw "Diagnostic ACL is missing required access for SID $sid."
+        }
     }
 }
 
@@ -93,9 +121,9 @@ function Preprovision-DiagnosticArtifacts {
     try { [IO.File]::Open($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read).Dispose() }
     catch { throw "Create diagnostic file failed: $($_.Exception.Message)" }
     Assert-NoReparsePointPath $Path
-    Set-Acl -LiteralPath $Path -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID -File)
-    Set-Acl -LiteralPath $directory -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID)
     $owner = [Security.Principal.SecurityIdentifier]::new($OwnerSID)
+    Set-Acl -LiteralPath $Path -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID $owner -File)
+    Set-Acl -LiteralPath $directory -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID $owner)
     Assert-PreprovisionedDiagnosticSecurity $directory $serviceAccountSID $owner
     Assert-PreprovisionedDiagnosticSecurity $Path $serviceAccountSID $owner -File
 }

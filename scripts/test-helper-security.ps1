@@ -130,6 +130,45 @@ function Get-DiagnosticExpectedMask {
     return [uint32]$rule.FileSystemRights
 }
 
+function Get-DiagnosticAccessRules {
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$ACL)
+    # PowerShell 7's Access view can omit SIDs that have no account-name mapping.
+    return $ACL.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+}
+
+function Get-DiagnosticSIDAccessSummary {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$ACL,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$SID
+    )
+    $count = 0
+    $mask = [uint32]0
+    foreach ($accessRule in (Get-DiagnosticAccessRules $ACL)) {
+        if ($accessRule.IdentityReference.Value -ne $SID.Value -or $accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $count++
+        $mask = [uint32]($mask -bor [uint32]$accessRule.FileSystemRights)
+    }
+    return [PSCustomObject]@{ Count = $count; Mask = $mask }
+}
+
+function Get-RawDiagnosticSIDAccessSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$SDDL,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$SID
+    )
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($SDDL)
+    $count = 0
+    $mask = [uint32]0
+    foreach ($ace in $descriptor.DiscretionaryAcl) {
+        if ($ace -isnot [Security.AccessControl.CommonAce] -or
+            $ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or
+            $ace.SecurityIdentifier.Value -ne $SID.Value) { continue }
+        $count++
+        $mask = [uint32]($mask -bor [uint32]$ace.AccessMask)
+    }
+    return [PSCustomObject]@{ Count = $count; Mask = $mask }
+}
+
 function New-ExactDiagnosticSecurity {
     param(
         [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
@@ -170,14 +209,13 @@ function Assert-ExactDiagnosticSecurityObject {
     $expected['S-1-5-19'] = $limitedRights
     $expected[$ServiceSID.Value] = $limitedRights
     $actual = @{}
-    foreach ($accessRule in $acl.Access) {
+    foreach ($accessRule in (Get-DiagnosticAccessRules $acl)) {
         if ($accessRule.IsInherited -or $accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
             $accessRule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
             $accessRule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
             throw "Diagnostic ACL contains a non-explicit allow ACE."
         }
-        try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
-        catch { throw "Diagnostic ACL contains an unresolvable SID." }
+        $sid = $accessRule.IdentityReference.Value
         if (-not $expected.ContainsKey($sid)) { throw "Diagnostic ACL grants unexpected SID $sid." }
         $rights = [uint32]$accessRule.FileSystemRights
         $expectedRights = [uint32]$expected[$sid]
@@ -205,6 +243,40 @@ function Assert-ExactDiagnosticSecurity {
     Assert-ExactDiagnosticSecurityObject $acl $ServiceSID $OwnerSID -File:$File
 }
 
+function Assert-DiagnosticSecurityRejected {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$ACL,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
+        [Parameter(Mandatory = $true)][string]$ExpectedMessage
+    )
+    $failure = $null
+    try { Assert-ExactDiagnosticSecurityObject $ACL $ServiceSID $OwnerSID -File }
+    catch { $failure = $_ }
+    if ($null -eq $failure) { throw "Invalid diagnostic ACL was accepted; expected '$ExpectedMessage'." }
+    if (-not $failure.Exception.Message.Contains($ExpectedMessage)) {
+        throw "Invalid diagnostic ACL failed for the wrong reason: '$($failure.Exception.Message)'; expected '$ExpectedMessage'."
+    }
+}
+
+function Write-DiagnosticAclObjectDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$ACL
+    )
+    try {
+        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+        Write-Host "$Label ACL owner=$($ACL.GetOwner([Security.Principal.SecurityIdentifier]).Value) protected=$($ACL.AreAccessRulesProtected) canonical=$($ACL.AreAccessRulesCanonical)"
+        Write-Host "$Label ACL SDDL=$($ACL.GetSecurityDescriptorSddlForm($sections))"
+        foreach ($accessRule in (Get-DiagnosticAccessRules $ACL)) {
+            $sid = $accessRule.IdentityReference.Value
+            $rights = [uint32]$accessRule.FileSystemRights
+            Write-Host "$Label ACE sid=$sid mask=0x$($rights.ToString('X')) type=$($accessRule.AccessControlType) inherited=$($accessRule.IsInherited) inheritance=$($accessRule.InheritanceFlags) propagation=$($accessRule.PropagationFlags)"
+        }
+    }
+    catch { Write-Warning "$Label ACL diagnostics failed: $($_.Exception.Message)" }
+}
+
 function Write-DiagnosticAclDiagnostics {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -216,15 +288,7 @@ function Write-DiagnosticAclDiagnostics {
             return
         }
         $acl = Get-Acl -LiteralPath $Path
-        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
-        Write-Host "$Label ACL owner=$($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) protected=$($acl.AreAccessRulesProtected) canonical=$($acl.AreAccessRulesCanonical)"
-        Write-Host "$Label ACL SDDL=$($acl.GetSecurityDescriptorSddlForm($sections))"
-        foreach ($accessRule in $acl.Access) {
-            try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
-            catch { $sid = $accessRule.IdentityReference.Value }
-            $rights = [uint32]$accessRule.FileSystemRights
-            Write-Host "$Label ACE sid=$sid mask=0x$($rights.ToString('X')) type=$($accessRule.AccessControlType) inherited=$($accessRule.IsInherited) inheritance=$($accessRule.InheritanceFlags) propagation=$($accessRule.PropagationFlags)"
-        }
+        Write-DiagnosticAclObjectDiagnostics $Label $acl
     }
     catch { Write-Warning "$Label ACL diagnostics failed: $($_.Exception.Message)" }
 }
@@ -426,21 +490,53 @@ function Invoke-ProvisioningSecurityTests {
         }
         $fileACL = New-ExactDiagnosticSecurity $serviceSID $ownerSID -File
         $writeDAC = [Security.AccessControl.FileSystemRights]::ChangePermissions
-        foreach ($accessRule in $fileACL.Access) {
-            try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+        foreach ($accessRule in (Get-DiagnosticAccessRules $fileACL)) {
+            $sid = $accessRule.IdentityReference.Value
             if (($sid -eq 'S-1-5-19' -or $sid -eq $serviceSID.Value) -and (($accessRule.FileSystemRights -band $writeDAC) -ne 0)) {
                 throw "Least-privilege diagnostic ACE grants ChangePermissions."
             }
         }
+        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
         $splitACL = [Security.AccessControl.FileSecurity]::new()
         $splitSDDL = "O:$($ownerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120080;;;$($serviceSID.Value))(A;;0x6;;;$($serviceSID.Value))"
-        $splitACL.SetSecurityDescriptorSddlForm($splitSDDL, [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access)
+        $logicalSplit = Get-RawDiagnosticSIDAccessSummary $splitSDDL $serviceSID
+        if ($logicalSplit.Count -ne 2 -or $logicalSplit.Mask -ne [uint32]0x120086) {
+            throw "Raw logical split-ACE input is invalid: count=$($logicalSplit.Count) union=0x$($logicalSplit.Mask.ToString('X'))."
+        }
+        $splitACL.SetSecurityDescriptorSddlForm($splitSDDL, $sections)
+        $splitInput = Get-DiagnosticSIDAccessSummary $splitACL $serviceSID
+        if (($splitInput.Count -ne 1 -and $splitInput.Count -ne 2) -or $splitInput.Mask -ne [uint32]0x120086) {
+            throw "FileSecurity split-ACE canonicalization is not strictly equivalent: count=$($splitInput.Count) union=0x$($splitInput.Mask.ToString('X'))."
+        }
         Assert-ExactDiagnosticSecurityObject $splitACL $serviceSID $ownerSID -File
+        Write-DiagnosticAclObjectDiagnostics 'split input' $splitACL
+        if ($isAdministrator) {
+            Set-Acl -LiteralPath $harness.Diagnostic -AclObject $splitACL
+            $persistedSplitACL = Get-Acl -LiteralPath $harness.Diagnostic
+            $persistedSplit = Get-DiagnosticSIDAccessSummary $persistedSplitACL $serviceSID
+            if (($persistedSplit.Count -ne 1 -and $persistedSplit.Count -ne 2) -or $persistedSplit.Mask -ne [uint32]0x120086) {
+                Write-DiagnosticAclObjectDiagnostics 'persisted split' $persistedSplitACL
+                throw "Persisted split-ACE fixture is not strictly equivalent: count=$($persistedSplit.Count) union=0x$($persistedSplit.Mask.ToString('X'))."
+            }
+            Assert-ExactDiagnosticSecurityObject $persistedSplitACL $serviceSID $ownerSID -File
+            Write-DiagnosticAclObjectDiagnostics 'persisted split' $persistedSplitACL
+            Write-Host "Persisted split-ACE fixture passed: logical_count=$($logicalSplit.Count) object_count=$($splitInput.Count) persisted_count=$($persistedSplit.Count) union=0x$($persistedSplit.Mask.ToString('X'))."
+        }
+        else { Write-Host "Logical split-ACE fixture passed: logical_count=$($logicalSplit.Count) object_count=$($splitInput.Count) union=0x$($splitInput.Mask.ToString('X')); elevated CI covers NTFS persistence." }
+
         $unexpectedACL = [Security.AccessControl.FileSecurity]::new()
-        $unexpectedACL.SetSecurityDescriptorSddlForm("$splitSDDL(A;;0x2;;;BU)", [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access)
-        $unexpectedAccepted = $true
-        try { Assert-ExactDiagnosticSecurityObject $unexpectedACL $serviceSID $ownerSID -File } catch { $unexpectedAccepted = $false }
-        if ($unexpectedAccepted) { throw "Unexpected Users ACE was accepted by diagnostic policy." }
+        $unexpectedACL.SetSecurityDescriptorSddlForm("$splitSDDL(A;;0x2;;;BU)", $sections)
+        Assert-DiagnosticSecurityRejected $unexpectedACL $serviceSID $ownerSID 'unexpected SID'
+        $denyACL = [Security.AccessControl.FileSecurity]::new()
+        $denyACL.SetSecurityDescriptorSddlForm("O:$($ownerSID.Value)D:PAI(D;;0x2;;;$($serviceSID.Value))(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x120086;;;$($serviceSID.Value))", $sections)
+        Assert-DiagnosticSecurityRejected $denyACL $serviceSID $ownerSID 'non-explicit allow ACE'
+        $inheritedACL = [Security.AccessControl.FileSecurity]::new()
+        $inheritedACL.SetSecurityDescriptorSddlForm("$splitSDDL(A;ID;0x1;;;SY)", $sections)
+        Assert-DiagnosticSecurityRejected $inheritedACL $serviceSID $ownerSID 'non-explicit allow ACE'
+        $writeDACACL = [Security.AccessControl.FileSecurity]::new()
+        $writeDACACL.SetSecurityDescriptorSddlForm("O:$($ownerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120086;;;LS)(A;;0x160086;;;$($serviceSID.Value))", $sections)
+        Assert-DiagnosticSecurityRejected $writeDACACL $serviceSID $ownerSID 'broadens SID'
+        Write-Host "Strict ACL rejection tests passed: extra SID, deny, inherited, and WRITE_DAC."
         Invoke-SetupFailureCleanupTest
         if (-not $isAdministrator) { Write-Host "Provisioning ACL object policy passed; elevated CI covers persisted ACL verification and LocalService E2E." }
         Write-Host "Harness diagnostic provisioning security tests passed."

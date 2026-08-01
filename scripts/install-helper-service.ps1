@@ -62,6 +62,12 @@ function Get-DiagnosticExpectedMask {
     return [uint32]$rule.FileSystemRights
 }
 
+function Get-DiagnosticAccessRules {
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$ACL)
+    # PowerShell 7's Access view can omit SIDs that have no account-name mapping.
+    return $ACL.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+}
+
 function New-ExactDiagnosticSecurity {
     param(
         [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
@@ -102,14 +108,13 @@ function Assert-PreprovisionedDiagnosticSecurity {
     $expected['S-1-5-19'] = $limitedRights
     $expected[$ServiceSID.Value] = $limitedRights
     $seen = @{}
-    foreach ($accessRule in $actual.Access) {
+    foreach ($accessRule in (Get-DiagnosticAccessRules $actual)) {
         if ($accessRule.IsInherited -or $accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
             $accessRule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
             $accessRule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
             throw "Diagnostic ACL contains a non-explicit allow ACE."
         }
-        try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
-        catch { throw "Diagnostic ACL contains an unresolvable SID." }
+        $sid = $accessRule.IdentityReference.Value
         if (-not $expected.ContainsKey($sid)) { throw "Diagnostic ACL grants unexpected SID $sid." }
         $rights = [uint32]$accessRule.FileSystemRights
         $expectedRights = [uint32]$expected[$sid]

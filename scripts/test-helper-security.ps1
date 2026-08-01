@@ -29,20 +29,81 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 
 namespace TachyonHarness {
+    public sealed class JobFaultPlan {
+        private readonly object sync = new object();
+        private int assignFailures;
+        private int terminateFailures;
+        private int closeFailures;
+        private int resumeFailures;
+
+        public JobFaultPlan(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures) {
+            this.assignFailures = assignFailures;
+            this.terminateFailures = terminateFailures;
+            this.closeFailures = closeFailures;
+            this.resumeFailures = resumeFailures;
+        }
+
+        internal bool ConsumeAssignFailure() { lock (sync) { return Consume(ref assignFailures); } }
+        internal bool ConsumeTerminateFailure() { lock (sync) { return Consume(ref terminateFailures); } }
+        internal bool ConsumeCloseFailure() { lock (sync) { return Consume(ref closeFailures); } }
+        internal bool ConsumeResumeFailure() { lock (sync) { return Consume(ref resumeFailures); } }
+
+        private static bool Consume(ref int remaining) {
+            if (remaining <= 0) return false;
+            remaining--;
+            return true;
+        }
+    }
+
+    public sealed class AssignedProcessStartResult {
+        private readonly List<string> errors = new List<string>();
+        public Process Process { get; internal set; }
+        public int ProcessId { get; internal set; }
+        public long StartTicksUtc { get; internal set; }
+        public bool Created { get; internal set; }
+        public bool Assigned { get; internal set; }
+        public bool Resumed { get; internal set; }
+        public bool TerminationAttempted { get; internal set; }
+        public bool TerminationSucceeded { get; internal set; }
+        public bool IndependentFallbackAttempted { get; internal set; }
+        public bool IndependentFallbackSucceeded { get; internal set; }
+        public bool CleanupConfirmed { get; internal set; }
+        public bool PidResidual { get; internal set; }
+        public bool PidReused { get; internal set; }
+        public bool Success { get; internal set; }
+        public string[] Errors { get { return errors.ToArray(); } }
+        internal void AddError(string value) { errors.Add(value); }
+    }
+
+    public sealed class JobCloseResult {
+        public bool Success { get; internal set; }
+        public bool AlreadyClosed { get; internal set; }
+        public bool HandleRetained { get; internal set; }
+        public int Attempt { get; internal set; }
+        public int ErrorCode { get; internal set; }
+        public string Error { get; internal set; }
+    }
+
     public sealed class KillOnCloseJob : IDisposable {
         private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         private const int JobObjectBasicProcessIdList = 3;
         private const int JobObjectExtendedLimitInformation = 9;
         private const uint CREATE_SUSPENDED = 0x00000004;
         private const uint CREATE_NO_WINDOW = 0x08000000;
+        private const uint WAIT_OBJECT_0 = 0x00000000;
+        private const uint WAIT_TIMEOUT = 0x00000102;
+        private const uint START_FAILURE_EXIT_CODE = 0x0000e101;
+        private readonly object sync = new object();
+        private readonly JobFaultPlan faults;
         private IntPtr handle;
+        private bool closed;
+        private int closeAttempts;
 
-        private KillOnCloseJob(IntPtr handle) { this.handle = handle; }
+        private KillOnCloseJob(IntPtr handle, JobFaultPlan faults) { this.handle = handle; this.faults = faults; }
 
-        public bool IsClosed { get { return Volatile.Read(ref handle) == IntPtr.Zero; } }
+        public bool IsClosed { get { lock (sync) { return closed; } } }
         public uint LimitFlags {
             get {
                 IntPtr job = RequireHandle();
@@ -74,7 +135,7 @@ namespace TachyonHarness {
                     }
                 }
                 finally { Marshal.FreeHGlobal(buffer); }
-                return new KillOnCloseJob(job);
+                return new KillOnCloseJob(job, new JobFaultPlan(0, 0, 0, 0));
             }
             catch {
                 CloseHandle(job);
@@ -82,7 +143,16 @@ namespace TachyonHarness {
             }
         }
 
-        public Process StartAssignedProcess(string applicationPath, string[] arguments) {
+        public static KillOnCloseJob CreateWithFaults(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures) {
+            if (assignFailures < 0 || terminateFailures < 0 || closeFailures < 0 || resumeFailures < 0) {
+                throw new ArgumentOutOfRangeException("failure counts must be non-negative");
+            }
+            KillOnCloseJob job = Create();
+            return new KillOnCloseJob(job.DetachHandle(), new JobFaultPlan(assignFailures, terminateFailures, closeFailures, resumeFailures));
+        }
+
+        public AssignedProcessStartResult StartAssignedProcess(string applicationPath, string[] arguments) {
+            AssignedProcessStartResult result = new AssignedProcessStartResult();
             IntPtr job = RequireHandle();
             string commandLine = QuoteArgument(applicationPath);
             if (arguments != null) {
@@ -90,37 +160,86 @@ namespace TachyonHarness {
             }
             STARTUPINFO startup = new STARTUPINFO();
             startup.cb = (uint)Marshal.SizeOf<STARTUPINFO>();
-            PROCESS_INFORMATION information;
+            PROCESS_INFORMATION information = new PROCESS_INFORMATION();
             StringBuilder mutableCommandLine = new StringBuilder(commandLine);
             if (!CreateProcessW(applicationPath, mutableCommandLine, IntPtr.Zero, IntPtr.Zero, false,
                 CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, Environment.CurrentDirectory, ref startup, out information)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessW suspended failed");
+                result.AddError("create_process_failed win32=" + Marshal.GetLastWin32Error());
+                result.CleanupConfirmed = true;
+                return result;
             }
+            result.Created = true;
+            result.ProcessId = unchecked((int)information.dwProcessId);
             Process managed = null;
-            bool resumed = false;
             try {
-                if (!AssignProcessToJobObject(job, information.hProcess)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+                long startTicks;
+                if (!TryGetStartTicks(information.hProcess, out startTicks)) {
+                    result.AddError("get_process_times_failed win32=" + Marshal.GetLastWin32Error());
                 }
-                bool assigned;
-                if (!IsProcessInJob(information.hProcess, job, out assigned) || !assigned) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "IsProcessInJob did not confirm assignment");
+                else { result.StartTicksUtc = startTicks; }
+                managed = Process.GetProcessById(result.ProcessId);
+                result.Process = managed;
+
+                int operationError;
+                if (!TryAssign(job, information.hProcess, out operationError)) {
+                    result.AddError("assign_process_to_job_failed win32=" + operationError);
                 }
-                managed = Process.GetProcessById(unchecked((int)information.dwProcessId));
-                if (ResumeThread(information.hThread) == UInt32.MaxValue) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
+                else {
+                    result.Assigned = true;
+                    bool assigned;
+                    if (!IsProcessInJob(information.hProcess, job, out assigned) || !assigned) {
+                        result.AddError("is_process_in_job_failed win32=" + Marshal.GetLastWin32Error());
+                    }
+                    else if (!TryResume(information.hThread, out operationError)) {
+                        result.AddError("resume_thread_failed win32=" + operationError);
+                    }
+                    else {
+                        result.Resumed = true;
+                        result.Success = true;
+                    }
                 }
-                resumed = true;
-                return managed;
             }
-            catch {
-                if (!resumed) TerminateProcess(information.hProcess, 0xe101);
-                if (managed != null) managed.Dispose();
-                throw;
+            catch (Exception error) {
+                result.AddError("start_exception type=" + error.GetType().Name + " message=" + error.Message);
             }
             finally {
+                if (!result.Success) CleanupFailedStart(result, information.hProcess, managed);
                 CloseHandle(information.hThread);
                 CloseHandle(information.hProcess);
+            }
+            return result;
+        }
+
+        public JobCloseResult TryClose() {
+            lock (sync) {
+                JobCloseResult result = new JobCloseResult();
+                result.Attempt = ++closeAttempts;
+                if (closed) {
+                    result.Success = true;
+                    result.AlreadyClosed = true;
+                    return result;
+                }
+                if (handle == IntPtr.Zero) {
+                    result.Error = "Job handle is unexpectedly empty before close.";
+                    result.HandleRetained = false;
+                    return result;
+                }
+                if (faults.ConsumeCloseFailure()) {
+                    result.ErrorCode = 5;
+                    result.Error = "injected CloseHandle(job) failure";
+                    result.HandleRetained = true;
+                    return result;
+                }
+                if (!CloseHandle(handle)) {
+                    result.ErrorCode = Marshal.GetLastWin32Error();
+                    result.Error = "CloseHandle(job) failed";
+                    result.HandleRetained = true;
+                    return result;
+                }
+                handle = IntPtr.Zero;
+                closed = true;
+                result.Success = true;
+                return result;
             }
         }
 
@@ -148,16 +267,98 @@ namespace TachyonHarness {
         }
 
         public void Dispose() {
-            IntPtr job = Interlocked.Exchange(ref handle, IntPtr.Zero);
-            if (job != IntPtr.Zero && !CloseHandle(job)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "CloseHandle(job) failed");
-            }
+            JobCloseResult result = TryClose();
+            if (!result.Success) throw new Win32Exception(result.ErrorCode, result.Error);
         }
 
         private IntPtr RequireHandle() {
-            IntPtr job = Volatile.Read(ref handle);
-            if (job == IntPtr.Zero) throw new ObjectDisposedException("KillOnCloseJob");
-            return job;
+            lock (sync) {
+                if (closed || handle == IntPtr.Zero) throw new ObjectDisposedException("KillOnCloseJob");
+                return handle;
+            }
+        }
+
+        private IntPtr DetachHandle() {
+            lock (sync) {
+                IntPtr detached = handle;
+                handle = IntPtr.Zero;
+                closed = true;
+                return detached;
+            }
+        }
+
+        private bool TryAssign(IntPtr job, IntPtr process, out int error) {
+            if (faults.ConsumeAssignFailure()) { error = 5; return false; }
+            if (AssignProcessToJobObject(job, process)) { error = 0; return true; }
+            error = Marshal.GetLastWin32Error();
+            return false;
+        }
+
+        private bool TryTerminate(IntPtr process, out int error) {
+            if (faults.ConsumeTerminateFailure()) { error = 5; return false; }
+            if (TerminateProcess(process, START_FAILURE_EXIT_CODE)) { error = 0; return true; }
+            error = Marshal.GetLastWin32Error();
+            return false;
+        }
+
+        private bool TryResume(IntPtr thread, out int error) {
+            if (faults.ConsumeResumeFailure()) { error = 5; return false; }
+            if (ResumeThread(thread) != UInt32.MaxValue) { error = 0; return true; }
+            error = Marshal.GetLastWin32Error();
+            return false;
+        }
+
+        private static bool TryGetStartTicks(IntPtr process, out long ticks) {
+            FILETIME creation;
+            FILETIME exit;
+            FILETIME kernel;
+            FILETIME user;
+            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) { ticks = 0; return false; }
+            long fileTime = ((long)creation.HighDateTime << 32) | creation.LowDateTime;
+            ticks = DateTime.FromFileTimeUtc(fileTime).Ticks;
+            return true;
+        }
+
+        private void CleanupFailedStart(AssignedProcessStartResult result, IntPtr processHandle, Process managed) {
+            result.TerminationAttempted = true;
+            int terminateError;
+            result.TerminationSucceeded = TryTerminate(processHandle, out terminateError);
+            if (!result.TerminationSucceeded) result.AddError("terminate_process_failed win32=" + terminateError);
+
+            uint wait = WaitForSingleObject(processHandle, result.TerminationSucceeded ? 5000u : 100u);
+            if (wait != WAIT_OBJECT_0) {
+                if (wait != WAIT_TIMEOUT) result.AddError("initial_process_wait_failed win32=" + Marshal.GetLastWin32Error());
+                result.IndependentFallbackAttempted = true;
+                try {
+                    if (managed == null) managed = Process.GetProcessById(result.ProcessId);
+                    if (!managed.HasExited) managed.Kill();
+                    bool waited = managed.WaitForExit(5000);
+                    result.IndependentFallbackSucceeded = waited && managed.HasExited;
+                    if (!result.IndependentFallbackSucceeded) result.AddError("independent_process_kill_wait_failed");
+                }
+                catch (Exception error) {
+                    result.AddError("independent_process_kill_failed type=" + error.GetType().Name + " message=" + error.Message);
+                }
+                wait = WaitForSingleObject(processHandle, 5000);
+            }
+
+            bool residual = false;
+            try {
+                using (Process candidate = Process.GetProcessById(result.ProcessId)) {
+                    long candidateTicks = candidate.StartTime.ToUniversalTime().Ticks;
+                    if (result.StartTicksUtc != 0 && candidateTicks == result.StartTicksUtc) residual = true;
+                    else if (result.StartTicksUtc != 0) result.PidReused = true;
+                    else residual = true;
+                }
+            }
+            catch (ArgumentException) { }
+            catch (Exception error) {
+                residual = true;
+                result.AddError("process_residual_check_failed type=" + error.GetType().Name + " message=" + error.Message);
+            }
+            result.PidResidual = residual;
+            result.CleanupConfirmed = wait == WAIT_OBJECT_0 && !residual;
+            if (!result.CleanupConfirmed) result.AddError("failed_start_cleanup_not_confirmed");
         }
 
         private static string QuoteArgument(string value) {
@@ -244,6 +445,12 @@ namespace TachyonHarness {
             public uint dwThreadId;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILETIME {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateJobObjectW(IntPtr securityAttributes, string name);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -262,6 +469,10 @@ namespace TachyonHarness {
         private static extern uint ResumeThread(IntPtr thread);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
     }
@@ -832,11 +1043,14 @@ function Close-HarnessJobAndVerifyCleanup {
     )
     $errors = [System.Collections.Generic.List[string]]::new()
     $members = [System.Collections.Generic.List[object]]::new()
+    $closeAttempts = [System.Collections.Generic.List[object]]::new()
     $result = [ordered]@{
         assigned = $Assigned
         limit_flags = 'KILL_ON_JOB_CLOSE'
         silent_breakaway_enabled = $false
         closed = $false
+        close_retried = $false
+        close_attempts = @()
         active_member_count_before_close = 0
         child_member_count_before_close = 0
         child_cleanup_confirmed = $false
@@ -859,12 +1073,22 @@ function Close-HarnessJobAndVerifyCleanup {
     }
     catch { $errors.Add("Job member snapshot failed: $($_.Exception.Message)") }
 
-    try {
-        $Job.Dispose()
-        $result.closed = [bool]$Job.IsClosed
-        if (-not $result.closed) { throw "Job handle did not report closed." }
+    for ($attempt = 1; $attempt -le 2 -and -not $Job.IsClosed; $attempt++) {
+        try {
+            $close = $Job.TryClose()
+            $closeAttempts.Add([PSCustomObject]@{
+                attempt = $close.Attempt
+                success = [bool]$close.Success
+                already_closed = [bool]$close.AlreadyClosed
+                handle_retained = [bool]$close.HandleRetained
+                error_code = $close.ErrorCode
+                error = $close.Error
+            })
+        }
+        catch { $closeAttempts.Add([PSCustomObject]@{ attempt = $attempt; success = $false; handle_retained = $true; error = $_.Exception.Message }) }
     }
-    catch { $errors.Add("Job close failed: $($_.Exception.Message)") }
+    $result.closed = [bool]$Job.IsClosed
+    $result.close_retried = $closeAttempts.Count -gt 1
 
     $coreCleanup = Stop-VerifiedHarnessProcess $CoreProcess $CoreProcessID $CoreStartTicks -WaitMilliseconds $WaitMilliseconds
     $result.core = $coreCleanup
@@ -873,15 +1097,126 @@ function Close-HarnessJobAndVerifyCleanup {
     $childResults = [System.Collections.Generic.List[object]]::new()
     foreach ($member in $members) {
         if ($member.pid -eq $CoreProcessID) { continue }
-        $childResult = Wait-HarnessProcessIdentityGone $member.pid $member.start_ticks_utc $WaitMilliseconds
+        if ($Job.IsClosed) {
+            $childResult = Wait-HarnessProcessIdentityGone $member.pid $member.start_ticks_utc $WaitMilliseconds
+        }
+        else {
+            $childProcess = Get-Process -Id $member.pid -ErrorAction SilentlyContinue
+            if ($null -eq $childProcess) {
+                $childResult = [PSCustomObject]@{ pid = $member.pid; gone = $true; pid_reused = $false; residual = $false; direct_fallback = $true }
+            }
+            else {
+                $directCleanup = Stop-VerifiedHarnessProcess $childProcess $member.pid $member.start_ticks_utc -WaitMilliseconds $WaitMilliseconds
+                $childResult = [PSCustomObject]@{
+                    pid = $member.pid
+                    gone = [bool]$directCleanup.success
+                    pid_reused = [bool]$directCleanup.pid_reused
+                    residual = [bool]$directCleanup.pid_residual
+                    direct_fallback = $true
+                    cleanup = $directCleanup
+                }
+            }
+        }
         $childResults.Add($childResult)
         if (-not $childResult.gone -or $childResult.residual) { $errors.Add("Job child PID $($member.pid) survived cleanup.") }
     }
+
+    if (-not $Job.IsClosed) {
+        try {
+            foreach ($memberIDValue in @($Job.ActiveProcessIds())) {
+                $memberID = [int][uint32]$memberIDValue
+                if ($memberID -eq $PID) { throw "Harness attempted to clean its own PID from the Job." }
+                $memberProcess = Get-Process -Id $memberID -ErrorAction SilentlyContinue
+                if ($null -eq $memberProcess) { continue }
+                $memberStartTicks = [long]$memberProcess.StartTime.ToUniversalTime().Ticks
+                $memberCleanup = Stop-VerifiedHarnessProcess $memberProcess $memberID $memberStartTicks -WaitMilliseconds $WaitMilliseconds
+                if (-not $memberCleanup.success) { $errors.Add("Late Job member PID $memberID survived direct fallback cleanup.") }
+            }
+        }
+        catch { $errors.Add("Job member fallback cleanup failed: $($_.Exception.Message)") }
+        try {
+            $close = $Job.TryClose()
+            $closeAttempts.Add([PSCustomObject]@{
+                attempt = $close.Attempt
+                success = [bool]$close.Success
+                already_closed = [bool]$close.AlreadyClosed
+                handle_retained = [bool]$close.HandleRetained
+                error_code = $close.ErrorCode
+                error = $close.Error
+                after_member_cleanup = $true
+            })
+        }
+        catch { $closeAttempts.Add([PSCustomObject]@{ success = $false; handle_retained = $true; error = $_.Exception.Message; after_member_cleanup = $true }) }
+    }
+    $result.closed = [bool]$Job.IsClosed
+    if (-not $result.closed) {
+        try {
+            $remainingMembers = @($Job.ActiveProcessIds())
+            if ($remainingMembers.Count -gt 0) { $errors.Add("Job remained open with $($remainingMembers.Count) active member(s).") }
+            else { $errors.Add("Job remained open after bounded close retries; no active members remained.") }
+        }
+        catch { $errors.Add("Job remained open and member verification failed: $($_.Exception.Message)") }
+    }
     $result.child_results = @($childResults)
     $result.child_cleanup_confirmed = @($childResults | Where-Object { -not $_.gone -or $_.residual }).Count -eq 0
+    $result.close_attempts = @($closeAttempts)
+    $result.close_retried = $closeAttempts.Count -gt 1
     $result.errors = @($errors)
     $result.success = $Assigned -and $result.closed -and $coreCleanup.success -and $result.child_cleanup_confirmed -and $errors.Count -eq 0
     return [PSCustomObject]$result
+}
+
+function Close-HarnessJobWithBoundedFallback {
+    param(
+        [Parameter(Mandatory = $true)]$Job,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [int]$WaitMilliseconds = 5000
+    )
+    $attempts = [System.Collections.Generic.List[object]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
+    for ($attempt = 1; $attempt -le 3 -and -not $Job.IsClosed; $attempt++) {
+        try {
+            $close = $Job.TryClose()
+            $attempts.Add([PSCustomObject]@{ attempt = $close.Attempt; success = [bool]$close.Success; handle_retained = [bool]$close.HandleRetained; error = $close.Error })
+        }
+        catch { $attempts.Add([PSCustomObject]@{ attempt = $attempt; success = $false; handle_retained = $true; error = $_.Exception.Message }) }
+    }
+
+    if (-not $Job.IsClosed) {
+        try {
+            foreach ($memberIDValue in @($Job.ActiveProcessIds())) {
+                $memberID = [int][uint32]$memberIDValue
+                if ($memberID -eq $PID) { throw "$Label fallback encountered its own PID in the Job." }
+                $member = Get-Process -Id $memberID -ErrorAction SilentlyContinue
+                if ($null -eq $member) { continue }
+                $startTicks = [long]$member.StartTime.ToUniversalTime().Ticks
+                $cleanup = Stop-VerifiedHarnessProcess $member $memberID $startTicks -WaitMilliseconds $WaitMilliseconds
+                if (-not $cleanup.success) { $errors.Add("$Label member PID $memberID cleanup failed: $($cleanup.errors -join '; ')") }
+            }
+        }
+        catch { $errors.Add("$Label member fallback failed: $($_.Exception.Message)") }
+        try {
+            $close = $Job.TryClose()
+            $attempts.Add([PSCustomObject]@{ attempt = $close.Attempt; success = [bool]$close.Success; handle_retained = [bool]$close.HandleRetained; error = $close.Error; after_member_cleanup = $true })
+        }
+        catch { $attempts.Add([PSCustomObject]@{ success = $false; handle_retained = $true; error = $_.Exception.Message; after_member_cleanup = $true }) }
+    }
+
+    $remaining = @()
+    if (-not $Job.IsClosed) {
+        try { $remaining = @($Job.ActiveProcessIds()) }
+        catch { $errors.Add("$Label residual member query failed: $($_.Exception.Message)") }
+        $errors.Add("$Label Job handle remained open after bounded retries; active_members=$($remaining.Count)")
+    }
+    $result = [PSCustomObject]@{
+        closed = [bool]$Job.IsClosed
+        attempts = @($attempts)
+        active_members = $remaining.Count
+        success = [bool]$Job.IsClosed -and $remaining.Count -eq 0 -and $errors.Count -eq 0
+        errors = @($errors)
+    }
+    if (-not $result.success) { throw "$Label bounded Job fallback failed: $($result | ConvertTo-Json -Depth 5 -Compress)" }
+    return $result
 }
 
 function ConvertTo-SafeHealthEvidence {
@@ -994,8 +1329,12 @@ function Invoke-HarnessJobProcessFixture {
     try {
         $powerShellPath = (Get-Process -Id $PID).Path
         $job = [TachyonHarness.KillOnCloseJob]::Create()
-        $process = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', $Command))
-        $startTicks = [long]$process.StartTime.ToUniversalTime().Ticks
+        $startResult = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', $Command))
+        if (-not $startResult.Success) {
+            throw "$Label fixture process failed to start safely: $($startResult | ConvertTo-Json -Depth 4 -Compress)"
+        }
+        $process = $startResult.Process
+        $startTicks = [long]$startResult.StartTicksUtc
         if (@($job.ActiveProcessIds()) -notcontains [uint64]$process.Id) { throw "$Label fixture process was not assigned to the Job." }
         $cleanup = Close-HarnessJobAndVerifyCleanup $job $process $process.Id $startTicks $true
         if (-not $cleanup.success -or -not $cleanup.assigned -or -not $cleanup.closed -or
@@ -1006,8 +1345,7 @@ function Invoke-HarnessJobProcessFixture {
     }
     finally {
         if ($null -ne $job -and -not $job.IsClosed) {
-            $job.Dispose()
-            if (-not $job.IsClosed) { throw "$Label fixture fallback did not close the Job." }
+            [void](Close-HarnessJobWithBoundedFallback $job "$Label fixture")
         }
         if ($null -ne $process -and $startTicks -ne 0) {
             $fallback = Stop-VerifiedHarnessProcess $process $process.Id $startTicks
@@ -1033,8 +1371,12 @@ function Invoke-FastParentJobCleanupFixture {
         $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($parentScript))
 
         $job = [TachyonHarness.KillOnCloseJob]::Create()
-        $parent = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand))
-        $parentStartTicks = [long]$parent.StartTime.ToUniversalTime().Ticks
+        $parentStartResult = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand))
+        if (-not $parentStartResult.Success) {
+            throw "Fast-parent fixture process failed to start safely: $($parentStartResult | ConvertTo-Json -Depth 4 -Compress)"
+        }
+        $parent = $parentStartResult.Process
+        $parentStartTicks = [long]$parentStartResult.StartTicksUtc
         $parentWaitCompleted = [bool]$parent.WaitForExit(5000)
         if (-not $parentWaitCompleted -or -not $parent.HasExited) { throw "Fast-parent fixture parent did not exit within the bounded wait." }
 
@@ -1061,8 +1403,7 @@ function Invoke-FastParentJobCleanupFixture {
     }
     finally {
         if ($null -ne $job -and -not $job.IsClosed) {
-            $job.Dispose()
-            if (-not $job.IsClosed) { throw "Fast-parent fixture fallback did not close the Job." }
+            [void](Close-HarnessJobWithBoundedFallback $job 'Fast-parent fixture')
         }
         foreach ($entry in @(
             @{ Label = 'child'; Process = $child; StartTicks = $childStartTicks },
@@ -1075,6 +1416,163 @@ function Invoke-FastParentJobCleanupFixture {
         if (Test-Path -LiteralPath $directory) {
             Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction Stop
             if (Test-Path -LiteralPath $directory) { throw "Fast-parent fixture left its temporary directory behind." }
+        }
+    }
+}
+
+function Invoke-HarnessJobFaultInjectionTests {
+    $powerShellPath = (Get-Process -Id $PID).Path
+    $failedStartEvidence = [System.Collections.Generic.List[object]]::new()
+    foreach ($fixture in @(
+        @{ Label = 'assign'; AssignFailures = 1; TerminateFailures = 0; ResumeFailures = 0; ExpectAssigned = $false; ExpectIndependentFallback = $false },
+        @{ Label = 'terminate'; AssignFailures = 1; TerminateFailures = 1; ResumeFailures = 0; ExpectAssigned = $false; ExpectIndependentFallback = $true },
+        @{ Label = 'resume'; AssignFailures = 0; TerminateFailures = 0; ResumeFailures = 1; ExpectAssigned = $true; ExpectIndependentFallback = $false }
+    )) {
+        $job = $null
+        $start = $null
+        try {
+            $job = [TachyonHarness.KillOnCloseJob]::CreateWithFaults($fixture.AssignFailures, $fixture.TerminateFailures, 0, $fixture.ResumeFailures)
+            $start = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
+            if ($start.Success -or -not $start.Created -or ([bool]$start.Assigned -ne [bool]$fixture.ExpectAssigned) -or $start.Resumed -or
+                -not $start.TerminationAttempted -or -not $start.CleanupConfirmed -or $start.PidResidual) {
+                throw "$($fixture.Label) failure fixture did not return a safe failed-start result: $($start | ConvertTo-Json -Depth 4 -Compress)"
+            }
+            if ([bool]$start.IndependentFallbackAttempted -ne [bool]$fixture.ExpectIndependentFallback) {
+                throw "$($fixture.Label) failure fixture used an unexpected independent fallback path."
+            }
+            if ($fixture.ExpectIndependentFallback -and -not $start.IndependentFallbackSucceeded) {
+                throw "TerminateProcess failure fixture did not complete the independent fallback."
+            }
+            $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
+            if (-not $gone.gone -or $gone.residual) { throw "$($fixture.Label) failure fixture left its suspended process behind." }
+            $failedStartEvidence.Add([PSCustomObject]@{
+                label = $fixture.Label
+                created = [bool]$start.Created
+                assigned = [bool]$start.Assigned
+                termination_succeeded = [bool]$start.TerminationSucceeded
+                independent_fallback_attempted = [bool]$start.IndependentFallbackAttempted
+                independent_fallback_succeeded = [bool]$start.IndependentFallbackSucceeded
+                cleanup_confirmed = [bool]$start.CleanupConfirmed
+                pid_residual = [bool]$start.PidResidual
+            })
+        }
+        finally {
+            if ($null -ne $job -and -not $job.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $job "$($fixture.Label) failure fixture") }
+            if ($null -ne $start -and $start.Created -and $start.StartTicksUtc -ne 0) {
+                $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 100
+                if (-not $gone.gone -or $gone.residual) {
+                    $resident = Get-Process -Id $start.ProcessId -ErrorAction SilentlyContinue
+                    if ($null -ne $resident) {
+                        $fallback = Stop-VerifiedHarnessProcess $resident $start.ProcessId $start.StartTicksUtc
+                        if (-not $fallback.success) { throw "$($fixture.Label) test fallback did not prove process exit: $($fallback.errors -join '; ')" }
+                    }
+                }
+                $finalGone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
+                if (-not $finalGone.gone -or $finalGone.residual) { throw "$($fixture.Label) test fallback left a residual process." }
+            }
+        }
+    }
+
+    $closeJob = $null
+    $closeProcess = $null
+    $closeStartTicks = [long]0
+    $retryEvidence = $null
+    try {
+        $closeJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(0, 0, 1, 0)
+        $closeStart = $closeJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
+        if (-not $closeStart.Success) { throw "CloseHandle retry fixture could not start: $($closeStart | ConvertTo-Json -Depth 4 -Compress)" }
+        $closeProcess = $closeStart.Process
+        $closeStartTicks = [long]$closeStart.StartTicksUtc
+        $firstClose = $closeJob.TryClose()
+        if ($firstClose.Success -or -not $firstClose.HandleRetained -or $closeJob.IsClosed -or $closeProcess.HasExited) {
+            throw "Injected CloseHandle failure did not retain the live Job and process."
+        }
+        $secondClose = $closeJob.TryClose()
+        if (-not $secondClose.Success -or $secondClose.AlreadyClosed -or -not $closeJob.IsClosed) {
+            throw "Retried CloseHandle did not close the retained Job handle."
+        }
+        $idempotentClose = $closeJob.TryClose()
+        if (-not $idempotentClose.Success -or -not $idempotentClose.AlreadyClosed) { throw "Closed Job state was not idempotent." }
+        $gone = Wait-HarnessProcessIdentityGone $closeProcess.Id $closeStartTicks 5000
+        if (-not $gone.gone -or $gone.residual) { throw "Retried Job close left its member process behind." }
+        $retryEvidence = [PSCustomObject]@{
+            first_success = [bool]$firstClose.Success
+            first_handle_retained = [bool]$firstClose.HandleRetained
+            second_success = [bool]$secondClose.Success
+            idempotent_success = [bool]$idempotentClose.Success
+            member_cleanup_confirmed = [bool]$gone.gone -and -not [bool]$gone.residual
+        }
+    }
+    finally {
+        if ($null -ne $closeJob -and -not $closeJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $closeJob 'CloseHandle retry fixture') }
+        if ($null -ne $closeProcess -and $closeStartTicks -ne 0) {
+            $fallback = Stop-VerifiedHarnessProcess $closeProcess $closeProcess.Id $closeStartTicks
+            if (-not $fallback.success) { throw "CloseHandle retry fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
+        }
+    }
+
+    $persistentJob = $null
+    $persistentProcess = $null
+    $persistentStartTicks = [long]0
+    $persistentChild = $null
+    $persistentChildStartTicks = [long]0
+    $persistentDirectory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-close-fault-$([guid]::NewGuid().ToString('N'))"
+    $persistentChildPIDPath = Join-Path $persistentDirectory 'child.pid'
+    $primaryFailureEvidence = $null
+    try {
+        [void][IO.Directory]::CreateDirectory($persistentDirectory)
+        $escapedPowerShellPath = $powerShellPath.Replace("'", "''")
+        $escapedChildPIDPath = $persistentChildPIDPath.Replace("'", "''")
+        $persistentScript = "`$child = Start-Process -FilePath '$escapedPowerShellPath' -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden; [IO.File]::WriteAllText('$escapedChildPIDPath', [string]`$child.Id); Start-Sleep -Seconds 30"
+        $persistentCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($persistentScript))
+        $persistentJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(0, 0, 3, 0)
+        $persistentStart = $persistentJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $persistentCommand))
+        if (-not $persistentStart.Success) { throw "Persistent CloseHandle fixture could not start safely." }
+        $persistentProcess = $persistentStart.Process
+        $persistentStartTicks = [long]$persistentStart.StartTicksUtc
+        $childDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not (Test-Path -LiteralPath $persistentChildPIDPath)) {
+            if ([DateTime]::UtcNow -ge $childDeadline) { throw "Persistent CloseHandle fixture did not publish its child PID." }
+            Start-Sleep -Milliseconds 25
+        }
+        $persistentChildPID = 0
+        if (-not [int]::TryParse([IO.File]::ReadAllText($persistentChildPIDPath).Trim(), [ref]$persistentChildPID) -or $persistentChildPID -le 0) {
+            throw "Persistent CloseHandle fixture published an invalid child PID."
+        }
+        $persistentChild = Get-Process -Id $persistentChildPID -ErrorAction Stop
+        $persistentChildStartTicks = [long]$persistentChild.StartTime.ToUniversalTime().Ticks
+        if (@($persistentJob.ActiveProcessIds()) -notcontains [uint64]$persistentChildPID) { throw "Persistent CloseHandle fixture child did not inherit the Job." }
+        $primaryFailureEvidence = Close-HarnessJobAndVerifyCleanup $persistentJob $persistentProcess $persistentProcess.Id $persistentStartTicks $true
+        if ($primaryFailureEvidence.success -or $primaryFailureEvidence.closed -or $primaryFailureEvidence.core.pid_residual -or
+            -not $primaryFailureEvidence.child_cleanup_confirmed -or $primaryFailureEvidence.child_member_count_before_close -lt 1) {
+            throw "Persistent CloseHandle fixture did not fail closed after bounded primary retries."
+        }
+    }
+    finally {
+        if ($null -ne $persistentJob -and -not $persistentJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $persistentJob 'Persistent CloseHandle fixture') }
+        foreach ($entry in @(
+            @{ Label = 'parent'; Process = $persistentProcess; StartTicks = $persistentStartTicks },
+            @{ Label = 'child'; Process = $persistentChild; StartTicks = $persistentChildStartTicks }
+        )) {
+            if ($null -eq $entry.Process -or $entry.StartTicks -eq 0) { continue }
+            $fallback = Stop-VerifiedHarnessProcess $entry.Process $entry.Process.Id $entry.StartTicks
+            if (-not $fallback.success) { throw "Persistent CloseHandle fixture $($entry.Label) fallback did not prove process exit: $($fallback.errors -join '; ')" }
+        }
+        if (Test-Path -LiteralPath $persistentDirectory) {
+            Remove-Item -LiteralPath $persistentDirectory -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $persistentDirectory) { throw "Persistent CloseHandle fixture left its temporary directory behind." }
+        }
+    }
+    if ($null -eq $primaryFailureEvidence -or -not $persistentJob.IsClosed) { throw "Persistent CloseHandle fixture did not complete final cleanup." }
+
+    return [PSCustomObject]@{
+        failed_starts = @($failedStartEvidence)
+        close_retry = $retryEvidence
+        persistent_close_primary_failure = [PSCustomObject]@{
+            success = [bool]$primaryFailureEvidence.success
+            closed = [bool]$primaryFailureEvidence.closed
+            member_cleanup_confirmed = [bool]$primaryFailureEvidence.child_cleanup_confirmed
+            fallback_closed = [bool]$persistentJob.IsClosed
         }
     }
 }
@@ -1153,6 +1651,7 @@ function Invoke-EvidenceFailureTests {
     $normalJobCleanup = Invoke-HarnessJobProcessFixture 'Normal Core' 'Start-Sleep -Seconds 30'
     $hungJobCleanup = Invoke-HarnessJobProcessFixture 'Hung Core' 'while ($true) { Start-Sleep -Milliseconds 100 }'
     $descendantJobCleanup = Invoke-FastParentJobCleanupFixture
+    $jobFaultEvidence = Invoke-HarnessJobFaultInjectionTests
 
     $evidenceDirectory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-evidence-$([guid]::NewGuid().ToString('N'))"
     try {
@@ -1168,6 +1667,7 @@ function Invoke-EvidenceFailureTests {
             core = $escalatedResult
             job = $descendantJobCleanup
             job_fixtures = [PSCustomObject]@{ normal = $normalJobCleanup; hung = $hungJobCleanup }
+            job_faults = $jobFaultEvidence
         }
         Write-HarnessEvidence $evidenceDirectory (ConvertTo-SafeHealthEvidence $baselineHealth) (ConvertTo-SafeReadyEvidence $baselineReady) $cleanup `
             ('a' * 40) '12345' '2' 'TachyonHelperHarness-evidence' 'S-1-5-80-1-2-3-4-5'
@@ -1431,9 +1931,13 @@ if ($RunServiceSIDHarness) {
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
         $coreJob = [TachyonHarness.KillOnCloseJob]::Create()
-        $coreProcess = $coreJob.StartAssignedProcess($resolvedBinary, [string[]]@('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready))
-        $coreJobAssigned = $true
-        $coreStartTicks = [long]$coreProcess.StartTime.ToUniversalTime().Ticks
+        $coreStartResult = $coreJob.StartAssignedProcess($resolvedBinary, [string[]]@('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready))
+        $coreJobAssigned = [bool]$coreStartResult.Assigned
+        if (-not $coreStartResult.Success) {
+            throw "test Core failed to start safely: $($coreStartResult | Select-Object ProcessId,StartTicksUtc,Created,Assigned,Resumed,TerminationAttempted,TerminationSucceeded,IndependentFallbackAttempted,IndependentFallbackSucceeded,CleanupConfirmed,PidResidual,PidReused,Errors | ConvertTo-Json -Depth 4 -Compress)"
+        }
+        $coreProcess = $coreStartResult.Process
+        $coreStartTicks = [long]$coreStartResult.StartTicksUtc
         $readyDeadline = (Get-Date).AddSeconds(10)
         do {
             if ($coreProcess.HasExited) { throw "test Core exited before pipe readiness; exit_code=$($coreProcess.ExitCode)" }
@@ -1527,8 +2031,7 @@ if ($RunServiceSIDHarness) {
         else { $cleanupEvidence.core = [PSCustomObject]@{ success = $true; not_started = $true } }
         if ($null -ne $coreJob -and -not $coreJob.IsClosed) {
             try {
-                $coreJob.Dispose()
-                if (-not $coreJob.IsClosed) { throw "Core Job handle remained open." }
+                $fallbackJobClose = Close-HarnessJobWithBoundedFallback $coreJob 'test Core Job'
                 if ($null -eq $cleanupEvidence.job) {
                     $cleanupEvidence.job = [PSCustomObject]@{
                         assigned = $coreJobAssigned
@@ -1538,6 +2041,7 @@ if ($RunServiceSIDHarness) {
                         child_cleanup_confirmed = $true
                         success = $coreJobAssigned
                         fallback_close = $true
+                        close_attempts = $fallbackJobClose.attempts
                     }
                 }
             }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/tachyon-space/tachyon-core/internal/tgp"
 	"golang.org/x/sys/windows"
@@ -171,6 +172,54 @@ func TestWindowsNamedPipeDialIsSingleAttempt(t *testing.T) {
 	}
 	if time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("single dial attempt took %s", time.Since(started))
+	}
+}
+
+func TestWindowsNamedPipeServerGrantsOnlyIdentityQueryRights(t *testing.T) {
+	serviceSID := "S-1-5-80-1-2-3-4-5"
+	if err := grantNamedPipeClientIdentityQueryAccess([]string{serviceSID}); err != nil {
+		t.Fatal(err)
+	}
+	process, err := windows.OpenProcess(windows.READ_CONTROL, false, uint32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(process)
+	assertKernelObjectSIDAccess(t, process, serviceSID, namedPipeServerProcessQueryAccess)
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.READ_CONTROL, &token); err != nil {
+		t.Fatal(err)
+	}
+	defer token.Close()
+	assertKernelObjectSIDAccess(t, windows.Handle(token), serviceSID, namedPipeServerTokenQueryAccess)
+}
+
+func assertKernelObjectSIDAccess(t *testing.T, handle windows.Handle, sidText string, expected windows.ACCESS_MASK) {
+	t.Helper()
+	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_KERNEL_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil || dacl == nil {
+		t.Fatalf("read DACL: %v", err)
+	}
+	var actual windows.ACCESS_MASK
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			t.Fatal(err)
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 {
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if sid.String() == sidText {
+			actual |= ace.Mask
+		}
+	}
+	if actual != expected {
+		t.Fatalf("SID %s kernel-object access = %#x, want exact query-only %#x", sidText, actual, expected)
 	}
 }
 

@@ -66,6 +66,9 @@ func NewNamedPipeServer(registry *Registry, config NamedPipeConfig, sender Named
 	if err != nil {
 		return nil, err
 	}
+	if err := grantNamedPipeClientIdentityQueryAccess(config.AllowedSIDs); err != nil {
+		return nil, err
+	}
 	server := &windowsNamedPipeServer{
 		registry: registry, sender: sender, config: config, securityAttributes: securityAttributes,
 		allowedSIDs: allowedSIDs, minimumIntegrity: minimumIntegrity,

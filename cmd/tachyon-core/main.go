@@ -94,6 +94,7 @@ func cmdHelper(args []string) error {
 		DiagnosticOwnerSID:   cli.FlagValue(args, "--diagnostic-owner-sid", "", ""),
 		DiagnosticFile:       cli.FlagValue(args, "--diagnostic-file", "", ""),
 		DiagnosticOverride:   cli.FlagPresent(args, "--diagnostic-test-override"),
+		TestReadyFile:        cli.FlagValue(args, "--ready-file", "", ""),
 		OperationTimeout:     10 * time.Second,
 		ReconnectMin:         100 * time.Millisecond,
 		ReconnectMax:         5 * time.Second,

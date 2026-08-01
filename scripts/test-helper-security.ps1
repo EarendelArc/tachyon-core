@@ -56,6 +56,24 @@ function Assert-HarnessDiagnosticPath {
     return $full
 }
 
+function Assert-HarnessReadyPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$ProgramDataPath = $env:ProgramData
+    )
+    $root = [IO.Path]::GetFullPath((Get-HarnessRoot $ProgramDataPath)).TrimEnd([char]'\', [char]'/')
+    $full = [IO.Path]::GetFullPath($Path)
+    $prefix = $root + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Ready path escapes the protected harness root."
+    }
+    $parts = $full.Substring($prefix.Length) -split '[\\/]'
+    if ($parts.Count -ne 2 -or $parts[0] -notmatch '^[0-9a-fA-F]{32}$' -or -not [string]::Equals($parts[1], 'core-ready.json', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Ready path must be Harness\\<GUID>\\core-ready.json."
+    }
+    return $full
+}
+
 function Resolve-ServiceSID {
     param(
         [Parameter(Mandatory = $true)][string]$ScPath,
@@ -77,7 +95,8 @@ function Resolve-VerifiedHarnessPath {
     $root = [IO.Path]::GetFullPath((Get-HarnessRoot $programDataFull))
     $directory = [IO.Path]::GetFullPath((Join-Path $root $HarnessID))
     $diagnostic = Assert-HarnessDiagnosticPath (Join-Path $directory 'helper-health.json') $programDataFull
-    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic; ProgramData = $programDataFull }
+    $ready = Assert-HarnessReadyPath (Join-Path $directory 'core-ready.json') $programDataFull
+    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic; Ready = $ready; ProgramData = $programDataFull }
 }
 
 function New-VerifiedHarnessPath {
@@ -388,7 +407,8 @@ function Write-SafeHarnessFailureDiagnostics {
                 status = $health.status; capture_provider = $health.capture_provider; pipe_connected = $health.pipe_connected
                 authenticated = $health.authenticated; lifecycle = $health.lifecycle; stop_timed_out = $health.stop_timed_out
                 provider_cleanup = $health.provider_cleanup; service_sid_present = $health.service_sid_present
-                restricted_sid_count = $health.restricted_sid_count
+                restricted_sid_count = $health.restricted_sid_count; stage = $health.stage; attempt = $health.attempt
+                reconnects = $health.reconnects; last_error = $health.last_error
             }
             Write-Host ("safe helper diagnostic: " + ($safe | ConvertTo-Json -Compress))
         }
@@ -412,7 +432,9 @@ function Invoke-HarnessPathSecurityTests {
     $programData = Join-Path ([IO.Path]::GetTempPath()) "tachyon-harness-path-$([guid]::NewGuid().ToString('N'))"
     try {
         $valid = Join-Path $programData "Tachyon\Harness\0123456789abcdef0123456789abcdef\helper-health.json"
+        $validReady = Join-Path $programData "Tachyon\Harness\0123456789abcdef0123456789abcdef\core-ready.json"
         if ((Assert-HarnessDiagnosticPath $valid $programData) -ne [IO.Path]::GetFullPath($valid)) { throw "Valid harness path was not canonicalized." }
+        if ((Assert-HarnessReadyPath $validReady $programData) -ne [IO.Path]::GetFullPath($validReady)) { throw "Valid ready path was not canonicalized." }
         foreach ($invalid in @(
             (Join-Path $programData "Tachyon\Harness\bad\helper-health.json"),
             (Join-Path $programData "Tachyon\Harness\0123456789abcdef0123456789abcdef\other.json"),
@@ -423,8 +445,18 @@ function Invoke-HarnessPathSecurityTests {
             try { [void](Assert-HarnessDiagnosticPath $invalid $programData) } catch { $accepted = $false }
             if ($accepted) { throw "Unsafe harness path was accepted: $invalid" }
         }
+        foreach ($invalidReady in @(
+            (Join-Path $programData "Tachyon\Harness\bad\core-ready.json"),
+            (Join-Path $programData "Tachyon\Harness\0123456789abcdef0123456789abcdef\other.json"),
+            (Join-Path $programData "Tachyon\Harness\0123456789abcdef0123456789abcdef\..\core-ready.json"),
+            (Join-Path $programData "outside-ready.json")
+        )) {
+            $accepted = $true
+            try { [void](Assert-HarnessReadyPath $invalidReady $programData) } catch { $accepted = $false }
+            if ($accepted) { throw "Unsafe ready path was accepted: $invalidReady" }
+        }
         $created = New-VerifiedHarnessPath '0123456789abcdef0123456789abcdef' $programData
-        if (-not (Test-Path -LiteralPath $created.Directory) -or $created.Diagnostic -ne $valid) {
+        if (-not (Test-Path -LiteralPath $created.Directory) -or $created.Diagnostic -ne $valid -or $created.Ready -ne $validReady) {
             throw "Verified harness directory was not created at the expected canonical path."
         }
         Assert-NoReparsePointPath $created.Directory
@@ -595,8 +627,23 @@ if ($RunServiceSIDHarness) {
         $image = "$quotedBinary helper --service --service-name $name --service-sid $serviceSID --diagnostic-owner-sid $($diagnosticOwnerSID.Value) --pipe $corePipe --server-sid $serverSID --core-binary $quotedTrustedBinary --core-sha256 $trustedHash --diagnostic-file $($harness.Diagnostic) --diagnostic-test-override"
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
-        $coreProcess = Start-Process -FilePath $resolvedBinary -ArgumentList @('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID) -PassThru -WindowStyle Hidden
-        Start-Sleep -Milliseconds 300
+        $coreProcess = Start-Process -FilePath $resolvedBinary -ArgumentList @('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready) -PassThru -WindowStyle Hidden
+        $readyDeadline = (Get-Date).AddSeconds(10)
+        do {
+            if ($coreProcess.HasExited) { throw "test Core exited before pipe readiness; exit_code=$($coreProcess.ExitCode)" }
+            if (Test-Path -LiteralPath $harness.Ready) {
+                try { $ready = Get-Content -LiteralPath $harness.Ready -Raw | ConvertFrom-Json }
+                catch { $ready = $null }
+                if ($null -ne $ready) {
+                    if ($ready.stage -ne 'listening' -or [int]$ready.pid -ne $coreProcess.Id -or $ready.pipe -ne $corePipe) {
+                        throw "test Core ready identity does not match the launched listener"
+                    }
+                    break
+                }
+            }
+            if ((Get-Date) -gt $readyDeadline) { throw "test Core did not publish pipe listener readiness" }
+            Start-Sleep -Milliseconds 50
+        } while ($true)
         & $scPath start $name | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service start failed with exit code $LASTEXITCODE" }
         $deadline = (Get-Date).AddSeconds(10)
@@ -605,9 +652,12 @@ if ($RunServiceSIDHarness) {
             Start-Sleep -Milliseconds 100
         }
         do {
+            if ($coreProcess.HasExited) { throw "test Core exited during helper authentication; exit_code=$($coreProcess.ExitCode)" }
             $health = Get-Content -LiteralPath $harness.Diagnostic -Raw | ConvertFrom-Json
             if ($health.pipe_connected -and $health.authenticated) { break }
-            if ((Get-Date) -gt $deadline) { throw "helper did not complete Core pipe authentication" }
+            if ((Get-Date) -gt $deadline) {
+                throw "helper did not complete Core pipe authentication; stage=$($health.stage) attempt=$($health.attempt) reconnects=$($health.reconnects) last_error=$($health.last_error)"
+            }
             Start-Sleep -Milliseconds 100
         } while ($true)
         if ($health.status -ne "not_ready") { throw "helper unexpectedly reported status '$($health.status)'" }
@@ -650,6 +700,10 @@ if ($RunServiceSIDHarness) {
             if (Test-Path -LiteralPath $harnessPath.Diagnostic) { $cleanupFailures.Add("diagnostic '$($harnessPath.Diagnostic)' still exists after cleanup") }
         }
         catch { $cleanupFailures.Add("diagnostic residual check failed: $($_.Exception.Message)") }
+        try {
+            if (Test-Path -LiteralPath $harnessPath.Ready) { $cleanupFailures.Add("ready file '$($harnessPath.Ready)' still exists after cleanup") }
+        }
+        catch { $cleanupFailures.Add("ready-file residual check failed: $($_.Exception.Message)") }
         try {
             if (Test-Path -LiteralPath $harnessPath.Directory) { $cleanupFailures.Add("directory '$($harnessPath.Directory)' still exists after cleanup") }
         }

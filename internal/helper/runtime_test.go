@@ -3,6 +3,7 @@ package helper
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -182,6 +183,7 @@ func TestRuntimeProviderStopHasOneOwnerAndFailsClosedAtDeadline(t *testing.T) {
 type blockingTestClient struct {
 	mu     sync.Mutex
 	closed chan struct{}
+	health capturedudp.NamedPipeClientHealth
 }
 
 func (client *blockingTestClient) Run(ctx context.Context) error {
@@ -214,7 +216,9 @@ func (client *blockingTestClient) Close() error {
 }
 
 func (client *blockingTestClient) Health() capturedudp.NamedPipeClientHealth {
-	return capturedudp.NamedPipeClientHealth{}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.health
 }
 func (client *blockingTestClient) Ping(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("not used")
@@ -239,4 +243,21 @@ func (client *blockingTestClient) SendDatagram(context.Context, capturedudp.Data
 }
 func (client *blockingTestClient) CloseFlow(context.Context, uint64, capturedudp.FlowID, capturedudp.LeaseNonce) error {
 	return errors.New("not used")
+}
+
+func TestRuntimeHealthIncludesPipeFailureDiagnostics(t *testing.T) {
+	runtime := &Runtime{
+		provider: NewUnavailableCaptureProvider(),
+		client: &blockingTestClient{health: capturedudp.NamedPipeClientHealth{
+			Stage: "connect_failed", Attempt: 4, Reconnects: 4,
+			LastError: "captured UDP named pipe peer identity rejected: open server process: access denied",
+		}},
+	}
+	health := runtime.Health()
+	if health.Stage != "connect_failed" || health.Attempt != 4 || health.Reconnects != 4 {
+		t.Fatalf("structured pipe health was not propagated: %+v", health)
+	}
+	if !strings.Contains(health.LastError, "open server process") {
+		t.Fatalf("pipe failure detail was lost: %+v", health)
+	}
 }

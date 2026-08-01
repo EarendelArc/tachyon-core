@@ -123,6 +123,7 @@ func Usage() string {
 		"    --service       Run under Windows SCM\n" +
 		"    --test-server   Test-only Core Named Pipe server; never production\n" +
 		"    --allow-sid     Test-only Named Pipe SID allowlist\n" +
+		"    --ready-file    Test-only Core listener readiness file\n" +
 		"    --pipe/-p       Named Pipe v2 name\n" +
 		"    --server-sid    Allowlisted Core server token SID (required)\n" +
 		"    --core-binary   Trusted Core binary path (default: current binary)\n" +

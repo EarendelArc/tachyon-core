@@ -37,6 +37,10 @@ func validateDiagnosticPath(path string, override bool) error {
 }
 
 func isHarnessDiagnosticPath(path string) bool {
+	return isHarnessArtifactPath(path, "helper-health.json")
+}
+
+func isHarnessArtifactPath(path, filename string) bool {
 	programData := os.Getenv("ProgramData")
 	if programData == "" {
 		programData = `C:\ProgramData`
@@ -47,7 +51,7 @@ func isHarnessDiagnosticPath(path string) bool {
 		return false
 	}
 	parts := strings.FieldsFunc(relative, func(r rune) bool { return r == '\\' || r == '/' })
-	return len(parts) == 2 && isHarnessGUID(parts[0]) && strings.EqualFold(parts[1], "helper-health.json")
+	return len(parts) == 2 && isHarnessGUID(parts[0]) && strings.EqualFold(parts[1], filename)
 }
 
 func isHarnessGUID(value string) bool {

@@ -34,6 +34,7 @@ type Config struct {
 	DiagnosticOwnerSID        string
 	DiagnosticFile            string
 	DiagnosticOverride        bool
+	TestReadyFile             string
 	// FailStop is invoked only after the sole provider shutdown operation has
 	// exceeded its absolute deadline. Production Windows uses TerminateProcess;
 	// tests inject a harmless implementation.
@@ -49,6 +50,9 @@ type Health struct {
 	CaptureCapabilities CaptureCapabilities `json:"capture_capabilities"`
 	PipeConnected       bool                `json:"pipe_connected"`
 	Authenticated       bool                `json:"authenticated"`
+	Stage               string              `json:"stage"`
+	Attempt             uint64              `json:"attempt"`
+	Reconnects          uint64              `json:"reconnects"`
 	WFPContractVersion  string              `json:"wfp_contract_version"`
 	ServiceSIDPresent   bool                `json:"service_sid_present"`
 	RestrictedSIDCount  int                 `json:"restricted_sid_count"`
@@ -282,11 +286,15 @@ func (runtime *Runtime) refreshHealth() {
 	if lifecycle == "" {
 		lifecycle = "created"
 	}
+	if lifecycle != "failed" && lifecycle != "stop_timeout" {
+		lastError = pipeHealth.LastError
+	}
 	runtime.mu.Lock()
 	runtime.health = Health{
 		Status: status, Reason: reason, CaptureProvider: providerHealth.Status,
 		CaptureCapabilities: providerHealth.Capabilities, PipeConnected: pipeHealth.Connected,
-		Authenticated: pipeHealth.Authenticated, WFPContractVersion: WFPDriverContractVersion,
+		Authenticated: pipeHealth.Authenticated, Stage: pipeHealth.Stage, Attempt: pipeHealth.Attempt,
+		Reconnects: pipeHealth.Reconnects, WFPContractVersion: WFPDriverContractVersion,
 		ServiceSIDPresent: tokenSecurity.ServiceSIDPresent, RestrictedSIDCount: tokenSecurity.RestrictedSIDCount,
 		PID: os.Getpid(), UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		ProviderCleanup: runtime.health.ProviderCleanup,

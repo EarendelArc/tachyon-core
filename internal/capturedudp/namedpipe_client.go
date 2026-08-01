@@ -102,6 +102,9 @@ type NamedPipeClientHealth struct {
 	Connected       bool
 	Authenticated   bool
 	Reconnects      uint64
+	Attempt         uint64
+	Stage           string
+	LastError       string
 	BufferedBytes   int
 	PendingRequests int
 }
@@ -128,6 +131,7 @@ type namedPipeDeliveryHandler func(context.Context, NamedPipeDelivery) error
 type namedPipeClient struct {
 	config  NamedPipeClientConfig
 	onReply namedPipeDeliveryHandler
+	open    namedPipeClientOpener
 
 	mu        sync.Mutex
 	writeMu   sync.Mutex
@@ -137,6 +141,10 @@ type namedPipeClient struct {
 	pending   map[uint64]chan namedPipeClientResponse
 	nextID    uint64
 	reconnect uint64
+	attempt   uint64
+	stage     string
+	lastError string
+	pipeOpen  bool
 	running   bool
 	closed    bool
 	cancel    context.CancelFunc
@@ -146,6 +154,8 @@ type namedPipeClientConnection interface {
 	namedPipeFrameIO
 	Close() error
 }
+
+type namedPipeClientOpener func(context.Context, NamedPipeClientConfig) (namedPipeClientConnection, error)
 
 type namedPipeClientResponse struct {
 	operation namedPipeMessageType
@@ -161,7 +171,7 @@ func newNamedPipeClient(config NamedPipeClientConfig, onReply namedPipeDeliveryH
 	}
 	return &namedPipeClient{
 		config: config, onReply: onReply, pending: make(map[uint64]chan namedPipeClientResponse),
-		nextID: 1,
+		nextID: 1, open: openNamedPipeClient, stage: "idle",
 	}, nil
 }
 
@@ -184,6 +194,8 @@ func (client *namedPipeClient) Run(parent context.Context) error {
 		client.mu.Lock()
 		client.running = false
 		client.cancel = nil
+		client.pipeOpen = false
+		client.stage = "stopped"
 		client.detachLocked(ErrNamedPipeNotReady)
 		client.mu.Unlock()
 	}()
@@ -193,8 +205,17 @@ func (client *namedPipeClient) Run(parent context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		connection, err := openNamedPipeClient(ctx, client.config)
+		client.mu.Lock()
+		client.attempt++
+		client.stage = "connecting"
+		client.lastError = ""
+		client.mu.Unlock()
+		connection, err := client.open(ctx, client.config)
 		if err == nil {
+			client.mu.Lock()
+			client.pipeOpen = true
+			client.stage = "awaiting_hello"
+			client.mu.Unlock()
 			err = client.runConnection(ctx, connection)
 			_ = connection.Close()
 		}
@@ -202,17 +223,23 @@ func (client *namedPipeClient) Run(parent context.Context) error {
 			return nil
 		}
 		client.mu.Lock()
+		client.pipeOpen = false
 		client.detachLocked(err)
 		client.reconnect++
-		client.mu.Unlock()
-		if err == nil {
-			backoff = client.config.ReconnectMin
-		} else if backoff < client.config.ReconnectMax {
-			backoff *= 2
-			if backoff > client.config.ReconnectMax {
-				backoff = client.config.ReconnectMax
+		if err != nil {
+			switch client.stage {
+			case "connecting":
+				client.stage = "connect_failed"
+			case "awaiting_hello":
+				client.stage = "hello_failed"
+			case "authenticating":
+				client.stage = "authentication_failed"
+			case "authenticated":
+				client.stage = "session_failed"
 			}
+			client.lastError = err.Error()
 		}
+		client.mu.Unlock()
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -220,7 +247,19 @@ func (client *namedPipeClient) Run(parent context.Context) error {
 			return nil
 		case <-timer.C:
 		}
+		if err == nil {
+			backoff = client.config.ReconnectMin
+		} else {
+			backoff = nextNamedPipeReconnectBackoff(backoff, client.config.ReconnectMax)
+		}
 	}
+}
+
+func nextNamedPipeReconnectBackoff(current, maximum time.Duration) time.Duration {
+	if current >= maximum || current > maximum/2 {
+		return maximum
+	}
+	return current * 2
 }
 
 func (client *namedPipeClient) runConnection(ctx context.Context, connection namedPipeClientConnection) error {
@@ -237,6 +276,9 @@ func (client *namedPipeClient) runConnection(ctx context.Context, connection nam
 	var token SessionToken
 	copy(token[:], hello.Payload)
 	clear(hello.Payload)
+	client.mu.Lock()
+	client.stage = "authenticating"
+	client.mu.Unlock()
 	client.requestMu.Lock()
 	authID := client.allocateRequestID()
 	auth := appendRequestID(nil, authID)
@@ -274,6 +316,8 @@ func (client *namedPipeClient) runConnection(ctx context.Context, connection nam
 	client.conn = connection
 	client.connected = make(chan struct{})
 	close(client.connected)
+	client.stage = "authenticated"
+	client.lastError = ""
 	client.mu.Unlock()
 	return client.readConnection(ctx, connection)
 }
@@ -478,8 +522,9 @@ func (client *namedPipeClient) Close() error {
 func (client *namedPipeClient) Health() NamedPipeClientHealth {
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	return NamedPipeClientHealth{Connected: client.conn != nil, Authenticated: client.conn != nil,
-		Reconnects: client.reconnect, PendingRequests: len(client.pending)}
+	return NamedPipeClientHealth{Connected: client.pipeOpen, Authenticated: client.conn != nil,
+		Reconnects: client.reconnect, Attempt: client.attempt, Stage: client.stage,
+		LastError: client.lastError, PendingRequests: len(client.pending)}
 }
 
 func (client *namedPipeClient) Ping(ctx context.Context, payload []byte) ([]byte, error) {

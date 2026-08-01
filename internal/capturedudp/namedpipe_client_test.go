@@ -3,10 +3,80 @@ package capturedudp
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestNamedPipeClientReportsFailedStageAndUsesBoundedBackoff(t *testing.T) {
+	clientValue, err := newNamedPipeClient(NamedPipeClientConfig{
+		Name: `\\.\pipe\Tachyon\health`, ServerSIDs: []string{"S-1-5-18"},
+		TrustedServerBinary: "trusted.exe", TrustedServerSHA256: strings.Repeat("0", 64),
+		ReconnectMin: 5 * time.Millisecond, ReconnectMax: 10 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := clientValue.(*namedPipeClient)
+	var attempts atomic.Uint64
+	var timestampsMu sync.Mutex
+	var timestamps []time.Time
+	client.open = func(context.Context, NamedPipeClientConfig) (namedPipeClientConnection, error) {
+		attempts.Add(1)
+		timestampsMu.Lock()
+		timestamps = append(timestamps, time.Now())
+		timestampsMu.Unlock()
+		return nil, errors.New("server identity query denied")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- client.Run(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		health := client.Health()
+		if health.Attempt >= 3 && health.Stage == "connect_failed" {
+			if !strings.Contains(health.LastError, "identity query denied") || health.Reconnects < 3 {
+				t.Fatalf("unexpected structured health: %+v", health)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed connection health was not observed: %+v", health)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	timestampsMu.Lock()
+	defer timestampsMu.Unlock()
+	if got := attempts.Load(); got < 3 || got > 4 {
+		t.Fatalf("dial attempts = %d, want 3..4", got)
+	}
+	for index := 1; index < len(timestamps); index++ {
+		if delay := timestamps[index].Sub(timestamps[index-1]); delay < 4*time.Millisecond {
+			t.Fatalf("retry delay %d = %s, want no busy reconnect loop", index, delay)
+		}
+	}
+}
+
+func TestNextNamedPipeReconnectBackoffIsBounded(t *testing.T) {
+	maximum := 10 * time.Millisecond
+	if got := nextNamedPipeReconnectBackoff(5*time.Millisecond, maximum); got != maximum {
+		t.Fatalf("first backoff = %s, want %s", got, maximum)
+	}
+	if got := nextNamedPipeReconnectBackoff(maximum, maximum); got != maximum {
+		t.Fatalf("bounded backoff = %s, want %s", got, maximum)
+	}
+	if got := nextNamedPipeReconnectBackoff(maximum-1, maximum); got != maximum {
+		t.Fatalf("overflow-safe backoff = %s, want %s", got, maximum)
+	}
+}
 
 type concurrentClientTransport struct {
 	client *namedPipeClient

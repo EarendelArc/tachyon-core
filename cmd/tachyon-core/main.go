@@ -85,16 +85,18 @@ func cmdHelper(args []string) error {
 	}
 	serviceName := cli.FlagValue(args, "--service-name", "", "TachyonHelper")
 	config := helper.Config{
-		PipeName:            cli.FlagValue(args, "--pipe", "-p", `\\.\pipe\Tachyon\captured-udp-v2`),
-		ServerSIDs:          []string{cli.FlagValue(args, "--server-sid", "", "")},
-		TrustedServerBinary: cli.FlagValue(args, "--core-binary", "", ""),
-		TrustedServerSHA256: cli.FlagValue(args, "--core-sha256", "", ""),
-		ServiceName:         serviceName,
-		DiagnosticFile:      cli.FlagValue(args, "--diagnostic-file", "", ""),
-		DiagnosticOverride:  cli.FlagPresent(args, "--diagnostic-test-override"),
-		OperationTimeout:    10 * time.Second,
-		ReconnectMin:        100 * time.Millisecond,
-		ReconnectMax:        5 * time.Second,
+		PipeName:             cli.FlagValue(args, "--pipe", "-p", `\\.\pipe\Tachyon\captured-udp-v2`),
+		ServerSIDs:           []string{cli.FlagValue(args, "--server-sid", "", "")},
+		TrustedServerBinary:  cli.FlagValue(args, "--core-binary", "", ""),
+		TrustedServerSHA256:  cli.FlagValue(args, "--core-sha256", "", ""),
+		ServiceName:          serviceName,
+		DiagnosticServiceSID: cli.FlagValue(args, "--service-sid", "", ""),
+		DiagnosticOwnerSID:   cli.FlagValue(args, "--diagnostic-owner-sid", "", ""),
+		DiagnosticFile:       cli.FlagValue(args, "--diagnostic-file", "", ""),
+		DiagnosticOverride:   cli.FlagPresent(args, "--diagnostic-test-override"),
+		OperationTimeout:     10 * time.Second,
+		ReconnectMin:         100 * time.Millisecond,
+		ReconnectMax:         5 * time.Second,
 	}
 	if cli.FlagPresent(args, "--service") {
 		return helper.RunService(serviceName, config)

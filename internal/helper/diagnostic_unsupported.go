@@ -23,7 +23,7 @@ type portableDiagnosticFile struct {
 	file *os.File
 }
 
-func openDiagnosticFile(path string, _ bool) (diagnosticFile, error) {
+func openDiagnosticFile(path string, _ bool, _ string, _ string) (diagnosticFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}

@@ -30,6 +30,8 @@ type Config struct {
 	ReconnectMin              time.Duration
 	ReconnectMax              time.Duration
 	ServiceName               string
+	DiagnosticServiceSID      string
+	DiagnosticOwnerSID        string
 	DiagnosticFile            string
 	DiagnosticOverride        bool
 	// FailStop is invoked only after the sole provider shutdown operation has
@@ -103,7 +105,7 @@ func NewRuntime(config Config) (*Runtime, error) {
 	if config.TrustedServerBinary == "" || config.TrustedServerSHA256 == "" {
 		return nil, errors.New("trusted Core binary path and externally pinned SHA-256 are required")
 	}
-	diagnostic, err := openDiagnosticFile(config.DiagnosticFile, config.DiagnosticOverride)
+	diagnostic, err := openDiagnosticFile(config.DiagnosticFile, config.DiagnosticOverride, config.DiagnosticServiceSID, config.DiagnosticOwnerSID)
 	if err != nil {
 		return nil, err
 	}

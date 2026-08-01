@@ -96,64 +96,83 @@ func rejectDiagnosticReparsePoints(path string) error {
 	return nil
 }
 
-func diagnosticDACL() (*windows.ACL, error) {
-	// Owner Rights keeps an explicitly requested diagnostic override testable by
-	// its owner while the production ProgramData directory remains owned by the
-	// service account. It does not grant access to unrelated users.
-	securityDescriptor, err := windows.SecurityDescriptorFromString("O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;SU)(A;;FA;;;OW)")
-	if err != nil {
-		return nil, fmt.Errorf("build diagnostic ACL: %w", err)
-	}
-	dacl, _, err := securityDescriptor.DACL()
-	if err != nil {
-		return nil, fmt.Errorf("read diagnostic ACL: %w", err)
-	}
-	return dacl, nil
+const (
+	diagnosticDirectoryAccess windows.ACCESS_MASK = windows.READ_CONTROL | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE
+	diagnosticFileAccess      windows.ACCESS_MASK = diagnosticDirectoryAccess | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+)
+
+// diagnosticSecurityError is intentionally mapped to ERROR_ACCESS_DENIED by
+// the SCM host. That gives operators a non-secret Event Log/SCM signal that
+// provisioning is missing or has been tampered with.
+type diagnosticSecurityError struct{ err error }
+
+func (err *diagnosticSecurityError) Error() string { return err.err.Error() }
+func (err *diagnosticSecurityError) Unwrap() error { return err.err }
+
+func newDiagnosticSecurityError(format string, arguments ...any) error {
+	return &diagnosticSecurityError{err: fmt.Errorf(format, arguments...)}
 }
 
-func secureDiagnosticHandle(handle windows.Handle) error {
-	dacl, err := diagnosticDACL()
+func expectedDiagnosticSecurity(serviceSID, ownerSID string, file bool) (*windows.SECURITY_DESCRIPTOR, error) {
+	if _, err := windows.StringToSid(serviceSID); err != nil {
+		return nil, newDiagnosticSecurityError("invalid diagnostic service SID: %v", err)
+	}
+	if _, err := windows.StringToSid(ownerSID); err != nil {
+		return nil, newDiagnosticSecurityError("invalid diagnostic owner SID: %v", err)
+	}
+	rights := diagnosticDirectoryAccess
+	if file {
+		rights = diagnosticFileAccess
+	}
+	// The installer owns the pre-provisioned artifact. The service receives the
+	// canonical owner SID as configuration and only verifies it; it never needs
+	// SeTakeOwnershipPrivilege or WRITE_OWNER.
+	sddl := fmt.Sprintf("O:%sD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x%X;;;LS)(A;;0x%X;;;%s)", ownerSID, uint32(rights), uint32(rights), serviceSID)
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return nil, newDiagnosticSecurityError("build expected diagnostic ACL: %v", err)
+	}
+	return descriptor, nil
+}
+
+func verifyDiagnosticHandle(handle windows.Handle, directory bool, serviceSID, ownerSID string) error {
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		return newDiagnosticSecurityError("inspect diagnostic handle: %v", err)
+	}
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return newDiagnosticSecurityError("diagnostic handle is a reparse point")
+	}
+	if directory && information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return newDiagnosticSecurityError("diagnostic parent is not a directory")
+	}
+	actual, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return newDiagnosticSecurityError("read diagnostic security descriptor: %v", err)
+	}
+	expected, err := expectedDiagnosticSecurity(serviceSID, ownerSID, !directory)
 	if err != nil {
 		return err
 	}
-	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil); err != nil {
-		return fmt.Errorf("apply diagnostic ACL: %w", err)
+	if !strings.EqualFold(actual.String(), expected.String()) {
+		return newDiagnosticSecurityError("diagnostic ACL or owner does not match pre-provisioned policy")
 	}
 	return nil
 }
 
-func verifyDiagnosticHandle(handle windows.Handle, directory bool) error {
-	var information windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
-		return fmt.Errorf("inspect diagnostic handle: %w", err)
-	}
-	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return errors.New("diagnostic handle is a reparse point")
-	}
-	if directory && information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		return errors.New("diagnostic parent is not a directory")
-	}
-	return nil
-}
-
-func openVerifiedDiagnosticDirectory(path string) (windows.Handle, error) {
+func openVerifiedDiagnosticDirectory(path, serviceSID, ownerSID string) (windows.Handle, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
-	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.WRITE_DAC,
-		0, nil, windows.OPEN_EXISTING,
+	handle, err := windows.CreateFile(name, uint32(diagnosticDirectoryAccess),
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
-		return 0, fmt.Errorf("open diagnostic directory: %w", err)
+		return 0, newDiagnosticSecurityError("open pre-provisioned diagnostic directory: %v", err)
 	}
-	if err := verifyDiagnosticHandle(handle, true); err != nil {
-		_ = windows.CloseHandle(handle)
-		return 0, err
-	}
-	if err := secureDiagnosticHandle(handle); err != nil {
+	if err := verifyDiagnosticHandle(handle, true, serviceSID, ownerSID); err != nil {
 		_ = windows.CloseHandle(handle)
 		return 0, err
 	}
@@ -165,22 +184,16 @@ type windowsDiagnosticFile struct {
 	handle windows.Handle
 }
 
-func openDiagnosticFile(path string, override bool) (diagnosticFile, error) {
+func openDiagnosticFile(path string, override bool, serviceSID, ownerSID string) (diagnosticFile, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve diagnostic path: %w", err)
 	}
 	if err := validateDiagnosticPath(absolute, override); err != nil {
-		return nil, err
+		return nil, newDiagnosticSecurityError("validate diagnostic path: %v", err)
 	}
 	parent := filepath.Dir(absolute)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return nil, fmt.Errorf("create helper diagnostic directory: %w", err)
-	}
-	if err := validateDiagnosticPath(absolute, override); err != nil {
-		return nil, err
-	}
-	directory, err := openVerifiedDiagnosticDirectory(parent)
+	directory, err := openVerifiedDiagnosticDirectory(parent, serviceSID, ownerSID)
 	if err != nil {
 		return nil, err
 	}
@@ -192,17 +205,13 @@ func openDiagnosticFile(path string, override bool) (diagnosticFile, error) {
 	// Read sharing permits an administrator-owned harness to inspect health while
 	// the service is running. Write/delete sharing remains denied, leaving one
 	// fixed, non-reparse writer handle for this helper instance.
-	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.WRITE_DAC,
-		windows.FILE_SHARE_READ, nil, windows.OPEN_ALWAYS,
+	handle, err := windows.CreateFile(name, uint32(diagnosticFileAccess),
+		windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_WRITE_THROUGH|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open fixed diagnostic file: %w", err)
+		return nil, newDiagnosticSecurityError("open pre-provisioned diagnostic file: %v", err)
 	}
-	if err := verifyDiagnosticHandle(handle, false); err != nil {
-		_ = windows.CloseHandle(handle)
-		return nil, err
-	}
-	if err := secureDiagnosticHandle(handle); err != nil {
+	if err := verifyDiagnosticHandle(handle, false, serviceSID, ownerSID); err != nil {
 		_ = windows.CloseHandle(handle)
 		return nil, err
 	}

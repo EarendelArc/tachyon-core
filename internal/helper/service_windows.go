@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
 
@@ -29,7 +30,7 @@ func (program *serviceProgram) Execute(_ []string, requests <-chan svc.ChangeReq
 	runtime, err := NewRuntime(program.config)
 	if err != nil {
 		changes <- svc.Status{State: svc.StopPending}
-		return true, 1
+		return helperServiceExitCode(err)
 	}
 	runResult := make(chan error, 1)
 	go func() { runResult <- runtime.Run(ctx) }()
@@ -40,7 +41,7 @@ func (program *serviceProgram) Execute(_ []string, requests <-chan svc.ChangeReq
 			_ = runtime.Shutdown(context.Background())
 			changes <- svc.Status{State: svc.StopPending}
 			if err != nil && !errors.Is(err, context.Canceled) {
-				return true, 1
+				return helperServiceExitCode(err)
 			}
 			return false, 0
 		case request := <-requests:
@@ -60,4 +61,12 @@ func (program *serviceProgram) Execute(_ []string, requests <-chan svc.ChangeReq
 			}
 		}
 	}
+}
+
+func helperServiceExitCode(err error) (bool, uint32) {
+	var securityErr *diagnosticSecurityError
+	if errors.As(err, &securityErr) {
+		return false, uint32(windows.ERROR_ACCESS_DENIED)
+	}
+	return true, 1
 }

@@ -26,6 +26,80 @@ function Assert-Administrator {
     }
 }
 
+function Assert-NoReparsePointPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    $current = $root
+    foreach ($part in ($full.Substring($root.Length).TrimStart('\', '/') -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $current = Join-Path $current $part
+        if ((Test-Path -LiteralPath $current) -and ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Diagnostic path contains a reparse point: $current"
+        }
+    }
+}
+
+function Resolve-ServiceSID {
+    param([Parameter(Mandatory = $true)][string]$ScPath, [Parameter(Mandatory = $true)][string]$Name)
+    $output = (& $ScPath showsid $Name | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $output -notmatch 'S-1-5-80-[0-9-]+') { throw "sc.exe showsid failed for '$Name' with exit code $LASTEXITCODE" }
+    return $Matches[0]
+}
+
+function New-ExactDiagnosticSecurity {
+    param([Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID, [switch]$File)
+    $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
+    $systemSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $administratorsSID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $security.SetAccessRuleProtection($true, $false)
+    $limited = if ($File) { [Security.AccessControl.FileSystemRights]0x120086 } else { [Security.AccessControl.FileSystemRights]0x120080 }
+    foreach ($rule in @(
+        [PSCustomObject]@{ SID = $systemSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+        [PSCustomObject]@{ SID = $administratorsSID; Rights = [Security.AccessControl.FileSystemRights]::FullControl },
+        [PSCustomObject]@{ SID = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null); Rights = $limited },
+        [PSCustomObject]@{ SID = $ServiceSID; Rights = $limited }
+    )) {
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($rule.SID, $rule.Rights, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    return $security
+}
+
+function Assert-PreprovisionedDiagnosticSecurity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
+        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
+        [switch]$File
+    )
+    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+    $actual = Get-Acl -LiteralPath $Path
+    $expected = New-ExactDiagnosticSecurity $ServiceSID -File:$File
+    $expected.SetOwner($OwnerSID)
+    $actualSDDL = $actual.GetSecurityDescriptorSddlForm($sections)
+    $expectedSDDL = $expected.GetSecurityDescriptorSddlForm($sections)
+    if (-not [string]::Equals($actualSDDL, $expectedSDDL, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Diagnostic ACL or owner does not match the pre-provisioned policy."
+    }
+}
+
+function Preprovision-DiagnosticArtifacts {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$ServiceSID, [Parameter(Mandatory = $true)][string]$OwnerSID)
+    $serviceAccountSID = [Security.Principal.NTAccount]::new('NT SERVICE', $ServiceName).Translate([Security.Principal.SecurityIdentifier])
+    if ($serviceAccountSID.Value -ne $ServiceSID) { throw "Service SID does not match NT SERVICE\\$ServiceName." }
+    $directory = Split-Path -Parent $Path
+    Assert-NoReparsePointPath $directory
+    [void][IO.Directory]::CreateDirectory($directory)
+    Assert-NoReparsePointPath $directory
+    try { [IO.File]::Open($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read).Dispose() }
+    catch { throw "Create diagnostic file failed: $($_.Exception.Message)" }
+    Assert-NoReparsePointPath $Path
+    Set-Acl -LiteralPath $Path -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID -File)
+    Set-Acl -LiteralPath $directory -AclObject (New-ExactDiagnosticSecurity $serviceAccountSID)
+    $owner = [Security.Principal.SecurityIdentifier]::new($OwnerSID)
+    Assert-PreprovisionedDiagnosticSecurity $directory $serviceAccountSID $owner
+    Assert-PreprovisionedDiagnosticSecurity $Path $serviceAccountSID $owner -File
+}
+
 Assert-Administrator
 $scPath = Join-Path $env:WINDIR "System32\sc.exe"
 if (-not (Test-Path -LiteralPath $scPath)) { throw "System32 sc.exe was not found." }
@@ -45,7 +119,7 @@ $diagnosticFull = [IO.Path]::GetFullPath($DiagnosticFile)
 $expectedDiagnosticFull = [IO.Path]::GetFullPath($expectedDiagnostic)
 if (-not [string]::Equals($diagnosticFull, $expectedDiagnosticFull, [StringComparison]::OrdinalIgnoreCase)) { throw "DiagnosticFile must use ProgramData\Tachyon\helper-health.json." }
 $quotedBinary = [char]34 + $resolvedBinary + [char]34
-$serviceArgs = "$quotedBinary helper --service --service-name $ServiceName --pipe $PipeName --server-sid $ServerSID --core-binary `"$resolvedTrustedServer`" --core-sha256 $TrustedServerSHA256 --diagnostic-file $DiagnosticFile"
+$bootstrapArgs = "$quotedBinary helper --service --service-name $ServiceName --pipe $PipeName --server-sid $ServerSID --core-binary `"$resolvedTrustedServer`" --core-sha256 $TrustedServerSHA256"
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     throw "Service '$ServiceName' already exists; uninstall it explicitly before reinstalling."
@@ -54,11 +128,17 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 if ($PSCmdlet.ShouldProcess($ServiceName, "Create restricted Tachyon helper service")) {
     $created = $false
     try {
-        & $scPath create $ServiceName binPath= $serviceArgs start= auto obj= "NT AUTHORITY\LocalService" DisplayName= "Tachyon Privileged Helper" | Out-Null
+        & $scPath create $ServiceName binPath= $bootstrapArgs start= auto obj= "NT AUTHORITY\LocalService" DisplayName= "Tachyon Privileged Helper" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed with exit code $LASTEXITCODE" }
         $created = $true
         & $scPath sidtype $ServiceName restricted | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe sidtype restricted failed with exit code $LASTEXITCODE" }
+        $serviceSID = Resolve-ServiceSID $scPath $ServiceName
+        $diagnosticOwnerSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        Preprovision-DiagnosticArtifacts $diagnosticFull $serviceSID $diagnosticOwnerSID
+        $serviceArgs = "$quotedBinary helper --service --service-name $ServiceName --service-sid $serviceSID --diagnostic-owner-sid $diagnosticOwnerSID --pipe $PipeName --server-sid $ServerSID --core-binary `"$resolvedTrustedServer`" --core-sha256 $TrustedServerSHA256 --diagnostic-file $DiagnosticFile"
+        & $scPath config $ServiceName binPath= $serviceArgs | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "sc.exe config binPath failed with exit code $LASTEXITCODE" }
         & $scPath config $ServiceName depend= RpcSs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe config depend failed with exit code $LASTEXITCODE" }
         & $scPath failure $ServiceName reset= 86400 actions= "restart/5000/restart/30000/0" | Out-Null

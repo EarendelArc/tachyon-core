@@ -26,7 +26,7 @@ type unixDiagnosticFile struct {
 	fd int
 }
 
-func openDiagnosticFile(path string, _ bool) (diagnosticFile, error) {
+func openDiagnosticFile(path string, _ bool, _ string, _ string) (diagnosticFile, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve diagnostic path: %w", err)

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package helper
 
 import (
@@ -10,11 +12,11 @@ func TestDiagnosticFileKeepsExclusiveHandleAndRewritesInPlace(t *testing.T) {
 	programData := t.TempDir()
 	t.Setenv("ProgramData", programData)
 	path := filepath.Join(programData, "Tachyon", "Harness", "0123456789abcdef0123456789abcdef", "helper-health.json")
-	diagnostic, err := openDiagnosticFile(path, true)
+	diagnostic, err := openDiagnosticFile(path, true, "S-1-5-80-1-2-3-4-5", "S-1-5-21-1-2-3-4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openDiagnosticFile(path, true); err == nil {
+	if _, err := openDiagnosticFile(path, true, "S-1-5-80-1-2-3-4-5", "S-1-5-21-1-2-3-4"); err == nil {
 		_ = diagnostic.Close()
 		t.Fatal("second diagnostic handle unexpectedly opened")
 	}

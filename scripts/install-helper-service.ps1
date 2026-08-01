@@ -46,14 +46,20 @@ function Resolve-ServiceSID {
     return $Matches[0]
 }
 
-function Get-ExactDiagnosticSDDL {
-    param(
-        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
-        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
-        [switch]$File
-    )
-    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
-    return "O:$($OwnerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x$($limitedRights.ToString('X'));;;LS)(A;;0x$($limitedRights.ToString('X'));;;$($ServiceSID.Value))"
+function Get-DiagnosticLimitedRights {
+    param([switch]$File)
+    $rights = [Security.AccessControl.FileSystemRights]::ReadPermissions -bor [Security.AccessControl.FileSystemRights]::ReadAttributes
+    if ($File) {
+        $rights = $rights -bor [Security.AccessControl.FileSystemRights]::WriteData -bor [Security.AccessControl.FileSystemRights]::AppendData
+    }
+    return [Security.AccessControl.FileSystemRights]$rights
+}
+
+function Get-DiagnosticExpectedMask {
+    param([switch]$File)
+    $localService = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($localService, (Get-DiagnosticLimitedRights -File:$File), [Security.AccessControl.AccessControlType]::Allow)
+    return [uint32]$rule.FileSystemRights
 }
 
 function New-ExactDiagnosticSecurity {
@@ -63,8 +69,17 @@ function New-ExactDiagnosticSecurity {
         [switch]$File
     )
     $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
-    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
-    $security.SetSecurityDescriptorSddlForm((Get-ExactDiagnosticSDDL $ServiceSID $OwnerSID -File:$File), $sections)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($OwnerSID)
+    $limitedRights = Get-DiagnosticLimitedRights -File:$File
+    foreach ($rule in @(
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null), $limitedRights, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new($ServiceSID, $limitedRights, [Security.AccessControl.AccessControlType]::Allow)
+    )) {
+        $security.SetAccessRule($rule)
+    }
     return $security
 }
 
@@ -80,7 +95,7 @@ function Assert-PreprovisionedDiagnosticSecurity {
         throw "Diagnostic owner or inheritance policy is not exact."
     }
     if (-not $actual.AreAccessRulesCanonical) { throw "Diagnostic ACL is not canonical." }
-    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    $limitedRights = Get-DiagnosticExpectedMask -File:$File
     $expected = @{}
     $expected['S-1-5-18'] = [uint32]0x1F01FF
     $expected['S-1-5-32-544'] = [uint32]0x1F01FF
@@ -105,7 +120,8 @@ function Assert-PreprovisionedDiagnosticSecurity {
     }
     foreach ($sid in $expected.Keys) {
         if (-not $seen.ContainsKey($sid) -or [uint32]$seen[$sid] -ne [uint32]$expected[$sid]) {
-            throw "Diagnostic ACL is missing required access for SID $sid."
+            $actualRights = if ($seen.ContainsKey($sid)) { [uint32]$seen[$sid] } else { [uint32]0 }
+            throw "Diagnostic ACL access mismatch for SID $sid; actual=0x$($actualRights.ToString('X')) expected=0x$(([uint32]$expected[$sid]).ToString('X'))."
         }
     }
 }

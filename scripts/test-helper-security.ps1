@@ -67,15 +67,27 @@ function Resolve-ServiceSID {
     return $Matches[0]
 }
 
-function New-VerifiedHarnessPath {
+function Resolve-VerifiedHarnessPath {
     param(
         [Parameter(Mandatory = $true)][string]$HarnessID,
         [string]$ProgramDataPath = $env:ProgramData
     )
     if ($HarnessID -notmatch '^[0-9a-f]{32}$') { throw "Harness GUID validation failed." }
-    $root = Get-HarnessRoot $ProgramDataPath
-    $directory = Join-Path $root $HarnessID
-    $diagnostic = Assert-HarnessDiagnosticPath (Join-Path $directory 'helper-health.json') $ProgramDataPath
+    $programDataFull = [IO.Path]::GetFullPath($ProgramDataPath)
+    $root = [IO.Path]::GetFullPath((Get-HarnessRoot $programDataFull))
+    $directory = [IO.Path]::GetFullPath((Join-Path $root $HarnessID))
+    $diagnostic = Assert-HarnessDiagnosticPath (Join-Path $directory 'helper-health.json') $programDataFull
+    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic; ProgramData = $programDataFull }
+}
+
+function New-VerifiedHarnessPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$HarnessID,
+        [string]$ProgramDataPath = $env:ProgramData
+    )
+    $harness = Resolve-VerifiedHarnessPath $HarnessID $ProgramDataPath
+    $root = Split-Path -Parent $harness.Directory
+    $directory = $harness.Directory
     foreach ($path in @((Split-Path -Parent $root), $root, $directory)) {
         # Paths are derived from ProgramData plus a validated GUID. Directory's
         # API has no wildcard expansion and is supported by Windows PowerShell 5.1.
@@ -84,7 +96,7 @@ function New-VerifiedHarnessPath {
         catch { throw "Create protected harness directory failed: $($_.Exception.Message)" }
         Assert-NoReparsePointPath $path
     }
-    return [PSCustomObject]@{ Directory = $directory; Diagnostic = $diagnostic }
+    return $harness
 }
 
 function New-ProtectedHarnessDirectory {
@@ -102,14 +114,20 @@ function New-ProtectedHarnessDirectory {
     return $harness
 }
 
-function Get-ExactDiagnosticSDDL {
-    param(
-        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$ServiceSID,
-        [Parameter(Mandatory = $true)][Security.Principal.SecurityIdentifier]$OwnerSID,
-        [switch]$File
-    )
-    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
-    return "O:$($OwnerSID.Value)D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x$($limitedRights.ToString('X'));;;LS)(A;;0x$($limitedRights.ToString('X'));;;$($ServiceSID.Value))"
+function Get-DiagnosticLimitedRights {
+    param([switch]$File)
+    $rights = [Security.AccessControl.FileSystemRights]::ReadPermissions -bor [Security.AccessControl.FileSystemRights]::ReadAttributes
+    if ($File) {
+        $rights = $rights -bor [Security.AccessControl.FileSystemRights]::WriteData -bor [Security.AccessControl.FileSystemRights]::AppendData
+    }
+    return [Security.AccessControl.FileSystemRights]$rights
+}
+
+function Get-DiagnosticExpectedMask {
+    param([switch]$File)
+    $localService = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($localService, (Get-DiagnosticLimitedRights -File:$File), [Security.AccessControl.AccessControlType]::Allow)
+    return [uint32]$rule.FileSystemRights
 }
 
 function New-ExactDiagnosticSecurity {
@@ -119,8 +137,17 @@ function New-ExactDiagnosticSecurity {
         [switch]$File
     )
     $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
-    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
-    $security.SetSecurityDescriptorSddlForm((Get-ExactDiagnosticSDDL $ServiceSID $OwnerSID -File:$File), $sections)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($OwnerSID)
+    $limitedRights = Get-DiagnosticLimitedRights -File:$File
+    foreach ($rule in @(
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalServiceSid, $null), $limitedRights, [Security.AccessControl.AccessControlType]::Allow),
+        [Security.AccessControl.FileSystemAccessRule]::new($ServiceSID, $limitedRights, [Security.AccessControl.AccessControlType]::Allow)
+    )) {
+        $security.SetAccessRule($rule)
+    }
     return $security
 }
 
@@ -136,7 +163,7 @@ function Assert-ExactDiagnosticSecurityObject {
         throw "Diagnostic owner or inheritance policy is not exact."
     }
     if (-not $acl.AreAccessRulesCanonical) { throw "Diagnostic ACL is not canonical." }
-    $limitedRights = if ($File) { [uint32]0x120086 } else { [uint32]0x120080 }
+    $limitedRights = Get-DiagnosticExpectedMask -File:$File
     $expected = @{}
     $expected['S-1-5-18'] = [uint32]0x1F01FF
     $expected['S-1-5-32-544'] = [uint32]0x1F01FF
@@ -161,7 +188,8 @@ function Assert-ExactDiagnosticSecurityObject {
     }
     foreach ($sid in $expected.Keys) {
         if (-not $actual.ContainsKey($sid) -or [uint32]$actual[$sid] -ne [uint32]$expected[$sid]) {
-            throw "Diagnostic ACL is missing required access for SID $sid."
+            $actualRights = if ($actual.ContainsKey($sid)) { [uint32]$actual[$sid] } else { [uint32]0 }
+            throw "Diagnostic ACL access mismatch for SID $sid; actual=0x$($actualRights.ToString('X')) expected=0x$(([uint32]$expected[$sid]).ToString('X'))."
         }
     }
 }
@@ -175,6 +203,65 @@ function Assert-ExactDiagnosticSecurity {
     )
     $acl = Get-Acl -LiteralPath $Path
     Assert-ExactDiagnosticSecurityObject $acl $ServiceSID $OwnerSID -File:$File
+}
+
+function Write-DiagnosticAclDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            Write-Host "$Label ACL: path does not exist"
+            return
+        }
+        $acl = Get-Acl -LiteralPath $Path
+        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+        Write-Host "$Label ACL owner=$($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) protected=$($acl.AreAccessRulesProtected) canonical=$($acl.AreAccessRulesCanonical)"
+        Write-Host "$Label ACL SDDL=$($acl.GetSecurityDescriptorSddlForm($sections))"
+        foreach ($accessRule in $acl.Access) {
+            try { $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+            catch { $sid = $accessRule.IdentityReference.Value }
+            $rights = [uint32]$accessRule.FileSystemRights
+            Write-Host "$Label ACE sid=$sid mask=0x$($rights.ToString('X')) type=$($accessRule.AccessControlType) inherited=$($accessRule.IsInherited) inheritance=$($accessRule.InheritanceFlags) propagation=$($accessRule.PropagationFlags)"
+        }
+    }
+    catch { Write-Warning "$Label ACL diagnostics failed: $($_.Exception.Message)" }
+}
+
+function Set-PrivateHarnessCleanupAccess {
+    param([Parameter(Mandatory = $true)][string]$Directory, [Parameter(Mandatory = $true)][string]$Diagnostic)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $directorySecurity = [Security.AccessControl.DirectorySecurity]::new()
+    $directorySecurity.SetAccessRuleProtection($true, $false)
+    $directorySecurity.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+    [IO.DirectoryInfo]::new($Directory).SetAccessControl($directorySecurity)
+    if (Test-Path -LiteralPath $Diagnostic) {
+        $fileSecurity = [Security.AccessControl.FileSecurity]::new()
+        $fileSecurity.SetAccessRuleProtection($true, $false)
+        $fileSecurity.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+        [IO.FileInfo]::new($Diagnostic).SetAccessControl($fileSecurity)
+    }
+}
+
+function Remove-VerifiedHarnessArtifacts {
+    param([Parameter(Mandatory = $true)][PSCustomObject]$Harness)
+    $harnessID = Split-Path -Leaf $Harness.Directory
+    $verified = Resolve-VerifiedHarnessPath $harnessID $Harness.ProgramData
+    if (-not [string]::Equals($verified.Directory, [IO.Path]::GetFullPath($Harness.Directory), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($verified.Diagnostic, [IO.Path]::GetFullPath($Harness.Diagnostic), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Harness cleanup path does not match the verified absolute path."
+    }
+    if (Test-Path -LiteralPath $verified.Directory) { Assert-NoReparsePointPath $verified.Directory }
+    if (Test-Path -LiteralPath $verified.Directory) {
+        try { Remove-Item -LiteralPath $verified.Directory -Recurse -Force -ErrorAction Stop }
+        catch {
+            Set-PrivateHarnessCleanupAccess $verified.Directory $verified.Diagnostic
+            Remove-Item -LiteralPath $verified.Directory -Recurse -Force -ErrorAction Stop
+        }
+    }
+    if (Test-Path -LiteralPath $verified.Diagnostic) { throw "Harness diagnostic '$($verified.Diagnostic)' still exists after cleanup." }
+    if (Test-Path -LiteralPath $verified.Directory) { throw "Harness directory '$($verified.Directory)' still exists after cleanup." }
 }
 
 function Set-PreprovisionedDiagnosticArtifacts {
@@ -196,8 +283,15 @@ function Set-PreprovisionedDiagnosticArtifacts {
     Set-Acl -LiteralPath $Diagnostic -AclObject $fileSecurity
     Set-Acl -LiteralPath $Directory -AclObject $directorySecurity
     if (-not $SkipPostProvisionVerification) {
-        Assert-ExactDiagnosticSecurity $Directory $ServiceSID $OwnerSID
-        Assert-ExactDiagnosticSecurity $Diagnostic $ServiceSID $OwnerSID -File
+        try {
+            Assert-ExactDiagnosticSecurity $Directory $ServiceSID $OwnerSID
+            Assert-ExactDiagnosticSecurity $Diagnostic $ServiceSID $OwnerSID -File
+        }
+        catch {
+            Write-DiagnosticAclDiagnostics 'directory' $Directory
+            Write-DiagnosticAclDiagnostics 'diagnostic' $Diagnostic
+            throw
+        }
     }
 }
 
@@ -280,15 +374,51 @@ function Invoke-HarnessPathSecurityTests {
     }
 }
 
+function Invoke-SetupFailureCleanupTest {
+    $programData = Join-Path ([IO.Path]::GetTempPath()) "tachyon-harness-setup-failure-$([guid]::NewGuid().ToString('N'))"
+    $resolved = Resolve-VerifiedHarnessPath '0123456789abcdef0123456789abcdef' $programData
+    $completedHarness = $null
+    $injectedFailureObserved = $false
+    try {
+        try {
+            $partial = New-VerifiedHarnessPath '0123456789abcdef0123456789abcdef' $programData
+            [IO.File]::WriteAllText($partial.Diagnostic, 'partial setup')
+            $serviceSID = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
+            $ownerSID = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            Set-PreprovisionedDiagnosticArtifacts $partial.Directory $partial.Diagnostic $serviceSID $ownerSID -SkipPostProvisionVerification
+            throw "injected harness setup failure"
+        }
+        catch {
+            if ($_.Exception.Message -ne 'injected harness setup failure') { throw }
+            $injectedFailureObserved = $true
+        }
+        finally {
+            Remove-VerifiedHarnessArtifacts $resolved
+        }
+        if ($null -ne $completedHarness) { throw "Setup failure test unexpectedly assigned a completed harness." }
+        if (-not $injectedFailureObserved) { throw "Setup failure test did not observe the injected failure." }
+        if ((Test-Path -LiteralPath $resolved.Directory) -or (Test-Path -LiteralPath $resolved.Diagnostic)) {
+            throw "Setup failure cleanup left harness artifacts behind."
+        }
+        Write-Host "Harness setup failure cleanup test passed."
+    }
+    finally {
+        if (Test-Path -LiteralPath $programData) {
+            Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
+        }
+    }
+}
+
 function Invoke-ProvisioningSecurityTests {
     $programData = Join-Path ([IO.Path]::GetTempPath()) "tachyon-harness-acl-$([guid]::NewGuid().ToString('N'))"
-    $provisionedDirectory = $null
+    $harness = $null
     try {
         $harness = New-VerifiedHarnessPath '0123456789abcdef0123456789abcdef' $programData
-        $provisionedDirectory = $harness.Directory
         $serviceSID = [Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
         $ownerSID = [Security.Principal.WindowsIdentity]::GetCurrent().User
         $isAdministrator = ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ((Get-DiagnosticExpectedMask) -ne [uint32]0x120080) { throw "Directory rights did not canonicalize to 0x120080." }
+        if ((Get-DiagnosticExpectedMask -File) -ne [uint32]0x120086) { throw "File rights did not canonicalize to 0x120086." }
         Set-PreprovisionedDiagnosticArtifacts $harness.Directory $harness.Diagnostic $serviceSID $ownerSID -SkipPostProvisionVerification:(-not $isAdministrator)
         if ($isAdministrator) {
             Assert-ExactDiagnosticSecurity $harness.Directory $serviceSID $ownerSID
@@ -311,26 +441,12 @@ function Invoke-ProvisioningSecurityTests {
         $unexpectedAccepted = $true
         try { Assert-ExactDiagnosticSecurityObject $unexpectedACL $serviceSID $ownerSID -File } catch { $unexpectedAccepted = $false }
         if ($unexpectedAccepted) { throw "Unexpected Users ACE was accepted by diagnostic policy." }
+        Invoke-SetupFailureCleanupTest
         if (-not $isAdministrator) { Write-Host "Provisioning ACL object policy passed; elevated CI covers persisted ACL verification and LocalService E2E." }
         Write-Host "Harness diagnostic provisioning security tests passed."
     }
     finally {
-        if ($null -ne $provisionedDirectory -and (Test-Path -LiteralPath $provisionedDirectory)) {
-            # The test deliberately removes the caller's delete right. As its
-            # owner, the caller may restore a private, temporary cleanup ACL.
-            $cleanupIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().User
-            $provisionedDiagnostic = Join-Path $provisionedDirectory 'helper-health.json'
-            $cleanupDirectory = [IO.DirectoryInfo]::new($provisionedDirectory)
-            $cleanupSecurity = [Security.AccessControl.DirectorySecurity]::new()
-            $cleanupSecurity.SetAccessRuleProtection($true, $false)
-            $cleanupSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($cleanupIdentity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
-            $cleanupDirectory.SetAccessControl($cleanupSecurity)
-            $cleanupFile = [IO.FileInfo]::new($provisionedDiagnostic)
-            $cleanupFileSecurity = [Security.AccessControl.FileSecurity]::new()
-            $cleanupFileSecurity.SetAccessRuleProtection($true, $false)
-            $cleanupFileSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($cleanupIdentity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
-            $cleanupFile.SetAccessControl($cleanupFileSecurity)
-        }
+        if ($null -ne $harness) { Remove-VerifiedHarnessArtifacts $harness }
         if (Test-Path -LiteralPath $programData) {
             Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
             if (Test-Path -LiteralPath $programData) { throw "Harness provisioning security test cleanup left a residual directory." }
@@ -363,6 +479,7 @@ if ($RunServiceSIDHarness) {
     $diagnosticOwnerSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
     $coreProcess = $null
     $harness = $null
+    $harnessPath = Resolve-VerifiedHarnessPath $harnessID
     $trustedHash = (Get-FileHash -LiteralPath $resolvedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     $quotedBinary = [char]34 + $resolvedBinary + [char]34
     $quotedTrustedBinary = [char]34 + $resolvedBinary + [char]34
@@ -375,6 +492,10 @@ if ($RunServiceSIDHarness) {
         if ($LASTEXITCODE -ne 0) { throw "temporary service SID setup failed with exit code $LASTEXITCODE" }
         $serviceSID = Resolve-ServiceSID $scPath $name
         $harness = New-ProtectedHarnessDirectory $harnessID $name $serviceSID $diagnosticOwnerSID
+        if (-not [string]::Equals($harness.Directory, $harnessPath.Directory, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($harness.Diagnostic, $harnessPath.Diagnostic, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Created harness path does not match the pre-resolved cleanup path."
+        }
         $image = "$quotedBinary helper --service --service-name $name --service-sid $serviceSID --diagnostic-owner-sid $($diagnosticOwnerSID.Value) --pipe $corePipe --server-sid $serverSID --core-binary $quotedTrustedBinary --core-sha256 $trustedHash --diagnostic-file $($harness.Diagnostic) --diagnostic-test-override"
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
@@ -402,17 +523,17 @@ if ($RunServiceSIDHarness) {
     }
     catch {
         $failure = $_
-        Write-SafeHarnessFailureDiagnostics $scPath $name $(if ($null -eq $harness) { "" } else { $harness.Diagnostic })
+        Write-DiagnosticAclDiagnostics 'directory' $harnessPath.Directory
+        Write-DiagnosticAclDiagnostics 'diagnostic' $harnessPath.Diagnostic
+        Write-SafeHarnessFailureDiagnostics $scPath $name $harnessPath.Diagnostic
     }
     finally {
         try {
             if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
                 [void](Invoke-ScDiagnostic $scPath 'stop' @('stop', $name))
                 if (-not (Wait-HarnessServiceState $name 'Stopped')) { $cleanupFailures.Add("temporary service '$name' did not stop") }
-                else {
-                    [void](Invoke-ScDiagnostic $scPath 'delete' @('delete', $name))
-                    if (-not (Wait-HarnessServiceState $name 'Deleted')) { $cleanupFailures.Add("temporary service '$name' was not deleted") }
-                }
+                [void](Invoke-ScDiagnostic $scPath 'delete' @('delete', $name))
+                if (-not (Wait-HarnessServiceState $name 'Deleted')) { $cleanupFailures.Add("temporary service '$name' was not deleted") }
             }
         }
         catch { $cleanupFailures.Add("service cleanup failed: $($_.Exception.Message)") }
@@ -423,19 +544,29 @@ if ($RunServiceSIDHarness) {
             }
             catch { $cleanupFailures.Add("test Core cleanup failed: $($_.Exception.Message)") }
         }
-        if ($null -ne $harness -and (Test-Path -LiteralPath $harness.Directory)) {
-            try {
-                Assert-NoReparsePointPath $harness.Directory
-                Remove-Item -LiteralPath $harness.Directory -Recurse -Force -ErrorAction Stop
-                if (Test-Path -LiteralPath $harness.Directory) { $cleanupFailures.Add("harness directory '$($harness.Directory)' still exists") }
-            }
-            catch { $cleanupFailures.Add("harness directory cleanup failed: $($_.Exception.Message)") }
+        try { Remove-VerifiedHarnessArtifacts $harnessPath }
+        catch { $cleanupFailures.Add("harness artifact cleanup failed: $($_.Exception.Message)") }
+        try {
+            if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $cleanupFailures.Add("temporary service '$name' still exists after cleanup") }
         }
-        if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $cleanupFailures.Add("temporary service '$name' still exists after cleanup") }
+        catch { $cleanupFailures.Add("temporary service residual check failed: $($_.Exception.Message)") }
+        try {
+            if (Test-Path -LiteralPath $harnessPath.Diagnostic) { $cleanupFailures.Add("diagnostic '$($harnessPath.Diagnostic)' still exists after cleanup") }
+        }
+        catch { $cleanupFailures.Add("diagnostic residual check failed: $($_.Exception.Message)") }
+        try {
+            if (Test-Path -LiteralPath $harnessPath.Directory) { $cleanupFailures.Add("directory '$($harnessPath.Directory)' still exists after cleanup") }
+        }
+        catch { $cleanupFailures.Add("directory residual check failed: $($_.Exception.Message)") }
+    }
+    if ($cleanupFailures.Count -gt 0) {
+        Write-SafeHarnessFailureDiagnostics $scPath $name $harnessPath.Diagnostic
+    }
+    if ($null -ne $failure -and $cleanupFailures.Count -gt 0) {
+        throw "Service SID harness failed: $($failure.Exception.Message); cleanup failed independently: $($cleanupFailures -join '; ')"
     }
     if ($null -ne $failure) { throw "Service SID harness failed: $($failure.Exception.Message)" }
     if ($cleanupFailures.Count -gt 0) {
-        Write-SafeHarnessFailureDiagnostics $scPath $name $(if ($null -eq $harness) { "" } else { $harness.Diagnostic })
         throw "Service SID harness cleanup failed: $($cleanupFailures -join '; ')"
     }
 }

@@ -82,7 +82,7 @@ jobs:
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "helper Service SID harness requires an elevated Windows runner"
           }
-          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe -RunServiceSIDHarness
+          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe -RunPathSecurityTests -RunProvisioningSecurityTests -RunServiceSIDHarness
 
       - name: Test elevated Windows route journal integration
         shell: pwsh

@@ -32,6 +32,9 @@ func TestHarnessDiagnosticPathPolicyRejectsEscapesAndUnexpectedFiles(t *testing.
 }
 
 func TestDiagnosticAccessMasksNeverRequestWriteDAC(t *testing.T) {
+	if diagnosticDirectoryAccess != windows.ACCESS_MASK(0x120080) || diagnosticFileAccess != windows.ACCESS_MASK(0x120086) {
+		t.Fatalf("diagnostic access masks do not match the installer policy: directory=%#x file=%#x", diagnosticDirectoryAccess, diagnosticFileAccess)
+	}
 	if diagnosticDirectoryAccess&windows.WRITE_DAC != 0 || diagnosticFileAccess&windows.WRITE_DAC != 0 {
 		t.Fatalf("diagnostic handles must never request WRITE_DAC: directory=%#x file=%#x", diagnosticDirectoryAccess, diagnosticFileAccess)
 	}

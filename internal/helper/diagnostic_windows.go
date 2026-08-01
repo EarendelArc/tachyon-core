@@ -212,7 +212,7 @@ func verifyDiagnosticSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR,
 	}
 	for sid, expectedMask := range expected {
 		if actual[sid] != expectedMask {
-			return newDiagnosticSecurityError("diagnostic DACL access does not match policy for SID %s", sid)
+			return newDiagnosticSecurityError("diagnostic DACL access does not match policy for SID %s: actual=%#x expected=%#x", sid, actual[sid], expectedMask)
 		}
 	}
 	return nil

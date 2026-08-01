@@ -21,6 +21,254 @@ if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
     $BinaryPath = Join-Path $scriptRoot "..\tachyon-core.exe"
 }
 
+if ($null -eq ('TachyonHarness.KillOnCloseJob' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace TachyonHarness {
+    public sealed class KillOnCloseJob : IDisposable {
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const int JobObjectBasicProcessIdList = 3;
+        private const int JobObjectExtendedLimitInformation = 9;
+        private const uint CREATE_SUSPENDED = 0x00000004;
+        private const uint CREATE_NO_WINDOW = 0x08000000;
+        private IntPtr handle;
+
+        private KillOnCloseJob(IntPtr handle) { this.handle = handle; }
+
+        public bool IsClosed { get { return Volatile.Read(ref handle) == IntPtr.Zero; } }
+        public uint LimitFlags {
+            get {
+                IntPtr job = RequireHandle();
+                int size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+                IntPtr buffer = Marshal.AllocHGlobal(size);
+                try {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size, out returned)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "QueryInformationJobObject limits failed");
+                    }
+                    return Marshal.PtrToStructure<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(buffer).BasicLimitInformation.LimitFlags;
+                }
+                finally { Marshal.FreeHGlobal(buffer); }
+            }
+        }
+
+        public static KillOnCloseJob Create() {
+            IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObjectW failed");
+            try {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                int size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+                IntPtr buffer = Marshal.AllocHGlobal(size);
+                try {
+                    Marshal.StructureToPtr(limits, buffer, false);
+                    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "SetInformationJobObject failed");
+                    }
+                }
+                finally { Marshal.FreeHGlobal(buffer); }
+                return new KillOnCloseJob(job);
+            }
+            catch {
+                CloseHandle(job);
+                throw;
+            }
+        }
+
+        public Process StartAssignedProcess(string applicationPath, string[] arguments) {
+            IntPtr job = RequireHandle();
+            string commandLine = QuoteArgument(applicationPath);
+            if (arguments != null) {
+                foreach (string argument in arguments) commandLine += " " + QuoteArgument(argument ?? String.Empty);
+            }
+            STARTUPINFO startup = new STARTUPINFO();
+            startup.cb = (uint)Marshal.SizeOf<STARTUPINFO>();
+            PROCESS_INFORMATION information;
+            StringBuilder mutableCommandLine = new StringBuilder(commandLine);
+            if (!CreateProcessW(applicationPath, mutableCommandLine, IntPtr.Zero, IntPtr.Zero, false,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, Environment.CurrentDirectory, ref startup, out information)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessW suspended failed");
+            }
+            Process managed = null;
+            bool resumed = false;
+            try {
+                if (!AssignProcessToJobObject(job, information.hProcess)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+                }
+                bool assigned;
+                if (!IsProcessInJob(information.hProcess, job, out assigned) || !assigned) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "IsProcessInJob did not confirm assignment");
+                }
+                managed = Process.GetProcessById(unchecked((int)information.dwProcessId));
+                if (ResumeThread(information.hThread) == UInt32.MaxValue) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
+                }
+                resumed = true;
+                return managed;
+            }
+            catch {
+                if (!resumed) TerminateProcess(information.hProcess, 0xe101);
+                if (managed != null) managed.Dispose();
+                throw;
+            }
+            finally {
+                CloseHandle(information.hThread);
+                CloseHandle(information.hProcess);
+            }
+        }
+
+        public ulong[] ActiveProcessIds() {
+            IntPtr job = RequireHandle();
+            const int capacity = 1024;
+            int size = 8 + (capacity * IntPtr.Size);
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try {
+                for (int index = 0; index < size; index++) Marshal.WriteByte(buffer, index, 0);
+                uint returned;
+                if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, (uint)size, out returned)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "QueryInformationJobObject failed");
+                }
+                uint count = unchecked((uint)Marshal.ReadInt32(buffer, 4));
+                if (count > capacity) throw new InvalidOperationException("Job process list exceeds harness hard limit");
+                List<ulong> processIds = new List<ulong>((int)count);
+                for (int index = 0; index < count; index++) {
+                    long value = IntPtr.Size == 8 ? Marshal.ReadInt64(buffer, 8 + (index * IntPtr.Size)) : Marshal.ReadInt32(buffer, 8 + (index * IntPtr.Size));
+                    processIds.Add(unchecked((ulong)value));
+                }
+                return processIds.ToArray();
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        public void Dispose() {
+            IntPtr job = Interlocked.Exchange(ref handle, IntPtr.Zero);
+            if (job != IntPtr.Zero && !CloseHandle(job)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CloseHandle(job) failed");
+            }
+        }
+
+        private IntPtr RequireHandle() {
+            IntPtr job = Volatile.Read(ref handle);
+            if (job == IntPtr.Zero) throw new ObjectDisposedException("KillOnCloseJob");
+            return job;
+        }
+
+        private static string QuoteArgument(string value) {
+            StringBuilder quoted = new StringBuilder();
+            quoted.Append('"');
+            int backslashes = 0;
+            foreach (char character in value) {
+                if (character == '\\') { backslashes++; continue; }
+                if (character == '"') {
+                    quoted.Append('\\', (backslashes * 2) + 1);
+                    quoted.Append('"');
+                    backslashes = 0;
+                    continue;
+                }
+                quoted.Append('\\', backslashes);
+                backslashes = 0;
+                quoted.Append(character);
+            }
+            quoted.Append('\\', backslashes * 2);
+            quoted.Append('"');
+            return quoted.ToString();
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO {
+            public uint cb;
+            public IntPtr lpReserved;
+            public IntPtr lpDesktop;
+            public IntPtr lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObjectW(IntPtr securityAttributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr job, int informationClass, IntPtr information, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(IntPtr job, int informationClass, IntPtr information, uint length, out uint returnedLength);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcessW(string applicationName, StringBuilder commandLine, IntPtr processAttributes,
+            IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory,
+            ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+    }
+}
+'@
+}
+
 function Get-HarnessRoot {
     param([string]$ProgramDataPath = $env:ProgramData)
     if ([string]::IsNullOrWhiteSpace($ProgramDataPath)) { throw "ProgramData is required for the Service SID harness." }
@@ -436,6 +684,7 @@ function Stop-VerifiedHarnessProcess {
     $result = [ordered]@{
         pid = $ExpectedProcessID
         start_ticks_utc = $ExpectedStartTicks
+        identity_source = 'process_object'
         initially_exited = $false
         process_kill_attempted = $false
         initial_wait_completed = $false
@@ -450,8 +699,28 @@ function Stop-VerifiedHarnessProcess {
     $identityVerified = $true
     try {
         if ([int]$Process.Id -ne $ExpectedProcessID) { throw "Core process object PID changed." }
-        if ([long]$Process.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) { throw "Core process object start time changed." }
         $result.initially_exited = [bool]$Process.HasExited
+        $objectStartTicks = $null
+        try {
+            if ($null -ne $Process.StartTime) { $objectStartTicks = [long]$Process.StartTime.ToUniversalTime().Ticks }
+        }
+        catch { $objectStartTicks = $null }
+        if ($null -ne $objectStartTicks) {
+            if ($objectStartTicks -ne $ExpectedStartTicks) { throw "Core process object start time changed." }
+        }
+        else {
+            $resident = & $FindProcessByID $ExpectedProcessID
+            if ($null -ne $resident) {
+                if ([long]$resident.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) { throw "Core PID was reused before identity verification." }
+                if ($result.initially_exited) { throw "Core process object exited while its original PID remains active." }
+                $result.identity_source = 'pid_start_time'
+            }
+            elseif ($result.initially_exited) {
+                # No termination authority is exercised here; launch-time identity plus PID absence proves cleanup.
+                $result.identity_source = 'captured_start_time_pid_absent'
+            }
+            else { throw "Core process start time was unavailable while the process remained active." }
+        }
     }
     catch {
         $errors.Add("Core process identity verification failed: $($_.Exception.Message)")
@@ -459,7 +728,7 @@ function Stop-VerifiedHarnessProcess {
     }
 
     if ($identityVerified -and $result.initially_exited) {
-        try { $result.initial_wait_completed = [bool](& $WaitForExit $Process 0) }
+        try { $result.initial_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
         catch { $errors.Add("Exited Core process wait confirmation failed: $($_.Exception.Message)") }
     }
     elseif ($identityVerified) {
@@ -520,6 +789,98 @@ function Stop-VerifiedHarnessProcess {
     $result.errors = @($errors)
     $waitConfirmed = $result.initial_wait_completed -or $result.tree_wait_completed
     $result.success = $identityVerified -and $waitConfirmed -and $result.final_has_exited -and -not $result.pid_residual -and $errors.Count -eq 0
+    return [PSCustomObject]$result
+}
+
+function Wait-HarnessProcessIdentityGone {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessID,
+        [Parameter(Mandatory = $true)][long]$StartTicks,
+        [int]$TimeoutMilliseconds = 5000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $candidate = Get-Process -Id $ProcessID -ErrorAction SilentlyContinue
+        if ($null -eq $candidate) {
+            return [PSCustomObject]@{ pid = $ProcessID; gone = $true; pid_reused = $false; residual = $false }
+        }
+        try {
+            if ([long]$candidate.StartTime.ToUniversalTime().Ticks -ne $StartTicks) {
+                return [PSCustomObject]@{ pid = $ProcessID; gone = $true; pid_reused = $true; residual = $false }
+            }
+        }
+        catch {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                return [PSCustomObject]@{ pid = $ProcessID; gone = $false; pid_reused = $false; residual = $true; error = $_.Exception.Message }
+            }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            return [PSCustomObject]@{ pid = $ProcessID; gone = $false; pid_reused = $false; residual = $true }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ($true)
+}
+
+function Close-HarnessJobAndVerifyCleanup {
+    param(
+        [Parameter(Mandatory = $true)]$Job,
+        [Parameter(Mandatory = $true)]$CoreProcess,
+        [Parameter(Mandatory = $true)][int]$CoreProcessID,
+        [Parameter(Mandatory = $true)][long]$CoreStartTicks,
+        [bool]$Assigned,
+        [int]$WaitMilliseconds = 5000
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $members = [System.Collections.Generic.List[object]]::new()
+    $result = [ordered]@{
+        assigned = $Assigned
+        limit_flags = 'KILL_ON_JOB_CLOSE'
+        silent_breakaway_enabled = $false
+        closed = $false
+        active_member_count_before_close = 0
+        child_member_count_before_close = 0
+        child_cleanup_confirmed = $false
+        child_results = @()
+        core = $null
+        success = $false
+        errors = @()
+    }
+    try {
+        if ([uint32]$Job.LimitFlags -ne [uint32]0x2000) { throw "Job limit flags are not exactly KILL_ON_JOB_CLOSE." }
+        foreach ($memberIDValue in @($Job.ActiveProcessIds())) {
+            if ([uint64]$memberIDValue -gt [uint32]::MaxValue) { throw "Job member PID exceeds Windows PID range." }
+            $memberID = [int][uint32]$memberIDValue
+            $member = Get-Process -Id $memberID -ErrorAction SilentlyContinue
+            if ($null -eq $member) { continue }
+            $members.Add([PSCustomObject]@{ pid = $memberID; start_ticks_utc = [long]$member.StartTime.ToUniversalTime().Ticks })
+        }
+        $result.active_member_count_before_close = $members.Count
+        $result.child_member_count_before_close = @($members | Where-Object { $_.pid -ne $CoreProcessID }).Count
+    }
+    catch { $errors.Add("Job member snapshot failed: $($_.Exception.Message)") }
+
+    try {
+        $Job.Dispose()
+        $result.closed = [bool]$Job.IsClosed
+        if (-not $result.closed) { throw "Job handle did not report closed." }
+    }
+    catch { $errors.Add("Job close failed: $($_.Exception.Message)") }
+
+    $coreCleanup = Stop-VerifiedHarnessProcess $CoreProcess $CoreProcessID $CoreStartTicks -WaitMilliseconds $WaitMilliseconds
+    $result.core = $coreCleanup
+    if (-not $coreCleanup.success) { $errors.Add("Core cleanup did not prove exit: $($coreCleanup | ConvertTo-Json -Depth 4 -Compress)") }
+
+    $childResults = [System.Collections.Generic.List[object]]::new()
+    foreach ($member in $members) {
+        if ($member.pid -eq $CoreProcessID) { continue }
+        $childResult = Wait-HarnessProcessIdentityGone $member.pid $member.start_ticks_utc $WaitMilliseconds
+        $childResults.Add($childResult)
+        if (-not $childResult.gone -or $childResult.residual) { $errors.Add("Job child PID $($member.pid) survived cleanup.") }
+    }
+    $result.child_results = @($childResults)
+    $result.child_cleanup_confirmed = @($childResults | Where-Object { -not $_.gone -or $_.residual }).Count -eq 0
+    $result.errors = @($errors)
+    $result.success = $Assigned -and $result.closed -and $coreCleanup.success -and $result.child_cleanup_confirmed -and $errors.Count -eq 0
     return [PSCustomObject]$result
 }
 
@@ -621,6 +982,103 @@ function Write-HarnessEvidence {
     [IO.File]::WriteAllText((Join-Path $absolute 'manifest.sha256'), "$manifestHash  manifest.json`n", $utf8)
 }
 
+function Invoke-HarnessJobProcessFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Command
+    )
+    $job = $null
+    $process = $null
+    $startTicks = [long]0
+    $cleanup = $null
+    try {
+        $powerShellPath = (Get-Process -Id $PID).Path
+        $job = [TachyonHarness.KillOnCloseJob]::Create()
+        $process = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', $Command))
+        $startTicks = [long]$process.StartTime.ToUniversalTime().Ticks
+        if (@($job.ActiveProcessIds()) -notcontains [uint64]$process.Id) { throw "$Label fixture process was not assigned to the Job." }
+        $cleanup = Close-HarnessJobAndVerifyCleanup $job $process $process.Id $startTicks $true
+        if (-not $cleanup.success -or -not $cleanup.assigned -or -not $cleanup.closed -or
+            $cleanup.silent_breakaway_enabled -or -not $cleanup.core.success -or -not $cleanup.child_cleanup_confirmed) {
+            throw "$Label fixture did not prove bounded Job cleanup: $($cleanup.errors -join '; ')"
+        }
+        return $cleanup
+    }
+    finally {
+        if ($null -ne $job -and -not $job.IsClosed) {
+            $job.Dispose()
+            if (-not $job.IsClosed) { throw "$Label fixture fallback did not close the Job." }
+        }
+        if ($null -ne $process -and $startTicks -ne 0) {
+            $fallback = Stop-VerifiedHarnessProcess $process $process.Id $startTicks
+            if (-not $fallback.success) { throw "$Label fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
+        }
+    }
+}
+
+function Invoke-FastParentJobCleanupFixture {
+    $directory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-job-child-$([guid]::NewGuid().ToString('N'))"
+    $childPIDPath = Join-Path $directory 'child.pid'
+    $job = $null
+    $parent = $null
+    $parentStartTicks = [long]0
+    $child = $null
+    $childStartTicks = [long]0
+    try {
+        [void][IO.Directory]::CreateDirectory($directory)
+        $powerShellPath = (Get-Process -Id $PID).Path
+        $escapedPowerShellPath = $powerShellPath.Replace("'", "''")
+        $escapedChildPIDPath = $childPIDPath.Replace("'", "''")
+        $parentScript = "`$child = Start-Process -FilePath '$escapedPowerShellPath' -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden; [IO.File]::WriteAllText('$escapedChildPIDPath', [string]`$child.Id)"
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($parentScript))
+
+        $job = [TachyonHarness.KillOnCloseJob]::Create()
+        $parent = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand))
+        $parentStartTicks = [long]$parent.StartTime.ToUniversalTime().Ticks
+        $parentWaitCompleted = [bool]$parent.WaitForExit(5000)
+        if (-not $parentWaitCompleted -or -not $parent.HasExited) { throw "Fast-parent fixture parent did not exit within the bounded wait." }
+
+        $childDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not (Test-Path -LiteralPath $childPIDPath)) {
+            if ([DateTime]::UtcNow -ge $childDeadline) { throw "Fast-parent fixture did not publish the child PID." }
+            Start-Sleep -Milliseconds 25
+        }
+        $childPIDText = [IO.File]::ReadAllText($childPIDPath).Trim()
+        $childPID = 0
+        if (-not [int]::TryParse($childPIDText, [ref]$childPID) -or $childPID -le 0) { throw "Fast-parent fixture published an invalid child PID." }
+        $child = Get-Process -Id $childPID -ErrorAction Stop
+        $childStartTicks = [long]$child.StartTime.ToUniversalTime().Ticks
+        if (@($job.ActiveProcessIds()) -notcontains [uint64]$childPID) { throw "Fast-parent fixture child did not inherit the Job." }
+
+        $cleanup = Close-HarnessJobAndVerifyCleanup $job $parent $parent.Id $parentStartTicks $true
+        if (-not $cleanup.success -or -not $cleanup.closed -or $cleanup.child_member_count_before_close -lt 1 -or
+            -not $cleanup.child_cleanup_confirmed) {
+            throw "Fast-parent fixture did not prove descendant cleanup: $($cleanup.errors -join '; ')"
+        }
+        $childGone = Wait-HarnessProcessIdentityGone $childPID $childStartTicks 5000
+        if (-not $childGone.gone -or $childGone.residual) { throw "Fast-parent fixture left the long-running child behind." }
+        return $cleanup
+    }
+    finally {
+        if ($null -ne $job -and -not $job.IsClosed) {
+            $job.Dispose()
+            if (-not $job.IsClosed) { throw "Fast-parent fixture fallback did not close the Job." }
+        }
+        foreach ($entry in @(
+            @{ Label = 'child'; Process = $child; StartTicks = $childStartTicks },
+            @{ Label = 'parent'; Process = $parent; StartTicks = $parentStartTicks }
+        )) {
+            if ($null -eq $entry.Process -or $entry.StartTicks -eq 0) { continue }
+            $fallback = Stop-VerifiedHarnessProcess $entry.Process $entry.Process.Id $entry.StartTicks
+            if (-not $fallback.success) { throw "Fast-parent fixture $($entry.Label) fallback did not prove exit: $($fallback.errors -join '; ')" }
+        }
+        if (Test-Path -LiteralPath $directory) {
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $directory) { throw "Fast-parent fixture left its temporary directory behind." }
+        }
+    }
+}
+
 function Invoke-EvidenceFailureTests {
     $baselineHealth = [PSCustomObject]@{
         status = 'not_ready'; capture_provider = 'not_ready'; pipe_connected = $true; authenticated = $true
@@ -675,6 +1133,7 @@ function Invoke-EvidenceFailureTests {
     if ($mismatchResult.success -or $mismatchKillCalls.Value -ne 0) { throw "Mismatched Core identity fixture was killed or accepted." }
 
     $testProcess = $null
+    $testStartTicks = [long]0
     try {
         $powerShellPath = (Get-Process -Id $PID).Path
         $testProcess = Start-Process -FilePath $powerShellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden
@@ -685,13 +1144,15 @@ function Invoke-EvidenceFailureTests {
         }
     }
     finally {
-        if ($null -ne $testProcess) {
-            try {
-                if (-not $testProcess.HasExited) { $testProcess.Kill($true); [void]$testProcess.WaitForExit(5000) }
-            }
-            catch { throw "Real console cleanup test left a process that could not be terminated: $($_.Exception.Message)" }
+        if ($null -ne $testProcess -and $testStartTicks -ne 0) {
+            $fallbackCleanup = Stop-VerifiedHarnessProcess $testProcess $testProcess.Id $testStartTicks
+            if (-not $fallbackCleanup.success) { throw "Real console cleanup test fallback did not prove exit: $($fallbackCleanup.errors -join '; ')" }
         }
     }
+
+    $normalJobCleanup = Invoke-HarnessJobProcessFixture 'Normal Core' 'Start-Sleep -Seconds 30'
+    $hungJobCleanup = Invoke-HarnessJobProcessFixture 'Hung Core' 'while ($true) { Start-Sleep -Milliseconds 100 }'
+    $descendantJobCleanup = Invoke-FastParentJobCleanupFixture
 
     $evidenceDirectory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-evidence-$([guid]::NewGuid().ToString('N'))"
     try {
@@ -701,7 +1162,13 @@ function Invoke-EvidenceFailureTests {
         if ($sanitizedSecretHealth.last_error -match 'do-not-publish' -or $sanitizedSecretHealth.last_error -match ('b' * 64)) {
             throw "Health evidence did not redact token or SHA-256 values."
         }
-        $cleanup = [PSCustomObject]@{ success = $true; failures = @(); core = $escalatedResult }
+        $cleanup = [PSCustomObject]@{
+            success = $true
+            failures = @()
+            core = $escalatedResult
+            job = $descendantJobCleanup
+            job_fixtures = [PSCustomObject]@{ normal = $normalJobCleanup; hung = $hungJobCleanup }
+        }
         Write-HarnessEvidence $evidenceDirectory (ConvertTo-SafeHealthEvidence $baselineHealth) (ConvertTo-SafeReadyEvidence $baselineReady) $cleanup `
             ('a' * 40) '12345' '2' 'TachyonHelperHarness-evidence' 'S-1-5-80-1-2-3-4-5'
         foreach ($name in @('health.sanitized.json', 'ready.sanitized.json', 'cleanup.json', 'manifest.json', 'manifest.sha256')) {
@@ -716,6 +1183,12 @@ function Invoke-EvidenceFailureTests {
         $recordedHash = ((Get-Content -LiteralPath (Join-Path $evidenceDirectory 'manifest.sha256') -Raw).Trim() -split ' ')[0]
         if ($recordedHash -ne $manifestHash -or $manifest.commit_sha -ne ('a' * 40) -or $manifest.run_id -ne '12345' -or $manifest.run_attempt -ne '2') {
             throw "Evidence manifest metadata or hash is invalid."
+        }
+        $cleanupEvidence = Get-Content -LiteralPath (Join-Path $evidenceDirectory 'cleanup.json') -Raw | ConvertFrom-Json
+        if (-not $cleanupEvidence.job.assigned -or -not $cleanupEvidence.job.closed -or
+            $cleanupEvidence.job.silent_breakaway_enabled -or -not $cleanupEvidence.job.child_cleanup_confirmed -or
+            $cleanupEvidence.job.child_member_count_before_close -lt 1) {
+            throw "Cleanup evidence did not preserve the Job assignment and descendant cleanup proof."
         }
         $allEvidence = (Get-ChildItem -LiteralPath $evidenceDirectory -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
         if ($allEvidence -match '(?i)token|trusted_server_sha256|core_sha256') { throw "Evidence output contains a forbidden secret field name." }
@@ -918,6 +1391,8 @@ if ($RunServiceSIDHarness) {
     $diagnosticOwnerSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
     $coreProcess = $null
     $coreStartTicks = [long]0
+    $coreJob = $null
+    $coreJobAssigned = $false
     $harness = $null
     $health = $null
     $ready = $null
@@ -933,6 +1408,7 @@ if ($RunServiceSIDHarness) {
     $cleanupEvidence = [ordered]@{
         service_stop_confirmed = $false
         service_delete_confirmed = $false
+        job = $null
         core = $null
         diagnostic_removed = $false
         ready_removed = $false
@@ -954,7 +1430,9 @@ if ($RunServiceSIDHarness) {
         $image = "$quotedBinary helper --service --service-name $name --service-sid $serviceSID --diagnostic-owner-sid $($diagnosticOwnerSID.Value) --pipe $corePipe --server-sid $serverSID --core-binary $quotedTrustedBinary --core-sha256 $trustedHash --diagnostic-file $($harness.Diagnostic) --diagnostic-test-override"
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
-        $coreProcess = Start-Process -FilePath $resolvedBinary -ArgumentList @('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready) -PassThru -WindowStyle Hidden
+        $coreJob = [TachyonHarness.KillOnCloseJob]::Create()
+        $coreProcess = $coreJob.StartAssignedProcess($resolvedBinary, [string[]]@('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready))
+        $coreJobAssigned = $true
         $coreStartTicks = [long]$coreProcess.StartTime.ToUniversalTime().Ticks
         $readyDeadline = (Get-Date).AddSeconds(10)
         do {
@@ -1029,15 +1507,69 @@ if ($RunServiceSIDHarness) {
             }
         }
         catch { $cleanupFailures.Add("service cleanup failed: $($_.Exception.Message)") }
-        if ($null -ne $coreProcess) {
+        if ($null -ne $coreProcess -and $null -ne $coreJob) {
             try {
-                $coreCleanup = Stop-VerifiedHarnessProcess $coreProcess $coreProcess.Id $coreStartTicks
-                $cleanupEvidence.core = $coreCleanup
-                if (-not $coreCleanup.success) { $cleanupFailures.Add("test Core cleanup did not prove process exit: $($coreCleanup.errors -join '; ')") }
+                $jobCleanup = Close-HarnessJobAndVerifyCleanup $coreJob $coreProcess $coreProcess.Id $coreStartTicks $coreJobAssigned
+                $cleanupEvidence.job = $jobCleanup
+                $cleanupEvidence.core = $jobCleanup.core
+                if (-not $jobCleanup.success) { $cleanupFailures.Add("test Core Job cleanup did not prove process-tree exit: $($jobCleanup.errors -join '; ')") }
             }
             catch { $cleanupFailures.Add("test Core cleanup failed: $($_.Exception.Message)") }
         }
+        elseif ($null -ne $coreProcess) {
+            try {
+                $coreCleanup = Stop-VerifiedHarnessProcess $coreProcess $coreProcess.Id $coreStartTicks
+                $cleanupEvidence.core = $coreCleanup
+                if (-not $coreCleanup.success) { $cleanupFailures.Add("test Core fallback cleanup did not prove process exit: $($coreCleanup.errors -join '; ')") }
+            }
+            catch { $cleanupFailures.Add("test Core fallback cleanup failed: $($_.Exception.Message)") }
+        }
         else { $cleanupEvidence.core = [PSCustomObject]@{ success = $true; not_started = $true } }
+        if ($null -ne $coreJob -and -not $coreJob.IsClosed) {
+            try {
+                $coreJob.Dispose()
+                if (-not $coreJob.IsClosed) { throw "Core Job handle remained open." }
+                if ($null -eq $cleanupEvidence.job) {
+                    $cleanupEvidence.job = [PSCustomObject]@{
+                        assigned = $coreJobAssigned
+                        limit_flags = 'KILL_ON_JOB_CLOSE'
+                        silent_breakaway_enabled = $false
+                        closed = $true
+                        child_cleanup_confirmed = $true
+                        success = $coreJobAssigned
+                        fallback_close = $true
+                    }
+                }
+            }
+            catch {
+                if ($null -eq $cleanupEvidence.job) {
+                    $cleanupEvidence.job = [PSCustomObject]@{
+                        assigned = $coreJobAssigned
+                        limit_flags = 'KILL_ON_JOB_CLOSE'
+                        silent_breakaway_enabled = $false
+                        closed = [bool]$coreJob.IsClosed
+                        child_cleanup_confirmed = $false
+                        success = $false
+                        fallback_close = $true
+                        error = $_.Exception.Message
+                    }
+                }
+                $cleanupFailures.Add("test Core Job fallback close failed: $($_.Exception.Message)")
+            }
+        }
+        if ($null -ne $coreJob -and $null -eq $cleanupEvidence.job) {
+            $cleanupEvidence.job = [PSCustomObject]@{
+                assigned = $coreJobAssigned
+                limit_flags = 'KILL_ON_JOB_CLOSE'
+                silent_breakaway_enabled = $false
+                closed = [bool]$coreJob.IsClosed
+                child_cleanup_confirmed = $false
+                success = $false
+                fallback_close = $true
+                error = 'primary Job cleanup did not produce structured evidence'
+            }
+            $cleanupFailures.Add("test Core Job cleanup did not produce structured evidence")
+        }
         try { Remove-VerifiedHarnessArtifacts $harnessPath }
         catch { $cleanupFailures.Add("harness artifact cleanup failed: $($_.Exception.Message)") }
         try {

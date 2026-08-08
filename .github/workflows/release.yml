@@ -10,11 +10,6 @@ on:
         description: "Release tag, for example v0.1.0-alpha.1"
         required: true
         type: string
-      prerelease:
-        description: "Mark the GitHub release as a prerelease"
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: write
@@ -275,11 +270,6 @@ jobs:
           VERIFIED_COMMIT: ${{ needs.verify_tag.outputs.commit }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            prerelease="${{ inputs.prerelease }}"
-          else
-            prerelease="true"
-          fi
           version="${VERIFIED_TAG}"
           mkdir -p release
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
@@ -309,7 +299,7 @@ jobs:
             --output-directory release
           bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=true" >> "${GITHUB_OUTPUT}"
 
       - name: Reverify release tag before publishing
         id: publish_gate

@@ -15,6 +15,10 @@ All notable changes to Tachyon Core will be documented in this file.
   the shared Python path, and fail closed when official verification is unavailable.
 - Removed the remote lightweight-tag compatibility path and added persistent
   negative fixtures for immutable release identity, digest, size, and asset-set checks.
+- Closed the manual formal-release path for the alpha line: tag and manual runs now
+  force prerelease publication, with a pre-API negative test for `prerelease=false`.
+- Clarified the immutable GitHub Release contract as thirteen uploaded assets, with
+  `SHA256SUMS.txt` covering the other twelve assets.
 - The release boundary remains explicit: no real WFP callout, signed driver,
   kernel injection, process capture, or real game E2E is included or claimed.
 

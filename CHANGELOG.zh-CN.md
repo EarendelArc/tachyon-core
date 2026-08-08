@@ -12,6 +12,9 @@ Tachyon Core 的版本变更记录。该文件与英文 `CHANGELOG.md` 同步维
   通过统一 Python 路径校验官方 Wintun DLL hash 与 size，并在官方验证不可用时 fail-closed。
 - 移除远端 lightweight tag 兼容路径，并为 immutable release 身份、digest、size 与资产集合
   增加可持久复跑的负向 fixture。
+- 封闭 alpha 发布线的手动正式发布路径：tag 与手动运行均强制 prerelease，并增加
+  `prerelease=false` 在调用 API 前失败的负向测试。
+- 明确 immutable GitHub Release 共上传十三项资产，`SHA256SUMS.txt` 覆盖其余十二项。
 - 明确发布边界：不包含真实 WFP callout、签名驱动、内核注入、进程捕获，也不声称完成真实游戏 E2E。
 
 ## [v0.1.0-alpha.23] - 2026-07-29

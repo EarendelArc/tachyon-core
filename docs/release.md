@@ -28,7 +28,8 @@ The workflow builds six ZIPs:
 It also publishes `RELEASE_NOTES.md`, `RELEASE_NOTES.zh-CN.md`,
 `BUILD_METADATA.json`, `WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`,
 the deterministic `tachyon-helper-evidence_<tag>.tar.gz`, and `SHA256SUMS.txt`.
-The checksum file covers every asset except itself: twelve entries in total.
+The GitHub Release therefore contains exactly thirteen assets. `SHA256SUMS.txt`
+covers the other twelve assets and does not contain an entry for itself.
 
 `BUILD_METADATA.json` records the tag, full commit, source-date epoch, build time,
 Go version, every target OS/architecture, and each ZIP and embedded binary SHA-256.
@@ -62,6 +63,10 @@ is restricted to policy tests and cannot bypass production network verification.
 
 The remote tag gate accepts only a real annotated tag object whose peeled commit
 matches the verified checkout. A correctly targeted lightweight tag is still rejected.
+
+The current alpha release pipeline is prerelease-only. Tag pushes and manual
+`workflow_dispatch` runs both force `prerelease=true`; there is no manual formal-release
+input. The publisher rejects every other value before its first GitHub API operation.
 
 Before publishing, the workflow requires the verified tag, green Linux and Windows
 CI, six platform ZIPs, all bilingual notes, all manifests, and a strict SHA-256

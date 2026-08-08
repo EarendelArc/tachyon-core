@@ -51,10 +51,14 @@ Alpha.24 准备版本名称为 **WFP Helper / Captured UDP Named Pipe v2 Preview
 确定性生成 `RELEASE_NOTES.md` 与 `RELEASE_NOTES.zh-CN.md`。GitHub Release 正文按先英文、
 后中文的顺序包含两份内容，且不使用 GitHub 自动生成 release notes。
 
-`SHA256SUMS.txt` covers the six platform ZIPs, both note files, `BUILD_METADATA.json`,
-`WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`, and the sanitized Helper evidence archive:
-twelve entries, excluding the checksum file itself. Publication verifies every entry before the first
-GitHub write, uploads the complete asset set exactly once to a new draft, then publishes only that draft.
+The GitHub Release contains exactly thirteen assets. `SHA256SUMS.txt` covers the six platform ZIPs,
+both note files, `BUILD_METADATA.json`, `WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`,
+and the sanitized Helper evidence archive: twelve entries, excluding the checksum file itself.
+Publication verifies every entry before the first GitHub write, uploads the complete asset set exactly
+once to a new draft, then publishes only that draft.
+
+GitHub Release 固定包含十三项资产。`SHA256SUMS.txt` 覆盖除自身外的其余十二项；发布流程会在
+首次写入 GitHub 前完成校验。
 
 `SHA256SUMS.txt` 覆盖六个平台 ZIP、两份 notes、`BUILD_METADATA.json`、
 `WINTUN_SIDECAR_CONTRACT.json`、`EVIDENCE_MANIFEST.json` 和去敏 Helper evidence 压缩包，
@@ -92,6 +96,13 @@ GNU-format lines: the two notes, six platform ZIPs, four release metadata/eviden
 元数据/evidence 资产。
 
 ## Verification modes / 验证模式
+
+The current alpha pipeline is prerelease-only. Tag pushes and manual `workflow_dispatch` runs both
+force `prerelease=true`; no manual formal-release input is exposed. The publisher rejects any other
+value before its first GitHub API operation.
+
+当前 alpha 管线只允许 prerelease。tag push 与手动 `workflow_dispatch` 均强制
+`prerelease=true`，不暴露手动正式发布入口；publisher 会在首次调用 GitHub API 前拒绝其他值。
 
 - `signature`: `git verify-tag` successfully validates an annotated signed tag. A present but invalid
   or unverifiable signature fails closed.

@@ -127,6 +127,7 @@ for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md SHA256SUMS.txt; do
     fail "Bash output differs from shared golden ${golden_name}"
 done
 [[ $(wc -l < "${golden_release}/SHA256SUMS.txt") -eq 12 ]] || fail "golden checksum manifest must contain exactly twelve entries"
+[[ $(find "${golden_release}" -maxdepth 1 -type f | wc -l) -eq 13 ]] || fail "GitHub release fixture must contain exactly thirteen assets"
 
 printf 'unexpected\n' > "${golden_release}/unexpected.txt"
 expect_failure \
@@ -253,14 +254,23 @@ chmod +x "${fake_bin}/gh"
 
 run_publish() {
   local mode=$1
+  local prerelease=${2:-true}
+  local version=${3:-v1.2.4}
   PATH="${fake_bin}:${PATH}" \
     FAKE_GH_MODE="${mode}" \
     FAKE_GH_STATE="${fake_state}" \
     FAKE_GH_LOG="${fake_log}" \
     FAKE_GH_BODY="${fake_body}" \
     GITHUB_REPOSITORY="tachyon-space/tachyon-core" \
-    bash "${publish_script}" v1.2.4 "${second_commit}" true "${release_assets}"
+    bash "${publish_script}" "${version}" "${second_commit}" "${prerelease}" "${release_assets}"
 }
+
+rm -f "${fake_state}" "${fake_log}" "${fake_body}"
+expect_failure \
+  "non-prerelease publication" \
+  "only prerelease publication is supported; prerelease must be true" \
+  run_publish happy false v1.2.4-alpha.24
+[[ ! -f "${fake_log}" ]] || fail "prerelease=false reached the GitHub API"
 
 rm -f "${fake_state}" "${fake_log}" "${fake_body}"
 expect_failure "existing release" "already exists; refusing to edit or replace" run_publish existing
@@ -269,6 +279,7 @@ expect_failure "existing release" "already exists; refusing to edit or replace" 
 rm -f "${fake_state}" "${fake_log}" "${fake_body}"
 run_publish happy
 grep -Fq 'release create v1.2.4 --draft --verify-tag' "${fake_log}" || fail "release was not created as a verified draft"
+grep -Fq -- '--prerelease' "${fake_log}" || fail "release was not created as a prerelease"
 [[ $(grep -Fc 'release upload v1.2.4' "${fake_log}") -eq 1 ]] || fail "assets were not uploaded exactly once"
 grep -Fq 'RELEASE_NOTES.md' "${fake_log}" || fail "English notes were not uploaded"
 grep -Fq 'RELEASE_NOTES.zh-CN.md' "${fake_log}" || fail "Chinese notes were not uploaded"
@@ -309,6 +320,13 @@ grep -Fq 'group: release-${{ github.repository }}-${{ github.event_name' "${work
 grep -Fq 'cancel-in-progress: false' "${workflow}" || fail "same-tag release runs must serialize instead of cancelling"
 grep -Fq 'source_date_epoch=$(git show -s --format=%ct "${VERIFIED_COMMIT}")' "${workflow}" || fail "build metadata does not use verified commit time"
 grep -Fq 'bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release' "${workflow}" || fail "workflow does not use deterministic release metadata preparation"
+grep -Fq 'echo "prerelease=true" >> "${GITHUB_OUTPUT}"' "${workflow}" || fail "release workflow does not force prerelease metadata"
+if grep -Fq 'inputs.prerelease' "${workflow}"; then
+  fail "workflow_dispatch still exposes a formal-release path"
+fi
+grep -Fq '[[ "${prerelease}" == "true" ]]' "${publish_script}" || fail "publisher does not fail closed on prerelease=false"
+grep -Fq '[[ ${#assets[@]} -eq 13 ]]' "${publish_script}" || fail "publisher does not enforce thirteen GitHub assets"
+grep -Fq '[[ ${#expected_checksum_entries[@]} -eq 12 ]]' "${publish_script}" || fail "publisher does not enforce twelve checksum entries"
 grep -Fq 'sha256sum --check --strict SHA256SUMS.txt' "${publish_script}" || fail "publisher does not verify the complete checksum manifest"
 grep -Fq 'gh api "repos/${repository}/releases/tags/${version}"' "${repo_root}/.github/scripts/verify-published-release.sh" || fail "published release verification does not use the real GitHub API"
 grep -Fq 'validate-published-release.py' "${repo_root}/.github/scripts/verify-published-release.sh" || fail "published release verification does not use the strict validator"

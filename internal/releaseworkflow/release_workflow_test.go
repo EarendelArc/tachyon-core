@@ -350,3 +350,42 @@ func TestReleaseRejectsLightweightTagsAndValidatesPublishedAssets(t *testing.T) 
 		}
 	}
 }
+
+func TestCurrentReleasePipelineIsPrereleaseOnly(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	if strings.Contains(workflow, "inputs.prerelease") {
+		t.Fatal("workflow_dispatch exposes a formal-release path")
+	}
+	if count := strings.Count(workflow, `echo "prerelease=true"`); count != 1 {
+		t.Fatalf("release workflow forces prerelease metadata %d times, want exactly 1", count)
+	}
+
+	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
+	for _, required := range []string{
+		`[[ "${prerelease}" == "true" ]]`,
+		"only prerelease publication is supported",
+		"--prerelease",
+		`[[ ${#assets[@]} -eq 13 ]]`,
+		`[[ ${#expected_checksum_entries[@]} -eq 12 ]]`,
+	} {
+		if !strings.Contains(publication, required) {
+			t.Fatalf("prerelease publication policy is missing %q", required)
+		}
+	}
+	gate := strings.Index(publication, `[[ "${prerelease}" == "true" ]]`)
+	firstGitHubRead := strings.Index(publication, `gh release view "${version}"`)
+	if gate < 0 || firstGitHubRead < 0 || gate > firstGitHubRead {
+		t.Fatal("prerelease-only gate must run before the first GitHub API operation")
+	}
+
+	bashPolicy := readRepoFile(t, ".github", "scripts", "test-release-policy.sh")
+	for _, required := range []string{
+		"non-prerelease publication",
+		"run_publish happy false v1.2.4-alpha.24",
+		"prerelease=false reached the GitHub API",
+	} {
+		if !strings.Contains(bashPolicy, required) {
+			t.Fatalf("persistent prerelease-negative policy is missing %q", required)
+		}
+	}
+}

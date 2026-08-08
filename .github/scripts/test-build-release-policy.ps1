@@ -12,6 +12,9 @@ $metadataScript = Join-Path $repoRoot ".github\scripts\generate-build-metadata.p
 $evidenceScript = Join-Path $repoRoot ".github\scripts\generate-evidence-manifest.py"
 $pythonPolicyScript = Join-Path $repoRoot ".github\scripts\test-release-assets-policy.py"
 $publishedPolicyScript = Join-Path $repoRoot ".github\scripts\test-published-release-policy.py"
+$workflowPath = Join-Path $repoRoot ".github\workflows\release.yml"
+$publishScript = Join-Path $repoRoot ".github\scripts\publish-release.sh"
+$bashPolicyScript = Join-Path $repoRoot ".github\scripts\test-release-policy.sh"
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tachyon-release-policy-" + [guid]::NewGuid().ToString("N"))
 $previousPolicyEnvironment = $env:TACHYON_RELEASE_POLICY_TEST
 
@@ -95,6 +98,9 @@ try {
     if ($manifest.Contains("`r")) { Fail "checksum manifest must use LF line endings" }
     $manifestLines = @($manifest.TrimEnd("`n").Split("`n"))
     if ($manifestLines.Count -ne 12) { Fail "checksum manifest must contain exactly twelve entries" }
+    if (@(Get-ChildItem -LiteralPath $releaseDir -File).Count -ne 13) {
+        Fail "GitHub release fixture must contain exactly thirteen assets"
+    }
 
     Set-Content -LiteralPath (Join-Path $releaseDir "unexpected.txt") -Value "unexpected"
     Expect-Failure "undeclared release asset" "*unexpected asset: unexpected.txt*" {
@@ -155,6 +161,25 @@ try {
     $prepareContent = [System.IO.File]::ReadAllText($prepareScript)
     foreach ($required in @("generate-wintun-contract.py", "--verify-official", "validate-release-assets.py", "unexpected asset")) {
         if (-not $prepareContent.Contains($required)) { Fail "prepare-release.ps1 is missing: $required" }
+    }
+
+    $workflowContent = [System.IO.File]::ReadAllText($workflowPath)
+    if ($workflowContent.Contains("inputs.prerelease")) {
+        Fail "workflow_dispatch still exposes a formal-release path"
+    }
+    if (-not $workflowContent.Contains('echo "prerelease=true"')) {
+        Fail "release workflow does not force prerelease metadata"
+    }
+    $publishContent = [System.IO.File]::ReadAllText($publishScript)
+    foreach ($required in @(
+        '[[ "${prerelease}" == "true" ]]', '--prerelease',
+        '[[ ${#assets[@]} -eq 13 ]]', '[[ ${#expected_checksum_entries[@]} -eq 12 ]]'
+    )) {
+        if (-not $publishContent.Contains($required)) { Fail "publish-release.sh is missing: $required" }
+    }
+    $bashPolicyContent = [System.IO.File]::ReadAllText($bashPolicyScript)
+    foreach ($required in @("non-prerelease publication", "run_publish happy false v1.2.4-alpha.24", "prerelease=false reached the GitHub API")) {
+        if (-not $bashPolicyContent.Contains($required)) { Fail "Bash prerelease policy is missing: $required" }
     }
 }
 finally {

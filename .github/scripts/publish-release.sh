@@ -20,7 +20,7 @@ repository=${GITHUB_REPOSITORY:-}
 
 [[ "${version}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || die "invalid release tag"
 [[ "${commit}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] || die "commit must be a full Git object ID"
-[[ "${prerelease}" == "true" || "${prerelease}" == "false" ]] || die "prerelease must be true or false"
+[[ "${prerelease}" == "true" ]] || die "only prerelease publication is supported; prerelease must be true"
 [[ "${repository}" == */* ]] || die "GITHUB_REPOSITORY must identify owner/repository"
 [[ -f "${release_dir}/RELEASE_NOTES.md" ]] || die "English release notes are missing"
 [[ -f "${release_dir}/RELEASE_NOTES.zh-CN.md" ]] || die "Simplified Chinese release notes are missing"
@@ -72,11 +72,14 @@ assets=(
   "${release_dir}/RELEASE_NOTES.zh-CN.md"
   "${release_dir}/SHA256SUMS.txt"
 )
+[[ ${#assets[@]} -eq 13 ]] || die "GitHub release asset contract must contain exactly thirteen files"
 
 expected_checksum_entries=(RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md)
 for asset in "${zip_assets[@]}" "${auxiliary_assets[@]}"; do
   expected_checksum_entries+=("$(basename "${asset}")")
 done
+[[ ${#expected_checksum_entries[@]} -eq 12 ]] || \
+  die "checksum manifest contract must contain exactly twelve entries"
 
 for entry in "${expected_checksum_entries[@]}"; do
   [[ $(grep -Ec "^[0-9a-f]{64}  ${entry//./\\.}$" "${release_dir}/SHA256SUMS.txt") -eq 1 ]] || \
@@ -144,18 +147,13 @@ cleanup_draft() {
 }
 trap cleanup_draft EXIT
 
-prerelease_flag=()
-if [[ "${prerelease}" == "true" ]]; then
-  prerelease_flag=(--prerelease)
-fi
-
 gh release create "${version}" \
   --draft \
   --verify-tag \
   --target "${commit}" \
   --title "Tachyon Core ${version}" \
   --notes-file "${body_file}" \
-  "${prerelease_flag[@]}"
+  --prerelease
 draft_created=true
 
 draft_id=$(gh release view "${version}" --json databaseId,isDraft --jq 'select(.isDraft == true) | .databaseId')

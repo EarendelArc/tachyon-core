@@ -24,8 +24,8 @@ workflow 构建六个 ZIP：
 
 同时发布 `RELEASE_NOTES.md`、`RELEASE_NOTES.zh-CN.md`、`BUILD_METADATA.json`、
 `WINTUN_SIDECAR_CONTRACT.json`、`EVIDENCE_MANIFEST.json`、确定性的
-`tachyon-helper-evidence_<tag>.tar.gz` 和 `SHA256SUMS.txt`。校验文件覆盖除自身外
-的全部资产，共十二项。
+`tachyon-helper-evidence_<tag>.tar.gz` 和 `SHA256SUMS.txt`。GitHub Release 总计固定为
+十三项资产；`SHA256SUMS.txt` 覆盖除自身外的其余十二项，不包含自身条目。
 
 `BUILD_METADATA.json` 记录版本、完整 commit、SOURCE_DATE_EPOCH、构建时间、Go 版本、
 所有目标平台/架构，以及每个 ZIP 与其中二进制的 SHA-256。构建使用已验证提交的
@@ -54,6 +54,10 @@ sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 
 远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
 即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。
+
+当前 alpha 发布管线只允许 prerelease。tag push 与手动 `workflow_dispatch` 均强制
+`prerelease=true`，不提供手动正式发布输入；publisher 会在首次调用 GitHub API 前拒绝
+任何其他值。
 
 发布前必须满足：tag 已验证、Linux/Windows CI 全绿、六个 ZIP、双语 notes、全部 manifest
 和严格 SHA-256 校验均通过。workflow 只创建一个 draft，只上传一次完整资产集，然后

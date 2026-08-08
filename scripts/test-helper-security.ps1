@@ -37,18 +37,25 @@ namespace TachyonHarness {
         private int terminateFailures;
         private int closeFailures;
         private int resumeFailures;
+        private int processHandleCloseFailures;
+        private int threadHandleCloseFailures;
 
-        public JobFaultPlan(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures) {
+        public JobFaultPlan(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures,
+            int processHandleCloseFailures, int threadHandleCloseFailures) {
             this.assignFailures = assignFailures;
             this.terminateFailures = terminateFailures;
             this.closeFailures = closeFailures;
             this.resumeFailures = resumeFailures;
+            this.processHandleCloseFailures = processHandleCloseFailures;
+            this.threadHandleCloseFailures = threadHandleCloseFailures;
         }
 
         internal bool ConsumeAssignFailure() { lock (sync) { return Consume(ref assignFailures); } }
         internal bool ConsumeTerminateFailure() { lock (sync) { return Consume(ref terminateFailures); } }
         internal bool ConsumeCloseFailure() { lock (sync) { return Consume(ref closeFailures); } }
         internal bool ConsumeResumeFailure() { lock (sync) { return Consume(ref resumeFailures); } }
+        internal bool ConsumeProcessHandleCloseFailure() { lock (sync) { return Consume(ref processHandleCloseFailures); } }
+        internal bool ConsumeThreadHandleCloseFailure() { lock (sync) { return Consume(ref threadHandleCloseFailures); } }
 
         private static bool Consume(ref int remaining) {
             if (remaining <= 0) return false;
@@ -149,7 +156,7 @@ namespace TachyonHarness {
                     }
                 }
                 finally { Marshal.FreeHGlobal(buffer); }
-                return new KillOnCloseJob(job, new JobFaultPlan(0, 0, 0, 0));
+                return new KillOnCloseJob(job, new JobFaultPlan(0, 0, 0, 0, 0, 0));
             }
             catch {
                 CloseHandle(job);
@@ -158,11 +165,18 @@ namespace TachyonHarness {
         }
 
         public static KillOnCloseJob CreateWithFaults(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures) {
-            if (assignFailures < 0 || terminateFailures < 0 || closeFailures < 0 || resumeFailures < 0) {
+            return CreateWithFaults(assignFailures, terminateFailures, closeFailures, resumeFailures, 0, 0);
+        }
+
+        public static KillOnCloseJob CreateWithFaults(int assignFailures, int terminateFailures, int closeFailures, int resumeFailures,
+            int processHandleCloseFailures, int threadHandleCloseFailures) {
+            if (assignFailures < 0 || terminateFailures < 0 || closeFailures < 0 || resumeFailures < 0 ||
+                processHandleCloseFailures < 0 || threadHandleCloseFailures < 0) {
                 throw new ArgumentOutOfRangeException("failure counts must be non-negative");
             }
             KillOnCloseJob job = Create();
-            return new KillOnCloseJob(job.DetachHandle(), new JobFaultPlan(assignFailures, terminateFailures, closeFailures, resumeFailures));
+            return new KillOnCloseJob(job.DetachHandle(), new JobFaultPlan(assignFailures, terminateFailures, closeFailures,
+                resumeFailures, processHandleCloseFailures, threadHandleCloseFailures));
         }
 
         public AssignedProcessStartResult StartAssignedProcess(string applicationPath, string[] arguments) {
@@ -447,20 +461,24 @@ namespace TachyonHarness {
             return true;
         }
 
-        private static bool CloseOwnedHandles(AssignedProcessStartResult owned, OwnedProcessActionResult result) {
+        private bool CloseOwnedHandles(AssignedProcessStartResult owned, OwnedProcessActionResult result) {
             if (owned.ThreadHandle != IntPtr.Zero) {
-                if (!CloseHandle(owned.ThreadHandle)) {
-                    result.AddError("CloseHandle(thread) failed win32=" + Marshal.GetLastWin32Error());
-                    return false;
+                if (faults.ConsumeThreadHandleCloseFailure()) {
+                    result.AddError("injected CloseHandle(thread) failure");
                 }
-                owned.ThreadHandle = IntPtr.Zero;
+                else if (!CloseHandle(owned.ThreadHandle)) {
+                    result.AddError("CloseHandle(thread) failed win32=" + Marshal.GetLastWin32Error());
+                }
+                else { owned.ThreadHandle = IntPtr.Zero; }
             }
             if (owned.ProcessHandle != IntPtr.Zero) {
-                if (!CloseHandle(owned.ProcessHandle)) {
-                    result.AddError("CloseHandle(process) failed win32=" + Marshal.GetLastWin32Error());
-                    return false;
+                if (faults.ConsumeProcessHandleCloseFailure()) {
+                    result.AddError("injected CloseHandle(process) failure");
                 }
-                owned.ProcessHandle = IntPtr.Zero;
+                else if (!CloseHandle(owned.ProcessHandle)) {
+                    result.AddError("CloseHandle(process) failed win32=" + Marshal.GetLastWin32Error());
+                }
+                else { owned.ProcessHandle = IntPtr.Zero; }
             }
             result.HandlesClosed = owned.NativeHandlesClosed;
             return result.HandlesClosed;
@@ -1259,6 +1277,95 @@ function Confirm-OwnedHarnessLaunchReleased {
     return $release
 }
 
+function New-HarnessCleanupCollector {
+    param([Parameter(Mandatory = $true)][string]$Label)
+    return [PSCustomObject]@{
+        label = $Label
+        errors = [System.Collections.Generic.List[string]]::new()
+        steps = [System.Collections.Generic.List[object]]::new()
+        result = $null
+    }
+}
+
+function Invoke-HarnessCleanupStep {
+    param(
+        [Parameter(Mandatory = $true)]$Collector,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+    try {
+        $value = & $Action
+        [void]$Collector.steps.Add([PSCustomObject]@{ name = $Name; success = $true })
+        return $value
+    }
+    catch {
+        $message = "$Name failed: $($_.Exception.Message)"
+        [void]$Collector.errors.Add($message)
+        [void]$Collector.steps.Add([PSCustomObject]@{ name = $Name; success = $false; error = $_.Exception.Message })
+        return $null
+    }
+}
+
+function Complete-HarnessCleanupCollector {
+    param([Parameter(Mandatory = $true)]$Collector)
+    $Collector.result = [PSCustomObject]@{
+        label = $Collector.label
+        success = $Collector.errors.Count -eq 0
+        steps = @($Collector.steps)
+        errors = @($Collector.errors)
+    }
+    if ($Collector.errors.Count -gt 0) {
+        throw "$($Collector.label) cleanup failed after all steps ran: $($Collector.errors -join '; ')"
+    }
+    return $Collector.result
+}
+
+function Invoke-HarnessFixtureCleanup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        $Launch,
+        $Job,
+        [object[]]$Processes = @(),
+        [string]$Directory = "",
+        $Collector = $null
+    )
+    if ($null -eq $Collector) { $Collector = New-HarnessCleanupCollector $Label }
+
+    [void](Invoke-HarnessCleanupStep $Collector 'owner cleanup' {
+        if ($null -eq $Launch -or -not $Launch.Created -or $Launch.NativeHandlesClosed) { return }
+        $ownerCleanup = Stop-OwnedHarnessLaunch $Launch
+        if (-not $ownerCleanup.success) { throw ($ownerCleanup.errors -join '; ') }
+    })
+    [void](Invoke-HarnessCleanupStep $Collector 'Job close' {
+        if ($null -eq $Job -or $Job.IsClosed) { return }
+        [void](Close-HarnessJobWithBoundedFallback $Job $Label)
+    })
+    [void](Invoke-HarnessCleanupStep $Collector 'raw process/thread handle release' {
+        [void](Confirm-OwnedHarnessLaunchReleased $Launch $Label)
+    })
+
+    foreach ($entry in @($Processes)) {
+        if ($null -eq $entry) { continue }
+        $entryLabel = if ([string]::IsNullOrWhiteSpace([string]$entry.Label)) { 'process' } else { [string]$entry.Label }
+        [void](Invoke-HarnessCleanupStep $Collector "residual check: $entryLabel" {
+            if ($null -eq $entry.Process -or [long]$entry.StartTicks -eq 0) { return }
+            $cleanup = Stop-VerifiedHarnessProcess $entry.Process $entry.Process.Id ([long]$entry.StartTicks)
+            if (-not $cleanup.success) { throw ($cleanup.errors -join '; ') }
+        })
+    }
+
+    [void](Invoke-HarnessCleanupStep $Collector 'final raw process/thread handle release' {
+        [void](Confirm-OwnedHarnessLaunchReleased $Launch $Label)
+    })
+    [void](Invoke-HarnessCleanupStep $Collector 'directory cleanup' {
+        if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
+        Remove-Item -LiteralPath $Directory -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $Directory) { throw "directory remained after removal: $Directory" }
+    })
+
+    return Complete-HarnessCleanupCollector $Collector
+}
+
 function Start-HarnessOwnedProcess {
     param(
         [Parameter(Mandatory = $true)]$Job,
@@ -1639,18 +1746,9 @@ function Invoke-HarnessJobProcessFixture {
         return $cleanup
     }
     finally {
-        if ($null -ne $startResult -and $startResult.Created -and -not $startResult.NativeHandlesClosed) {
-            $ownedFallback = Stop-OwnedHarnessLaunch $startResult
-            if (-not $ownedFallback.success) { throw "$Label fixture owner fallback failed: $($ownedFallback.errors -join '; ')" }
-        }
-        if ($null -ne $job -and -not $job.IsClosed) {
-            [void](Close-HarnessJobWithBoundedFallback $job "$Label fixture")
-        }
-        [void](Confirm-OwnedHarnessLaunchReleased $startResult "$Label fixture")
-        if ($null -ne $process -and $startTicks -ne 0) {
-            $fallback = Stop-VerifiedHarnessProcess $process $process.Id $startTicks
-            if (-not $fallback.success) { throw "$Label fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
-        }
+        [void](Invoke-HarnessFixtureCleanup "$Label fixture" $startResult $job @(
+            @{ Label = 'process'; Process = $process; StartTicks = $startTicks }
+        ))
     }
 }
 
@@ -1704,26 +1802,10 @@ function Invoke-FastParentJobCleanupFixture {
         return $cleanup
     }
     finally {
-        if ($null -ne $parentStartResult -and $parentStartResult.Created -and -not $parentStartResult.NativeHandlesClosed) {
-            $ownedFallback = Stop-OwnedHarnessLaunch $parentStartResult
-            if (-not $ownedFallback.success) { throw "Fast-parent fixture owner fallback failed: $($ownedFallback.errors -join '; ')" }
-        }
-        if ($null -ne $job -and -not $job.IsClosed) {
-            [void](Close-HarnessJobWithBoundedFallback $job 'Fast-parent fixture')
-        }
-        [void](Confirm-OwnedHarnessLaunchReleased $parentStartResult 'Fast-parent fixture')
-        foreach ($entry in @(
+        [void](Invoke-HarnessFixtureCleanup 'Fast-parent fixture' $parentStartResult $job @(
             @{ Label = 'child'; Process = $child; StartTicks = $childStartTicks },
             @{ Label = 'parent'; Process = $parent; StartTicks = $parentStartTicks }
-        )) {
-            if ($null -eq $entry.Process -or $entry.StartTicks -eq 0) { continue }
-            $fallback = Stop-VerifiedHarnessProcess $entry.Process $entry.Process.Id $entry.StartTicks
-            if (-not $fallback.success) { throw "Fast-parent fixture $($entry.Label) fallback did not prove exit: $($fallback.errors -join '; ')" }
-        }
-        if (Test-Path -LiteralPath $directory) {
-            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $directory) { throw "Fast-parent fixture left its temporary directory behind." }
-        }
+        ) $directory)
     }
 }
 
@@ -1760,12 +1842,13 @@ function Invoke-HarnessJobFaultInjectionTests {
             }
         }
         finally {
-            if ($null -ne $start -and $start.Created -and -not $start.NativeHandlesClosed) {
-                $finalCleanup = Stop-OwnedHarnessLaunch $start
-                if (-not $finalCleanup.success) { throw "$($fixture.Label) outer finally retry failed: $($finalCleanup.errors -join '; ')" }
+            $finalCollector = New-HarnessCleanupCollector "$($fixture.Label) failure fixture"
+            try {
+                $finalCleanup = Invoke-HarnessFixtureCleanup "$($fixture.Label) failure fixture" $start $job @(
+                    @{ Label = 'failed launch'; Process = if ($null -ne $start) { $start.Process } else { $null }; StartTicks = if ($null -ne $start) { $start.StartTicksUtc } else { [long]0 } }
+                ) '' $finalCollector
             }
-            if ($null -ne $job -and -not $job.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $job "$($fixture.Label) failure fixture") }
-            [void](Confirm-OwnedHarnessLaunchReleased $start "$($fixture.Label) failure fixture")
+            catch { throw }
         }
         $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
         if (-not $gone.gone -or $gone.residual -or -not $start.NativeHandlesClosed) { throw "$($fixture.Label) fixture left process ownership unresolved." }
@@ -1778,6 +1861,72 @@ function Invoke-HarnessJobFaultInjectionTests {
             handles_closed = [bool]$start.NativeHandlesClosed
             residual = [bool]$gone.residual
         })
+    }
+
+    $rawHandleJob = $null
+    $rawHandleStart = $null
+    $rawHandleProcess = $null
+    $rawHandleStartTicks = [long]0
+    $rawHandleDirectory = Join-Path ([IO.Path]::GetTempPath()) "tachyon-helper-raw-handle-fault-$([guid]::NewGuid().ToString('N'))"
+    $rawHandleCollector = New-HarnessCleanupCollector 'Raw process/thread CloseHandle fixture'
+    $rawHandleFailure = $null
+    $rawHandleEvidence = $null
+    try {
+        [void][IO.Directory]::CreateDirectory($rawHandleDirectory)
+        $rawHandleJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(0, 0, 0, 0, 4, 4)
+        $rawHandleStart = $rawHandleJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
+        if (-not $rawHandleStart.Success) { throw "Raw handle fixture process failed to start: $($rawHandleStart.Errors -join '; ')" }
+        $rawHandleProcess = $rawHandleStart.Process
+        $rawHandleStartTicks = [long]$rawHandleStart.StartTicksUtc
+
+        $handoff = $rawHandleJob.AcceptSuccessfulLaunch($rawHandleStart)
+        $handoffErrors = @($handoff.Errors)
+        if ($handoff.Success -or $rawHandleStart.NativeHandlesClosed -or
+            @($handoffErrors | Where-Object { $_ -eq 'injected CloseHandle(process) failure' }).Count -ne 1 -or
+            @($handoffErrors | Where-Object { $_ -eq 'injected CloseHandle(thread) failure' }).Count -ne 1) {
+            throw "Raw handle fixture did not expose both deterministic CloseHandle failures."
+        }
+
+        try {
+            [void](Invoke-HarnessFixtureCleanup 'Raw process/thread CloseHandle fixture' $rawHandleStart $rawHandleJob @(
+                @{ Label = 'process'; Process = $rawHandleProcess; StartTicks = $rawHandleStartTicks }
+            ) $rawHandleDirectory $rawHandleCollector)
+        }
+        catch { $rawHandleFailure = $_ }
+
+        if ($null -eq $rawHandleFailure -or $null -eq $rawHandleCollector.result -or $rawHandleCollector.result.success) {
+            throw "Raw handle cleanup failure was not reported after every cleanup step ran."
+        }
+        $stepMap = @{}
+        foreach ($step in @($rawHandleCollector.result.steps)) { $stepMap[[string]$step.name] = $step }
+        foreach ($requiredStep in @('owner cleanup', 'Job close', 'raw process/thread handle release', 'residual check: process',
+            'final raw process/thread handle release', 'directory cleanup')) {
+            if (-not $stepMap.ContainsKey($requiredStep)) { throw "Raw handle cleanup skipped step '$requiredStep'." }
+        }
+        if ($stepMap['owner cleanup'].success -or $stepMap['raw process/thread handle release'].success -or
+            -not $stepMap['Job close'].success -or -not $stepMap['residual check: process'].success -or
+            -not $stepMap['final raw process/thread handle release'].success -or -not $stepMap['directory cleanup'].success) {
+            throw "Raw handle cleanup did not continue through the deterministic failure path."
+        }
+        $rawGone = Wait-HarnessProcessIdentityGone $rawHandleStart.ProcessId $rawHandleStart.StartTicksUtc 5000
+        if (-not $rawHandleJob.IsClosed -or -not $rawHandleStart.NativeHandlesClosed -or -not $rawGone.gone -or
+            $rawGone.residual -or (Test-Path -LiteralPath $rawHandleDirectory)) {
+            throw "Raw handle fixture did not finish with zero retained ownership or residue."
+        }
+        $rawHandleEvidence = [PSCustomObject]@{
+            initial_process_close_failure_observed = $true
+            initial_thread_close_failure_observed = $true
+            aggregate_failure_observed = $true
+            later_steps_completed = $true
+            final_handles_closed = [bool]$rawHandleStart.NativeHandlesClosed
+            final_job_closed = [bool]$rawHandleJob.IsClosed
+            residual = [bool]$rawGone.residual
+        }
+    }
+    finally {
+        [void](Invoke-HarnessFixtureCleanup 'Raw process/thread CloseHandle fixture final fallback' $rawHandleStart $rawHandleJob @(
+            @{ Label = 'process'; Process = $rawHandleProcess; StartTicks = $rawHandleStartTicks }
+        ) $rawHandleDirectory)
     }
 
     $replacementJob = $null
@@ -1798,16 +1947,10 @@ function Invoke-HarnessJobFaultInjectionTests {
         }
     }
     finally {
-        if ($null -ne $replacementStart -and $replacementStart.Created -and -not $replacementStart.NativeHandlesClosed) {
-            $ownerRetry = Stop-OwnedHarnessLaunch $replacementStart
-            if (-not $ownerRetry.success) { throw "PID replacement fixture owner retry failed: $($ownerRetry.errors -join '; ')" }
-        }
-        if ($null -ne $replacementJob -and -not $replacementJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $replacementJob 'PID replacement fixture') }
-        [void](Confirm-OwnedHarnessLaunchReleased $replacementStart 'PID replacement fixture')
-        if ($null -ne $replacementProcess -and $replacementTicks -ne 0) {
-            $replacementCleanup = Stop-VerifiedHarnessProcess $replacementProcess $replacementProcess.Id $replacementTicks
-            if (-not $replacementCleanup.success) { throw "PID replacement control process cleanup failed: $($replacementCleanup.errors -join '; ')" }
-        }
+        [void](Invoke-HarnessFixtureCleanup 'PID replacement fixture' $replacementStart $replacementJob @(
+            @{ Label = 'failed launch'; Process = if ($null -ne $replacementStart) { $replacementStart.Process } else { $null }; StartTicks = if ($null -ne $replacementStart) { $replacementStart.StartTicksUtc } else { [long]0 } },
+            @{ Label = 'replacement control'; Process = $replacementProcess; StartTicks = $replacementTicks }
+        ))
     }
 
     $closeJob = $null
@@ -1843,16 +1986,9 @@ function Invoke-HarnessJobFaultInjectionTests {
         }
     }
     finally {
-        if ($null -ne $closeStart -and $closeStart.Created -and -not $closeStart.NativeHandlesClosed) {
-            $ownerFallback = Stop-OwnedHarnessLaunch $closeStart
-            if (-not $ownerFallback.success) { throw "CloseHandle retry fixture owner fallback failed: $($ownerFallback.errors -join '; ')" }
-        }
-        if ($null -ne $closeJob -and -not $closeJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $closeJob 'CloseHandle retry fixture') }
-        [void](Confirm-OwnedHarnessLaunchReleased $closeStart 'CloseHandle retry fixture')
-        if ($null -ne $closeProcess -and $closeStartTicks -ne 0) {
-            $fallback = Stop-VerifiedHarnessProcess $closeProcess $closeProcess.Id $closeStartTicks
-            if (-not $fallback.success) { throw "CloseHandle retry fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
-        }
+        [void](Invoke-HarnessFixtureCleanup 'CloseHandle retry fixture' $closeStart $closeJob @(
+            @{ Label = 'process'; Process = $closeProcess; StartTicks = $closeStartTicks }
+        ))
     }
 
     $persistentJob = $null
@@ -1895,29 +2031,16 @@ function Invoke-HarnessJobFaultInjectionTests {
         }
     }
     finally {
-        if ($null -ne $persistentStart -and $persistentStart.Created -and -not $persistentStart.NativeHandlesClosed) {
-            $ownerFallback = Stop-OwnedHarnessLaunch $persistentStart
-            if (-not $ownerFallback.success) { throw "Persistent CloseHandle fixture owner fallback failed: $($ownerFallback.errors -join '; ')" }
-        }
-        if ($null -ne $persistentJob -and -not $persistentJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $persistentJob 'Persistent CloseHandle fixture') }
-        [void](Confirm-OwnedHarnessLaunchReleased $persistentStart 'Persistent CloseHandle fixture')
-        foreach ($entry in @(
+        [void](Invoke-HarnessFixtureCleanup 'Persistent CloseHandle fixture' $persistentStart $persistentJob @(
             @{ Label = 'parent'; Process = $persistentProcess; StartTicks = $persistentStartTicks },
             @{ Label = 'child'; Process = $persistentChild; StartTicks = $persistentChildStartTicks }
-        )) {
-            if ($null -eq $entry.Process -or $entry.StartTicks -eq 0) { continue }
-            $fallback = Stop-VerifiedHarnessProcess $entry.Process $entry.Process.Id $entry.StartTicks
-            if (-not $fallback.success) { throw "Persistent CloseHandle fixture $($entry.Label) fallback did not prove process exit: $($fallback.errors -join '; ')" }
-        }
-        if (Test-Path -LiteralPath $persistentDirectory) {
-            Remove-Item -LiteralPath $persistentDirectory -Recurse -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $persistentDirectory) { throw "Persistent CloseHandle fixture left its temporary directory behind." }
-        }
+        ) $persistentDirectory)
     }
     if ($null -eq $primaryFailureEvidence -or -not $persistentJob.IsClosed) { throw "Persistent CloseHandle fixture did not complete final cleanup." }
 
     return [PSCustomObject]@{
         failed_starts = @($failedStartEvidence)
+        raw_handle_close = $rawHandleEvidence
         close_retry = $retryEvidence
         persistent_close_primary_failure = [PSCustomObject]@{
             success = [bool]$primaryFailureEvidence.success
@@ -1994,10 +2117,9 @@ function Invoke-EvidenceFailureTests {
         }
     }
     finally {
-        if ($null -ne $testProcess -and $testStartTicks -ne 0) {
-            $fallbackCleanup = Stop-VerifiedHarnessProcess $testProcess $testProcess.Id $testStartTicks
-            if (-not $fallbackCleanup.success) { throw "Real console cleanup test fallback did not prove exit: $($fallbackCleanup.errors -join '; ')" }
-        }
+        [void](Invoke-HarnessFixtureCleanup 'Real console cleanup fixture' $null $null @(
+            @{ Label = 'process'; Process = $testProcess; StartTicks = $testStartTicks }
+        ))
     }
 
     $normalJobCleanup = Invoke-HarnessJobProcessFixture 'Normal Core' 'Start-Sleep -Seconds 30'
@@ -2046,7 +2168,7 @@ function Invoke-EvidenceFailureTests {
         if ($allEvidence -match '(?i)token|trusted_server_sha256|core_sha256') { throw "Evidence output contains a forbidden secret field name." }
     }
     finally {
-        if (Test-Path -LiteralPath $evidenceDirectory) { Remove-Item -LiteralPath $evidenceDirectory -Recurse -Force -ErrorAction Stop }
+        [void](Invoke-HarnessFixtureCleanup 'Harness evidence fixture' $null $null @() $evidenceDirectory)
     }
     Write-Host "Harness evidence and cleanup failure tests passed."
 }
@@ -2098,10 +2220,7 @@ function Invoke-HarnessPathSecurityTests {
         Write-Host "Harness path security tests passed."
     }
     finally {
-        if (Test-Path -LiteralPath $programData) {
-            Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $programData) { throw "Harness path security test cleanup left a residual directory." }
-        }
+        [void](Invoke-HarnessFixtureCleanup 'Harness path security fixture' $null $null @() $programData)
     }
 }
 
@@ -2124,7 +2243,11 @@ function Invoke-SetupFailureCleanupTest {
             $injectedFailureObserved = $true
         }
         finally {
-            Remove-VerifiedHarnessArtifacts $resolved
+            $partialCollector = New-HarnessCleanupCollector 'Harness setup partial fixture'
+            [void](Invoke-HarnessCleanupStep $partialCollector 'verified artifact cleanup' {
+                Remove-VerifiedHarnessArtifacts $resolved
+            })
+            [void](Complete-HarnessCleanupCollector $partialCollector)
         }
         if ($null -ne $completedHarness) { throw "Setup failure test unexpectedly assigned a completed harness." }
         if (-not $injectedFailureObserved) { throw "Setup failure test did not observe the injected failure." }
@@ -2134,9 +2257,7 @@ function Invoke-SetupFailureCleanupTest {
         Write-Host "Harness setup failure cleanup test passed."
     }
     finally {
-        if (Test-Path -LiteralPath $programData) {
-            Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
-        }
+        [void](Invoke-HarnessFixtureCleanup 'Harness setup fixture' $null $null @() $programData)
     }
 }
 
@@ -2209,11 +2330,16 @@ function Invoke-ProvisioningSecurityTests {
         Write-Host "Harness diagnostic provisioning security tests passed."
     }
     finally {
-        if ($null -ne $harness) { Remove-VerifiedHarnessArtifacts $harness }
-        if (Test-Path -LiteralPath $programData) {
+        $collector = New-HarnessCleanupCollector 'Harness provisioning security fixture'
+        [void](Invoke-HarnessCleanupStep $collector 'verified artifact cleanup' {
+            if ($null -ne $harness) { Remove-VerifiedHarnessArtifacts $harness }
+        })
+        [void](Invoke-HarnessCleanupStep $collector 'directory cleanup' {
+            if (-not (Test-Path -LiteralPath $programData)) { return }
             Remove-Item -LiteralPath $programData -Recurse -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $programData) { throw "Harness provisioning security test cleanup left a residual directory." }
-        }
+            if (Test-Path -LiteralPath $programData) { throw "directory remained after removal: $programData" }
+        })
+        [void](Complete-HarnessCleanupCollector $collector)
     }
 }
 

@@ -15,14 +15,19 @@ die()     { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 PORT="${TACHYON_PORT:-443}"
 TACHYON_VERSION="latest"
 UNINSTALL=false
+CONFIRM_PSK_ROTATION=false
 TACHYON_PSK="${TACHYON_PSK:-}"
+TACHYON_ROTATE_PSK="${TACHYON_ROTATE_PSK:-0}"
 TACHYON_ALLOWED_TARGETS="${TACHYON_ALLOWED_TARGETS:-}"
 ALLOWED_TARGET_INPUTS=()
 ALLOWED_TARGET_OBJECTS=()
 ALLOWED_TARGETS_JSON="[]"
 COMPOSE_DIR="/opt/tachyon-docker"
-GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
+OFFICIAL_GITHUB_REPO="EarendelArc/tachyon-core"
+GITHUB_REPO="${TACHYON_CORE_REPO:-$OFFICIAL_GITHUB_REPO}"
 GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
+GITHUB_API="https://api.github.com/repos/$GITHUB_REPO"
+TACHYON_DEV_MODE="${TACHYON_DEV_MODE:-0}"
 DOCKER_ENGINE_MAJOR=29
 CONTAINERD_MAJOR=2
 DOCKER_BUILDX_MAJOR=0
@@ -30,7 +35,11 @@ DOCKER_COMPOSE_MAJOR=5
 DOCKER_APT_KEYRING="/etc/apt/keyrings/docker.asc"
 DOCKER_APT_SOURCE="/etc/apt/sources.list.d/docker.sources"
 DOCKER_APT_PREFERENCES="/etc/apt/preferences.d/tachyon-docker-ce"
+DOCKER_APT_KEY_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 TACHYON_BASE_IMAGE="debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
+SYSTEMD_UNIT="/etc/systemd/system/tachyon-docker.service"
+EXPECTED_PRERELEASE="true"
+INSTALL_WORK_ROOT=""
 
 usage() {
   cat <<'USAGE'
@@ -44,12 +53,16 @@ OPTIONS:
   --version TAG|latest         Release tag to install (default: latest)
   --allow-target SPEC          Relay ACL entry; repeatable. Example:
                                cidr=198.51.100.0/24,ports=27015-27050
+  --confirm-psk-rotation       Required with TACHYON_ROTATE_PSK=1 when replacing
+                               an existing deployment PSK
   --uninstall                  Remove Docker compose deployment and service
   -h, --help                   Show this help
 
 ENV:
   TACHYON_PSK                  Existing shared TGP PSK; generated if omitted
+  TACHYON_ROTATE_PSK=1         Explicitly request replacement of an existing PSK
   TACHYON_ALLOWED_TARGETS      Semicolon-separated relay ACL entries
+  TACHYON_DEV_MODE=1           Permit a non-official TACHYON_CORE_REPO for development
 
 Security notes:
   This deployment intentionally uses host networking to avoid Docker NAT/userland
@@ -86,6 +99,7 @@ parse_args() {
         shift 2
         ;;
       --uninstall) UNINSTALL=true; shift ;;
+      --confirm-psk-rotation) CONFIRM_PSK_ROTATION=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
@@ -107,8 +121,26 @@ validate_listen_port() {
 
 install_deps() {
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl jq unzip
+  apt-get install -y -qq ca-certificates curl gnupg jq unzip
   success "Dependencies installed."
+}
+
+validate_repository_policy() {
+  case "$TACHYON_DEV_MODE" in
+    0|1) ;;
+    *) die "TACHYON_DEV_MODE must be 0 or 1" ;;
+  esac
+  [[ "$GITHUB_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || die "TACHYON_CORE_REPO must be an exact GitHub owner/repository name"
+  if [[ "$GITHUB_REPO" != "$OFFICIAL_GITHUB_REPO" ]]; then
+    [[ "$TACHYON_DEV_MODE" == "1" ]] \
+      || die "custom TACHYON_CORE_REPO is forbidden outside TACHYON_DEV_MODE=1"
+    warn "DEVELOPMENT MODE: downloading an untrusted custom repository: $GITHUB_REPO"
+  fi
+}
+
+cleanup_install_work() {
+  [[ -z "$INSTALL_WORK_ROOT" ]] || rm -rf -- "$INSTALL_WORK_ROOT"
 }
 
 version_allowed() {
@@ -125,21 +157,21 @@ version_allowed() {
 
 select_version_from_list() {
   local package="$1"
-  local version
+  local version selected=""
   while IFS= read -r version; do
     [[ -n "$version" ]] || continue
-    if version_allowed "$package" "$version"; then
-      printf '%s\n' "$version"
-      return 0
+    if version_allowed "$package" "$version" && { [[ -z "$selected" ]] || dpkg --compare-versions "$version" gt "$selected"; }; then
+      selected="$version"
     fi
   done
-  return 1
+  [[ -n "$selected" ]] || return 1
+  printf '%s\n' "$selected"
 }
 
 select_apt_version() {
   local package="$1"
   local versions selected
-  versions=$(apt-cache madison "$package" | awk '{print $3}' | sort -Vr) \
+  versions=$(apt-cache madison "$package" | awk '{print $3}') \
     || die "Unable to enumerate Docker package versions for $package"
   selected=$(select_version_from_list "$package" <<< "$versions") \
     || die "No supported $package version is available from the configured stable repository"
@@ -187,6 +219,11 @@ configure_docker_repository() {
     die "Unable to download Docker's official apt signing key"
   fi
   [[ -s "$key_tmp" ]] || { rm -f "$key_tmp"; die "Docker apt signing key is empty"; }
+  local fingerprints
+  fingerprints=$(gpg --batch --show-keys --with-colons "$key_tmp" 2>/dev/null | awk -F: '$1 == "fpr" { print toupper($10) }') \
+    || { rm -f "$key_tmp"; die "Unable to inspect Docker apt signing key"; }
+  grep -Fxq "$DOCKER_APT_KEY_FINGERPRINT" <<< "$fingerprints" \
+    || { rm -f "$key_tmp"; die "Docker apt signing key fingerprint mismatch"; }
   install -m 0644 "$key_tmp" "$DOCKER_APT_KEYRING"
   rm -f "$key_tmp"
   cat > "$DOCKER_APT_SOURCE" <<EOF
@@ -257,32 +294,177 @@ install_docker() {
   success "Docker CE installed from the official stable apt repository with exact package versions."
 }
 
-resolve_latest() {
-  curl -fsSL "$1?per_page=20" | jq -r '.[0].tag_name'
+github_api_get() {
+  local url="$1"
+  local args=(--proto '=https' --tlsv1.2 -fsSL -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  curl "${args[@]}" "$url"
 }
 
-get_asset_url() {
-  curl -fsSL "$1/tags/$2" \
-    | jq -r --arg marker "$3" '.assets[] | select(.name | contains($marker)) | .browser_download_url' \
-    | head -1
+resolve_release_json() {
+  local destination="$1"
+  if [[ "$TACHYON_VERSION" == "latest" ]]; then
+    local releases
+    releases=$(mktemp)
+    github_api_get "$GITHUB_CORE?per_page=100" > "$releases" \
+      || { rm -f "$releases"; die "Unable to enumerate Tachyon releases"; }
+    TACHYON_VERSION=$(jq -er --argjson prerelease "$EXPECTED_PRERELEASE" '
+      [ .[] | select(.draft == false and .prerelease == $prerelease) ]
+      | max_by(.published_at) | .tag_name
+      | select(type == "string" and length > 0)
+    ' "$releases") || { rm -f "$releases"; die "No release matches the required prerelease policy"; }
+    rm -f "$releases"
+  fi
+  [[ "$TACHYON_VERSION" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] \
+    || die "Invalid Tachyon release tag"
+  github_api_get "$GITHUB_CORE/tags/$TACHYON_VERSION" > "$destination" \
+    || die "Unable to fetch exact release tag $TACHYON_VERSION"
+}
+
+validate_release_metadata() {
+  local release_json="$1"
+  jq -e --arg tag "$TACHYON_VERSION" --argjson prerelease "$EXPECTED_PRERELEASE" '
+    .tag_name == $tag and
+    .draft == false and
+    .prerelease == $prerelease and
+    .immutable == true and
+    (.target_commitish | type == "string" and test("^[0-9a-fA-F]{40}$")) and
+    (.assets | type == "array")
+  ' "$release_json" >/dev/null || die "Release metadata violates the immutable prerelease contract"
+  RELEASE_COMMIT=$(jq -er '.target_commitish | ascii_downcase' "$release_json") \
+    || die "Release target commit is unavailable"
+}
+
+validate_annotated_tag_metadata() {
+  local ref_json="$1"
+  local tag_object_json="$2"
+  local expected_commit="$3"
+  jq -e '.object.type == "tag" and (.object.sha | test("^[0-9a-fA-F]{40}$"))' "$ref_json" >/dev/null \
+    || die "Release tag must be an annotated tag object"
+  local tag_commit
+  tag_commit=$(jq -er '.object | select(.type == "commit") | .sha | ascii_downcase' "$tag_object_json") \
+    || die "Annotated release tag does not target a commit"
+  [[ "$tag_commit" == "$expected_commit" ]] \
+    || die "Annotated tag commit does not match release target_commitish"
+}
+
+verify_release_identity() {
+  local release_json="$1"
+  validate_release_metadata "$release_json"
+  local ref_json tag_object_json tag_object
+  ref_json="$(dirname "$release_json")/tag-ref.json"
+  tag_object_json="$(dirname "$release_json")/tag-object.json"
+  github_api_get "$GITHUB_API/git/ref/tags/$TACHYON_VERSION" > "$ref_json" \
+    || { rm -f "$ref_json" "$tag_object_json"; die "Unable to resolve release tag ref"; }
+  tag_object=$(jq -er '.object | select(.type == "tag") | .sha | ascii_downcase' "$ref_json") \
+    || { rm -f "$ref_json" "$tag_object_json"; die "Release tag must be an annotated tag object"; }
+  github_api_get "$GITHUB_API/git/tags/$tag_object" > "$tag_object_json" \
+    || { rm -f "$ref_json" "$tag_object_json"; die "Unable to inspect annotated release tag"; }
+  validate_annotated_tag_metadata "$ref_json" "$tag_object_json" "$RELEASE_COMMIT" \
+    || { rm -f "$ref_json" "$tag_object_json"; return 1; }
+  rm -f "$ref_json" "$tag_object_json"
+}
+
+asset_metadata() {
+  local release_json="$1"
+  local asset_name="$2"
+  local count
+  count=$(jq --arg name "$asset_name" '[.assets[] | select(.name == $name)] | length' "$release_json")
+  [[ "$count" == "1" ]] || die "Release must contain exactly one asset named $asset_name"
+  jq -c --arg name "$asset_name" '.assets[] | select(.name == $name)' "$release_json"
+}
+
+download_verified_asset() {
+  local metadata="$1"
+  local destination="$2"
+  local name url expected_digest expected_size actual_digest actual_size expected_prefix
+  name=$(jq -er '.name' <<< "$metadata")
+  expected_prefix="https://github.com/$GITHUB_REPO/releases/download/$TACHYON_VERSION/"
+  url=$(jq -er --arg prefix "$expected_prefix" '.browser_download_url | select(startswith($prefix))' <<< "$metadata") \
+    || die "Release asset $name has an invalid download URL"
+  expected_digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$metadata") \
+    || die "Release asset $name has no immutable SHA-256 digest"
+  expected_size=$(jq -er '.size | select(type == "number" and . > 0 and floor == .)' <<< "$metadata") \
+    || die "Release asset $name has an invalid size"
+  curl --proto '=https' --tlsv1.2 -fL --progress-bar -o "$destination" "$url" \
+    || die "Unable to download release asset $name"
+  actual_size=$(stat -c '%s' "$destination")
+  [[ "$actual_size" == "$expected_size" ]] || die "Release asset size mismatch for $name"
+  actual_digest="sha256:$(sha256sum "$destination" | awk '{print $1}')"
+  [[ "$actual_digest" == "$expected_digest" ]] || die "Release asset digest mismatch for $name"
 }
 
 verify_archive_checksum() {
   local work_dir="$1"
   local asset_name="$2"
-
-  grep -F "  $asset_name" "$work_dir/SHA256SUMS.txt" > "$work_dir/SHA256SUMS.asset" \
-    || die "SHA256SUMS.txt does not contain $asset_name"
-  (cd "$work_dir" && sha256sum -c SHA256SUMS.asset) \
+  local lines
+  lines=$(awk -v name="$asset_name" '$2 == name { count++; line=$0 } END { if (count == 1) print line }' "$work_dir/SHA256SUMS.txt")
+  [[ -n "$lines" ]] || die "SHA256SUMS.txt must contain exactly one checksum for $asset_name"
+  printf '%s\n' "$lines" > "$work_dir/SHA256SUMS.asset"
+  (cd "$work_dir" && sha256sum --check --strict SHA256SUMS.asset) \
     || die "Checksum verification failed for $asset_name"
 }
 
+read_existing_private_psk() {
+  local config_path="$1"
+  [[ -e "$config_path" ]] || return 1
+  [[ -f "$config_path" && ! -L "$config_path" ]] \
+    || die "Existing Tachyon config is not a regular private file"
+  local mode owner
+  mode=$(stat -c '%a' "$config_path")
+  owner=$(stat -c '%u' "$config_path")
+  (( (8#$mode & 077) == 0 )) || die "Existing Tachyon config is readable by group or others"
+  [[ "$owner" == "0" || "$owner" == "65532" ]] \
+    || die "Existing Tachyon config has an unexpected owner"
+  jq -er '.mode == "server" and (.tgp.auth.psk | type == "string" and length >= 16) | select(.)' "$config_path" >/dev/null \
+    || die "Existing Tachyon config is invalid; refusing to overwrite it"
+  jq -er '.tgp.auth.psk' "$config_path"
+}
+
 ensure_tgp_psk() {
-  if [[ -z "$TACHYON_PSK" ]]; then
-    TACHYON_PSK=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+  local existing_psk=""
+  if [[ -e "$COMPOSE_DIR/config/server.json" ]]; then
+    existing_psk=$(read_existing_private_psk "$COMPOSE_DIR/config/server.json")
+  fi
+  case "$TACHYON_ROTATE_PSK" in
+    0|1) ;;
+    *) die "TACHYON_ROTATE_PSK must be 0 or 1" ;;
+  esac
+
+  local requested_psk="$TACHYON_PSK"
+  TACHYON_PSK=$(select_tgp_psk "$existing_psk" "$requested_psk" "$TACHYON_ROTATE_PSK" "$CONFIRM_PSK_ROTATION")
+  if [[ -n "$existing_psk" && "$TACHYON_ROTATE_PSK" == "0" ]]; then
+    info "Preserving the existing private TGP PSK."
+  elif [[ -n "$existing_psk" && "$TACHYON_ROTATE_PSK" == "1" ]]; then
+    warn "Confirmed TGP PSK rotation will invalidate existing clients."
   fi
   [[ ${#TACHYON_PSK} -ge 16 ]] || die "TACHYON_PSK must be at least 16 characters"
   [[ "$TACHYON_PSK" =~ ^[A-Za-z0-9._~:-]+$ ]] || die "TACHYON_PSK contains characters unsafe for this installer"
+}
+
+select_tgp_psk() {
+  local existing="$1"
+  local requested="$2"
+  local rotate="$3"
+  local confirmed="$4"
+  if [[ -n "$existing" && "$rotate" == "0" ]]; then
+    [[ -z "$requested" || "$requested" == "$existing" ]] \
+      || die "Refusing implicit PSK replacement; set TACHYON_ROTATE_PSK=1 and pass --confirm-psk-rotation"
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  if [[ -n "$existing" && "$rotate" == "1" ]]; then
+    [[ "$confirmed" == "true" ]] || die "PSK rotation requires --confirm-psk-rotation"
+    [[ -n "$requested" ]] || requested=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+    [[ "$requested" != "$existing" ]] || die "Requested PSK rotation did not change the PSK"
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  [[ "$rotate" == "0" ]] || die "PSK rotation was requested but no existing deployment is present"
+  [[ -n "$requested" ]] || requested=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+  printf '%s\n' "$requested"
 }
 
 validate_ports() {
@@ -385,34 +567,41 @@ collect_allowed_targets() {
 }
 
 install_tachyon_binary() {
-  [[ "$TACHYON_VERSION" == "latest" ]] && TACHYON_VERSION=$(resolve_latest "$GITHUB_CORE")
+  local deployment_dir="$1"
+  local evidence_dir="$2"
+  local release_json="$evidence_dir/release.json"
+  resolve_release_json "$release_json"
+  verify_release_identity "$release_json"
   info "Installing tachyon-core $TACHYON_VERSION for Docker..."
 
+  local arch asset_name archive metadata checksums_metadata entries
   arch=$(dpkg --print-architecture)
   asset_name="tachyon-core_${TACHYON_VERSION}_linux_${arch}.zip"
-  url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "$asset_name")
-  checksums_url=$(get_asset_url "$GITHUB_CORE" "$TACHYON_VERSION" "SHA256SUMS.txt")
-  [[ -n "$url" ]] || die "No tachyon-core asset for linux_${arch}"
-  [[ -n "$checksums_url" ]] || die "No SHA256SUMS.txt asset for $TACHYON_VERSION"
-
-  mkdir -p "$COMPOSE_DIR/bin"
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
-  curl -fL --progress-bar -o "$tmp/$asset_name" "$url"
-  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$checksums_url"
-  verify_archive_checksum "$tmp" "$asset_name"
-  unzip -q "$tmp/$asset_name" -d "$tmp"
-  install -m 755 "$tmp/tachyon-core" "$COMPOSE_DIR/bin/tachyon-core"
+  archive="$evidence_dir/$asset_name"
+  metadata=$(asset_metadata "$release_json" "$asset_name")
+  checksums_metadata=$(asset_metadata "$release_json" "SHA256SUMS.txt")
+  download_verified_asset "$metadata" "$archive"
+  download_verified_asset "$checksums_metadata" "$evidence_dir/SHA256SUMS.txt"
+  verify_archive_checksum "$evidence_dir" "$asset_name"
+  entries=$(unzip -Z1 "$archive") || die "Unable to inspect Tachyon release archive"
+  [[ $(grep -Fxc 'tachyon-core' <<< "$entries") -eq 1 ]] \
+    || die "Release archive must contain exactly one root tachyon-core binary"
+  if grep -Eq '(^/|(^|/)\.\.(/|$)|\\)' <<< "$entries"; then
+    die "Release archive contains an unsafe path"
+  fi
+  install -d -m 0750 "$deployment_dir/bin"
+  unzip -p "$archive" tachyon-core > "$deployment_dir/bin/tachyon-core"
+  chmod 0555 "$deployment_dir/bin/tachyon-core"
   success "tachyon-core binary installed."
 }
 
 write_configs() {
+  local deployment_dir="$1"
   ensure_tgp_psk
   collect_allowed_targets
-  install -d -m 0750 "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
-  chown 65532:65532 "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
-  install -o 65532 -g 65532 -m 0400 /dev/null "$COMPOSE_DIR/config/server.json"
-  cat > "$COMPOSE_DIR/config/server.json" <<JSON
+  install -d -o 65532 -g 65532 -m 0750 "$deployment_dir/config" "$deployment_dir/logs"
+  install -o 65532 -g 65532 -m 0400 /dev/null "$deployment_dir/config/server.json"
+  cat > "$deployment_dir/config/server.json" <<JSON
 {
   "mode": "server",
   "server": {
@@ -455,36 +644,52 @@ write_configs() {
   }
 }
 JSON
-  chown 65532:65532 "$COMPOSE_DIR/config/server.json"
-  chmod 0400 "$COMPOSE_DIR/config/server.json"
+  chown 65532:65532 "$deployment_dir/config/server.json"
+  chmod 0400 "$deployment_dir/config/server.json"
   success "Config written."
-  info "TGP PSK saved in $COMPOSE_DIR/config/server.json; copy it into the Prism Tachyon server profile."
+  info "TGP PSK is stored in the private server config; it will not be printed."
   if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 ]]; then
-    warn "Relay ACL is deny-all. Edit $COMPOSE_DIR/config/server.json server.relay.allowed_targets before testing game UDP forwarding."
+    warn "Relay ACL is deny-all. Configure server.relay.allowed_targets before testing game UDP forwarding."
   fi
 }
 
-write_dockerfile() {
-  cat > "$COMPOSE_DIR/Dockerfile" <<EOF
+prepare_build_context() {
+  local binary="$1"
+  local context_dir="$2"
+  mkdir -p "$context_dir/bin"
+  chmod 0700 "$context_dir" "$context_dir/bin"
+  cp "$binary" "$context_dir/bin/tachyon-core"
+  chmod 0555 "$context_dir/bin/tachyon-core"
+  cat > "$context_dir/Dockerfile" <<EOF
 ARG TACHYON_BASE_IMAGE=$TACHYON_BASE_IMAGE
 FROM \${TACHYON_BASE_IMAGE}
 COPY --chown=65532:65532 --chmod=0555 bin/tachyon-core /opt/tachyon/tachyon-core
 USER 65532:65532
 ENTRYPOINT ["/opt/tachyon/tachyon-core"]
 EOF
-  success "Digest-pinned Dockerfile written."
+  cat > "$context_dir/.dockerignore" <<'EOF'
+**
+!Dockerfile
+!.dockerignore
+!bin/
+!bin/tachyon-core
+EOF
+  local manifest
+  manifest=$(cd "$context_dir" && find . -mindepth 1 -type f -printf '%P\n' | LC_ALL=C sort)
+  [[ "$manifest" == $'.dockerignore\nDockerfile\nbin/tachyon-core' ]] \
+    || die "Docker build context contains an unexpected file"
+  [[ -z $(find "$context_dir" -type l -print -quit) ]] \
+    || die "Docker build context contains a symlink"
+  success "Minimal digest-pinned Docker build context prepared."
 }
 
 write_compose() {
-  cat > "$COMPOSE_DIR/docker-compose.yaml" <<YAML
+  local deployment_dir="$1"
+  local image="$2"
+  cat > "$deployment_dir/docker-compose.yaml" <<YAML
 services:
   tachyon-core:
-    image: tachyon-core-local:preview
-    build:
-      context: $COMPOSE_DIR
-      dockerfile: Dockerfile
-      args:
-        TACHYON_BASE_IMAGE: $TACHYON_BASE_IMAGE
+    image: $image
     container_name: tachyon-core
     restart: unless-stopped
     # Host networking avoids Docker NAT/userland proxy jitter for latency-sensitive UDP.
@@ -520,9 +725,9 @@ YAML
   success "docker-compose.yaml written."
 }
 
-start_services() {
-  docker compose -f "$COMPOSE_DIR/docker-compose.yaml" build --pull
-  cat > /etc/systemd/system/tachyon-docker.service <<UNIT
+write_systemd_unit() {
+  local destination="$1"
+  cat > "$destination" <<UNIT
 [Unit]
 Description=Tachyon Core Docker TGP relay
 After=docker.service network-online.target
@@ -545,9 +750,142 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable --now tachyon-docker
-  success "Docker service started on UDP/$PORT."
+}
+
+validate_staged_contract() {
+  local deployment_dir="$1"
+  local config="$deployment_dir/config/server.json"
+  local logs="$deployment_dir/logs"
+  [[ $(stat -c '%u:%g:%a' "$config") == "65532:65532:400" ]] \
+    || die "Staged config is not private and readable by container UID 65532"
+  [[ $(stat -c '%u:%g' "$logs") == "65532:65532" && -w "$logs" ]] \
+    || die "Staged logs directory is not writable by container UID 65532"
+  grep -Fq 'network_mode: host' "$deployment_dir/docker-compose.yaml" \
+    || die "Staged compose lost host networking"
+  grep -Fq 'user: "65532:65532"' "$deployment_dir/docker-compose.yaml" \
+    || die "Staged compose lost the non-root UID contract"
+  grep -Fq -- '- NET_BIND_SERVICE' "$deployment_dir/docker-compose.yaml" \
+    || die "Staged compose lost CAP_NET_BIND_SERVICE"
+  grep -Fq "$COMPOSE_DIR/config/server.json:/etc/tachyon/server.json:ro" "$deployment_dir/docker-compose.yaml" \
+    || die "Staged compose config mount is not read-only"
+  grep -Fq "$COMPOSE_DIR/logs:/var/log/tachyon:rw" "$deployment_dir/docker-compose.yaml" \
+    || die "Staged compose logs mount is not writable"
+}
+
+build_and_validate_staged_deployment() {
+  local deployment_dir="$1"
+  local context_dir="$2"
+  local image="$3"
+  docker build --pull --build-arg "TACHYON_BASE_IMAGE=$TACHYON_BASE_IMAGE" --tag "$image" "$context_dir"
+  docker compose -f "$deployment_dir/docker-compose.yaml" config -q
+  docker run --rm --network none --read-only --cap-drop ALL \
+    --volume "$deployment_dir/config/server.json:/etc/tachyon/server.json:ro" \
+    "$image" validate --config /etc/tachyon/server.json
+  validate_staged_contract "$deployment_dir"
+}
+
+restore_service_state() {
+  local state="$1"
+  local enabled="$2"
+  [[ "$state" != "absent" ]] || return 0
+  if [[ "$enabled" == "enabled" ]]; then
+    systemctl enable tachyon-docker >/dev/null 2>&1
+  else
+    systemctl disable tachyon-docker >/dev/null 2>&1
+  fi
+  if [[ "$state" == "active" ]]; then
+    systemctl start tachyon-docker >/dev/null 2>&1
+  else
+    systemctl stop tachyon-docker >/dev/null 2>&1
+  fi
+}
+
+rollback_deployment() {
+  local backup_dir="$1"
+  local previous_state="$2"
+  local previous_enabled="$3"
+  local staged_deployment="$4"
+  local rollback_failed=false
+  warn "Deployment switch failed; restoring the previous deployment."
+  if ! systemctl stop tachyon-docker >/dev/null 2>&1 && [[ "$previous_state" != "absent" ]]; then
+    rollback_failed=true
+  fi
+  if [[ -d "$backup_dir/deployment" && ! -d "$backup_dir/deployment/logs" ]]; then
+    if [[ -d "$COMPOSE_DIR/logs" ]]; then
+      mv "$COMPOSE_DIR/logs" "$backup_dir/deployment/logs" || rollback_failed=true
+    elif [[ -d "$staged_deployment/logs" ]]; then
+      mv "$staged_deployment/logs" "$backup_dir/deployment/logs" || rollback_failed=true
+    fi
+  fi
+  rm -rf "$COMPOSE_DIR"
+  [[ ! -d "$backup_dir/deployment" ]] || mv "$backup_dir/deployment" "$COMPOSE_DIR" || rollback_failed=true
+  if [[ -f "$backup_dir/tachyon-docker.service" ]]; then
+    install -m 0644 "$backup_dir/tachyon-docker.service" "$SYSTEMD_UNIT.rollback" || rollback_failed=true
+    mv -f "$SYSTEMD_UNIT.rollback" "$SYSTEMD_UNIT" || rollback_failed=true
+  else
+    rm -f "$SYSTEMD_UNIT"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
+  restore_service_state "$previous_state" "$previous_enabled" || rollback_failed=true
+  [[ "$rollback_failed" == "false" ]] \
+    || die "Rollback was incomplete; inspect $COMPOSE_DIR and $SYSTEMD_UNIT before retrying"
+}
+
+commit_deployment() {
+  local staged_deployment="$1"
+  local staged_unit="$2"
+  local work_root="$3"
+  local backup_dir="$work_root/backup"
+  local previous_state="absent"
+  local previous_enabled="disabled"
+  install -d -m 0700 "$backup_dir"
+  if [[ -f "$SYSTEMD_UNIT" || -d "$COMPOSE_DIR" ]]; then
+    systemctl is-active --quiet tachyon-docker && previous_state="active" || previous_state="inactive"
+    systemctl is-enabled --quiet tachyon-docker && previous_enabled="enabled" || previous_enabled="disabled"
+  fi
+
+  if [[ "$previous_state" == "active" ]] && ! systemctl stop tachyon-docker; then
+    die "Unable to stop the existing Tachyon Docker service; deployment was not changed"
+  fi
+  [[ ! -d "$COMPOSE_DIR" ]] || mv "$COMPOSE_DIR" "$backup_dir/deployment"
+  if [[ -f "$SYSTEMD_UNIT" ]]; then
+    cp -a "$SYSTEMD_UNIT" "$backup_dir/tachyon-docker.service"
+  fi
+  if [[ -d "$backup_dir/deployment/logs" ]]; then
+    rm -rf "$staged_deployment/logs"
+    mv "$backup_dir/deployment/logs" "$staged_deployment/logs"
+  fi
+
+  if ! mv "$staged_deployment" "$COMPOSE_DIR"; then
+    rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
+    die "Unable to atomically activate the staged deployment"
+  fi
+  if ! install -m 0644 "$staged_unit" "$SYSTEMD_UNIT.new" || ! mv -f "$SYSTEMD_UNIT.new" "$SYSTEMD_UNIT" || ! systemctl daemon-reload; then
+    rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
+    die "Unable to activate the staged systemd unit"
+  fi
+
+  if [[ "$previous_state" == "inactive" ]]; then
+    if ! restore_service_state "inactive" "$previous_enabled"; then
+      rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
+      die "Unable to preserve the inactive service state; previous deployment restored"
+    fi
+    success "Deployment updated; the previously inactive service remains inactive."
+  else
+    local activation_failed=false
+    if [[ "$previous_state" == "active" && "$previous_enabled" == "disabled" ]]; then
+      systemctl disable tachyon-docker >/dev/null 2>&1 || activation_failed=true
+      systemctl start tachyon-docker || activation_failed=true
+    else
+      systemctl enable --now tachyon-docker || activation_failed=true
+    fi
+    systemctl is-active --quiet tachyon-docker || activation_failed=true
+    if [[ "$activation_failed" == "true" ]]; then
+      rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
+      die "New deployment failed to start; previous deployment restored"
+    fi
+    success "Docker service started on UDP/$PORT."
+  fi
 }
 
 uninstall() {
@@ -567,13 +905,37 @@ main() {
     uninstall
     exit 0
   fi
+  validate_repository_policy
+  [[ ! -L "$COMPOSE_DIR" ]] || die "Refusing symlinked deployment directory"
+  [[ ! -L "$SYSTEMD_UNIT" ]] || die "Refusing symlinked systemd unit"
+  if [[ -e "$COMPOSE_DIR/logs" ]]; then
+    [[ -d "$COMPOSE_DIR/logs" && ! -L "$COMPOSE_DIR/logs" ]] \
+      || die "Existing logs path is not a regular directory"
+    [[ $(stat -c '%u:%g' "$COMPOSE_DIR/logs") == "65532:65532" ]] \
+      || die "Existing logs directory has an unexpected owner"
+  fi
   install_deps
   install_docker
-  install_tachyon_binary
-  write_configs
-  write_dockerfile
-  write_compose
-  start_services
+  install -d -m 0755 "$(dirname "$COMPOSE_DIR")"
+  local work_root staged_deployment evidence_dir context_dir staged_unit image
+  work_root=$(mktemp -d "$(dirname "$COMPOSE_DIR")/.tachyon-install.XXXXXX")
+  chmod 0700 "$work_root"
+  INSTALL_WORK_ROOT="$work_root"
+  trap cleanup_install_work EXIT
+  staged_deployment="$work_root/deployment"
+  evidence_dir="$work_root/release-evidence"
+  context_dir="$work_root/build-context"
+  staged_unit="$work_root/tachyon-docker.service"
+  install -d -m 0700 "$staged_deployment" "$evidence_dir"
+
+  install_tachyon_binary "$staged_deployment" "$evidence_dir"
+  write_configs "$staged_deployment"
+  image="tachyon-core-local:${RELEASE_COMMIT:0:12}"
+  prepare_build_context "$staged_deployment/bin/tachyon-core" "$context_dir"
+  write_compose "$staged_deployment" "$image"
+  write_systemd_unit "$staged_unit"
+  build_and_validate_staged_deployment "$staged_deployment" "$context_dir" "$image"
+  commit_deployment "$staged_deployment" "$staged_unit" "$work_root"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

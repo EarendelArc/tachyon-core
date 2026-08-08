@@ -418,6 +418,83 @@ func TestHTTPRejectsHostAndRemoteAddressAttacks(t *testing.T) {
 	}
 }
 
+func TestHTTPAcceptsExactIPv6Authority(t *testing.T) {
+	server, err := NewHTTPServer(HTTPOptions{
+		Routing:       routing.NewService(routing.NewMemoryStore(routing.DefaultConfig())),
+		ListenAddress: "[::1]:55123",
+		SessionToken:  testSessionToken,
+	})
+	if err != nil {
+		t.Fatalf("new IPv6 HTTP server: %v", err)
+	}
+	req := newIPCRequest(http.MethodGet, "/v1/health", nil)
+	req.Host = "[::1]:55123"
+	req.RemoteAddr = "[::1]:43123"
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for exact IPv6 authority, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPIgnoresProxyAuthorityHeaders(t *testing.T) {
+	server := newTestHTTPServer(t)
+	req := newIPCRequest(http.MethodGet, "/v1/health", nil)
+	req.Header.Set("Forwarded", `for=192.0.2.1;host=evil.example;proto=https`)
+	req.Header.Set("X-Forwarded-For", "192.0.2.1")
+	req.Header.Set("X-Forwarded-Host", "evil.example")
+	req.Header.Set("X-Real-IP", "192.0.2.1")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxy headers influenced loopback authority: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPRejectsNonCanonicalPaths(t *testing.T) {
+	server := newTestHTTPServer(t)
+	for _, target := range []string{"/v1//health", "/v1/../v1/health", "/v1%2fhealth", `/v1\health`} {
+		t.Run(target, func(t *testing.T) {
+			req := newIPCRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for non-canonical path, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHTTPRejectsIllegalPreflight(t *testing.T) {
+	server := newTestHTTPServer(t)
+	tests := []struct {
+		name    string
+		path    string
+		method  string
+		headers string
+		origin  string
+	}{
+		{name: "missing origin", path: "/v1/health", method: http.MethodGet},
+		{name: "unsupported method", path: "/v1/health", method: http.MethodTrace, origin: testAllowedOrigin},
+		{name: "wrong route method", path: "/v1/health", method: http.MethodPost, origin: testAllowedOrigin},
+		{name: "unknown route", path: "/v1/unknown", method: http.MethodGet, origin: testAllowedOrigin},
+		{name: "unsupported header", path: "/v1/health", method: http.MethodGet, headers: "X-Admin", origin: testAllowedOrigin},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := newIPCRequest(http.MethodOptions, test.path, nil)
+			req.Header.Set("Origin", test.origin)
+			req.Header.Set("Access-Control-Request-Method", test.method)
+			req.Header.Set("Access-Control-Request-Headers", test.headers)
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest && rec.Code != http.StatusForbidden {
+				t.Fatalf("expected fail-closed preflight, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestHTTPRejectsNullAndUnlistedOrigins(t *testing.T) {
 	server := newTestHTTPServer(t)
 	for _, origin := range []string{"null", "https://evil.example"} {

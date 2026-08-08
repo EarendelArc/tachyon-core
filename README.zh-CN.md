@@ -135,7 +135,16 @@ NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-n
 数字 non-root 用户以及 `restart: unless-stopped`。Docker 脚本不会修改宿主机
 防火墙规则。Docker CE 只从 Docker 官方签名 apt repository 安装；脚本在契约允许的
 major 内选择最新包，然后把每个 package 固定到精确 version。脚本不会执行下载得到的
-shell。
+shell。镜像使用隔离的临时 context 构建，其中只包含 `.dockerignore`、`Dockerfile` 和
+已校验的 `tachyon-core` 二进制；配置、PSK、日志与 Release 证据绝不会进入 build
+context。Release 下载要求官方仓库、immutable prerelease、指向声明 commit 的 annotated
+tag、唯一且精确匹配的资产名，以及一致的 GitHub digest 和 size。
+
+Docker 升级会先在 staging 中完成下载、构建和配置验证，再切换在线目录与 systemd unit；
+切换失败会恢复原 Compose、配置、unit 和服务状态。幂等重跑会保留有效私有配置中的原
+PSK。轮换必须同时设置 `TACHYON_ROTATE_PSK=1` 和传入
+`--confirm-psk-rotation`。自定义 GitHub 仓库只在 `TACHYON_DEV_MODE=1` 下允许，并会明确
+标记为不可信开发输入。
 
 服务端 Relay 默认采用 fail-closed 安全策略。安装脚本会生成新的
 `tgp.auth.psk` 并写入 `server.json`，需要把该 PSK 复制到 Prism 的 Tachyon

@@ -10,6 +10,7 @@
   "apt": {
     "repository_template": "https://download.docker.com/linux/{debian|ubuntu}",
     "channel": "stable",
+    "key_fingerprint": "9DC858229FC7DD38854AE2D88D81803C0EBFCD88",
     "keyring": "/etc/apt/keyrings/docker.asc",
     "source_file": "/etc/apt/sources.list.d/docker.sources",
     "preferences_file": "/etc/apt/preferences.d/tachyon-docker-ce"
@@ -25,5 +26,25 @@
     "debian": ["11", "12", "13"],
     "ubuntu": ["22.04", "24.04", "25.10", "26.04"],
     "architectures": ["amd64", "arm64"]
+  },
+  "release_policy": {
+    "repository": "EarendelArc/tachyon-core",
+    "draft": false,
+    "prerelease": true,
+    "immutable": true,
+    "annotated_tag_required": true,
+    "asset_digest_and_size_required": true
+  },
+  "build_context": {
+    "files": [".dockerignore", "Dockerfile", "bin/tachyon-core"],
+    "deny_secrets_and_runtime_state": true
+  },
+  "container": {
+    "uid": 65532,
+    "gid": 65532,
+    "network_mode": "host",
+    "capabilities": ["NET_BIND_SERVICE"],
+    "config_read_only": true,
+    "logs_writable": true
   }
 }

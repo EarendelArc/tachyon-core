@@ -12,6 +12,8 @@ Prism 通过本地 HTTP 兼容桥读取 Core 健康状态、路由遥测和 TGP 
 
 监听地址只允许精确的数字地址 `127.0.0.1` 和 `::1`。hostname、通配地址、`127.0.0.0/8` 中的其他地址、非回环地址、不匹配的 `Host` authority 和非回环 peer 都会被拒绝。包括健康检查和遥测在内的所有 endpoint 都要求 `Authorization: Bearer <session-token>`。
 
+Forwarded/proxy headers 不会改变 peer 或 authority 判定。编码路径、dot segment、重复分隔符和反斜杠路径不会被归一化，而是直接拒绝。CORS preflight 必须为精确 endpoint 声明受支持 method，且只能请求 `Authorization` 与 `Content-Type` header。
+
 浏览器 CORS 默认关闭。原生 WebView 集成可以通过 `TACHYON_IPC_ALLOWED_ORIGINS` 提供逗号分隔的精确 allowlist。`null`、`*`、部分 origin、userinfo、query、fragment 和未列出的 origin 都会被拒绝。只有精确匹配 origin 且 method 受支持时才会返回 preflight。
 
 ## HTTP 限制

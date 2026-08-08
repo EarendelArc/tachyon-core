@@ -101,6 +101,10 @@ Docker 路径会使用下载并校验的静态 `tachyon-core` 二进制构建本
 Debian base image 由 `deploy/docker/runtime-contract.json` 固定 digest；Docker CE
 只从 Docker 官方签名 apt repository 安装，并遵守仓库中的 package major 契约。
 该路径不要求 GHCR，也不会执行下载得到的安装 shell。
+Build context 是仅包含三个文件的临时 allowlist，排除 server config、PSK、日志和
+Release 证据。幂等重跑会保留已有私有 PSK；主动轮换必须同时设置
+`TACHYON_ROTATE_PSK=1` 并传入 `--confirm-psk-rotation`。只有镜像与配置验证通过后
+才切换部署文件，失败时恢复原服务状态。
 
 安装后同时检查宿主 UDP 暴露和容器状态。云安全组仍必须允许入站 UDP 到发布的服务端口。
 

@@ -28,6 +28,11 @@ addresses, mismatched `Host` authorities, and non-loopback peers are rejected.
 Every endpoint, including health and telemetry, requires
 `Authorization: Bearer <session-token>`.
 
+Forwarded/proxy headers never alter the peer or authority decision. Encoded,
+dot-segment, duplicate-separator, and backslash paths are rejected instead of
+being normalized. CORS preflights must name a supported method for the exact
+endpoint and may request only `Authorization` and `Content-Type` headers.
+
 Browser CORS is disabled by default. A native WebView integration may provide
 an exact comma-separated allowlist through `TACHYON_IPC_ALLOWED_ORIGINS`.
 `null`, `*`, partial origins, userinfo, queries, fragments, and unlisted origins

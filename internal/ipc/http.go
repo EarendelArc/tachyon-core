@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -74,6 +75,10 @@ func (s *HTTPServer) Handler() http.Handler {
 			writeJSON(w, http.StatusMisdirectedRequest, map[string]string{"error": "request authority is not the configured loopback endpoint"})
 			return
 		}
+		if !canonicalRequestPath(r.URL) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request path must be canonical"})
+			return
+		}
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
 		if origin != "" {
 			if _, ok := s.origins[origin]; !ok {
@@ -84,7 +89,8 @@ func (s *HTTPServer) Handler() http.Handler {
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
-			if origin == "" || !validPreflightMethod(r.Header.Get("Access-Control-Request-Method")) {
+			requestedMethod := strings.TrimSpace(r.Header.Get("Access-Control-Request-Method"))
+			if origin == "" || !knownRoute(r.URL.Path) || !validRouteMethod(requestedMethod, r.URL.Path) || !validPreflightHeaders(r.Header.Get("Access-Control-Request-Headers")) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid CORS preflight"})
 				return
 			}
@@ -188,12 +194,31 @@ func (s *HTTPServer) authorized(raw string) bool {
 	return len(presented) == len(s.sessionToken) && subtle.ConstantTimeCompare(presented, s.sessionToken) == 1
 }
 
-func validPreflightMethod(method string) bool {
-	switch strings.TrimSpace(method) {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete:
+func canonicalRequestPath(requestURL *url.URL) bool {
+	requestPath := requestURL.Path
+	if requestURL.RawPath != "" || requestPath == "" || strings.Contains(requestPath, `\`) {
+		return false
+	}
+	cleaned := path.Clean(requestPath)
+	return cleaned == requestPath || (strings.HasSuffix(requestPath, "/") && cleaned+"/" == requestPath)
+}
+
+func validPreflightHeaders(raw string) bool {
+	for _, value := range strings.Split(raw, ",") {
+		header := strings.ToLower(strings.TrimSpace(value))
+		if header != "" && header != "authorization" && header != "content-type" {
+			return false
+		}
+	}
+	return true
+}
+
+func knownRoute(requestPath string) bool {
+	switch requestPath {
+	case "/v1/health", "/v1/routing/game-profiles", "/v1/launchers/steam/scan", "/v1/telemetry/sse":
 		return true
 	default:
-		return false
+		return strings.HasPrefix(requestPath, "/v1/routing/game-profiles/") && strings.TrimPrefix(requestPath, "/v1/routing/game-profiles/") != ""
 	}
 }
 

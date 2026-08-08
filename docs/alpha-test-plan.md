@@ -116,6 +116,11 @@ static binary. The Debian base image is digest-pinned by
 `deploy/docker/runtime-contract.json`; Docker CE comes only from Docker's
 official signed apt repository under the repository's package-major policy.
 It does not require a GHCR image or execute a downloaded installation script.
+The build context is a temporary three-file allowlist and excludes the server
+configuration, PSK, logs, and release evidence. A rerun preserves an existing
+private PSK; deliberate rotation requires `TACHYON_ROTATE_PSK=1` together with
+`--confirm-psk-rotation`. Deployment files are switched only after image and
+configuration validation, with rollback to the prior service state on failure.
 
 After installation, check both the host UDP exposure and the container state.
 The cloud security group must still allow inbound UDP to the published server

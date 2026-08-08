@@ -292,3 +292,61 @@ func TestReleasePinsTagBuildAndAssetsToVerifiedCommit(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseRejectsLightweightTagsAndValidatesPublishedAssets(t *testing.T) {
+	tagVerification := readRepoFile(t, ".github", "scripts", "verify-release-tag.sh")
+	for _, text := range []string{
+		`[[ "${tag_type}" == "tag" ]]`,
+		"must be an annotated tag object",
+		`verification="annotated-tag"`,
+	} {
+		if !strings.Contains(tagVerification, text) {
+			t.Fatalf("release tag verification is missing %q", text)
+		}
+	}
+	legacyMode := "ref-" + "commit"
+	if strings.Contains(tagVerification, legacyMode) {
+		t.Fatal("release tag verification still contains legacy lightweight-tag compatibility")
+	}
+
+	bashPolicy := readRepoFile(t, ".github", "scripts", "test-release-policy.sh")
+	for _, text := range []string{
+		"lightweight tag at expected commit",
+		"refs/tags/v1.2.5",
+		"test-published-release-policy.py",
+	} {
+		if !strings.Contains(bashPolicy, text) {
+			t.Fatalf("Bash release policy is missing %q", text)
+		}
+	}
+
+	publishedVerification := readRepoFile(t, ".github", "scripts", "verify-published-release.sh")
+	for _, text := range []string{
+		`gh api "repos/${repository}/releases/tags/${version}"`,
+		"validate-published-release.py",
+	} {
+		if !strings.Contains(publishedVerification, text) {
+			t.Fatalf("published release verification is missing %q", text)
+		}
+	}
+	for _, forbidden := range []string{"TACHYON_RELEASE_JSON", "fixture", "FIXTURE"} {
+		if strings.Contains(publishedVerification, forbidden) {
+			t.Fatalf("production published release verification contains fixture bypass %q", forbidden)
+		}
+	}
+
+	fixtures := readRepoFile(t, ".github", "scripts", "test-published-release-policy.py")
+	for _, text := range []string{
+		"test_positive_fixture_passes",
+		"test_is_immutable_false_fails",
+		"test_target_commit_mismatch_fails",
+		"test_digest_mismatch_fails",
+		"test_size_mismatch_fails",
+		"test_missing_asset_fails",
+		"test_extra_asset_fails",
+	} {
+		if !strings.Contains(fixtures, text) {
+			t.Fatalf("published release fixture policy is missing %q", text)
+		}
+	}
+}

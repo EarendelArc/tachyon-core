@@ -60,14 +60,15 @@ printf 'first\n' > "${source_repo}/payload.txt"
 git -C "${source_repo}" add payload.txt
 git -C "${source_repo}" commit --quiet -m "first"
 first_commit=$(git -C "${source_repo}" rev-parse HEAD)
-git -C "${source_repo}" tag v1.2.3 "${first_commit}"
+git -C "${source_repo}" tag --annotate v1.2.3 --message "wrong commit" "${first_commit}"
 
 printf 'second\n' > "${source_repo}/payload.txt"
 git -C "${source_repo}" commit --quiet -am "second"
 second_commit=$(git -C "${source_repo}" rev-parse HEAD)
 git -C "${source_repo}" tag --annotate v1.2.4 --message "unsigned release tag" "${second_commit}"
+git -C "${source_repo}" tag v1.2.5 "${second_commit}"
 git -C "${source_repo}" remote add origin "${remote}"
-git -C "${source_repo}" push --quiet origin HEAD:refs/heads/main refs/tags/v1.2.3 refs/tags/v1.2.4
+git -C "${source_repo}" push --quiet origin HEAD:refs/heads/main refs/tags/v1.2.3 refs/tags/v1.2.4 refs/tags/v1.2.5
 
 git clone --quiet "${remote}" "${checkout}"
 git -C "${checkout}" checkout --quiet --detach "${second_commit}"
@@ -82,11 +83,16 @@ expect_failure \
   "points to ${first_commit}, expected ${second_commit}" \
   run_gate "${checkout}" v1.2.3 "${second_commit}"
 
+expect_failure \
+  "lightweight tag at expected commit" \
+  "must be an annotated tag object; fetched object type is commit" \
+  run_gate "${checkout}" v1.2.5 "${second_commit}"
+
 output_file="${tmp_dir}/github-output"
 run_gate "${checkout}" v1.2.4 "${second_commit}" "${output_file}"
 grep -Fqx "tag=v1.2.4" "${output_file}" || fail "correct tag output is missing"
 grep -Fqx "commit=${second_commit}" "${output_file}" || fail "correct commit output is missing"
-grep -Fqx "verification=ref-commit" "${output_file}" || fail "unsigned fallback was not explicit"
+grep -Fqx "verification=annotated-tag" "${output_file}" || fail "unsigned annotated tag verification was not explicit"
 
 golden_release="${tmp_dir}/golden-release"
 mkdir -p "${golden_release}"
@@ -130,6 +136,7 @@ expect_failure \
 rm "${golden_release}/unexpected.txt"
 
 TACHYON_RELEASE_POLICY_TEST=1 python3 "${repo_root}/.github/scripts/test-release-assets-policy.py"
+python3 "${repo_root}/.github/scripts/test-published-release-policy.py"
 
 fake_bin="${tmp_dir}/fake-bin"
 fake_state="${tmp_dir}/fake-gh-state"
@@ -303,6 +310,11 @@ grep -Fq 'cancel-in-progress: false' "${workflow}" || fail "same-tag release run
 grep -Fq 'source_date_epoch=$(git show -s --format=%ct "${VERIFIED_COMMIT}")' "${workflow}" || fail "build metadata does not use verified commit time"
 grep -Fq 'bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release' "${workflow}" || fail "workflow does not use deterministic release metadata preparation"
 grep -Fq 'sha256sum --check --strict SHA256SUMS.txt' "${publish_script}" || fail "publisher does not verify the complete checksum manifest"
+grep -Fq 'gh api "repos/${repository}/releases/tags/${version}"' "${repo_root}/.github/scripts/verify-published-release.sh" || fail "published release verification does not use the real GitHub API"
+grep -Fq 'validate-published-release.py' "${repo_root}/.github/scripts/verify-published-release.sh" || fail "published release verification does not use the strict validator"
+if grep -Eq 'FIXTURE|fixture|TACHYON_RELEASE_JSON' "${repo_root}/.github/scripts/verify-published-release.sh"; then
+  fail "production published release verification contains a fixture bypass"
+fi
 grep -Fq 'zip -X -9' "${workflow}" || fail "release ZIP metadata is not normalized"
 if grep -Fq 'date -u +%Y-%m-%dT%H:%M:%SZ' "${workflow}"; then
   fail "release build still embeds wall-clock time"

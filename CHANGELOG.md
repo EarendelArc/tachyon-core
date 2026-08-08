@@ -13,6 +13,8 @@ All notable changes to Tachyon Core will be documented in this file.
 - Hardened local release preparation to require an existing annotated tag,
   reject undeclared assets, verify official Wintun DLL hashes and sizes through
   the shared Python path, and fail closed when official verification is unavailable.
+- Removed the remote lightweight-tag compatibility path and added persistent
+  negative fixtures for immutable release identity, digest, size, and asset-set checks.
 - The release boundary remains explicit: no real WFP callout, signed driver,
   kernel injection, process capture, or real game E2E is included or claimed.
 

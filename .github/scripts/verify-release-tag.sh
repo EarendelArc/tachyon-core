@@ -37,6 +37,8 @@ git fetch --quiet --no-tags "${remote}" "refs/tags/${release_tag}:${FETCH_REF}" 
 
 tag_object=$(git rev-parse --verify "${FETCH_REF}") || die "fetched tag object is unavailable"
 tag_type=$(git cat-file -t "${tag_object}") || die "cannot inspect fetched tag object"
+[[ "${tag_type}" == "tag" ]] || \
+  die "tag ${release_tag} must be an annotated tag object; fetched object type is ${tag_type}"
 tag_commit=$(git rev-parse --verify "${FETCH_REF}^{commit}") || die "tag does not peel to a commit"
 
 if [[ -n "${expected_tag_object}" ]]; then
@@ -59,16 +61,14 @@ if verify_output=$(git verify-tag "${FETCH_REF}" 2>&1); then
   [[ -z "${verify_output}" ]] || printf '%s\n' "${verify_output}"
   echo "release tag ${release_tag}: cryptographic signature verified with git verify-tag"
 else
-  if [[ "${tag_type}" == "commit" ]]; then
-    verification="ref-commit"
-  elif [[ "${tag_type}" == "tag" && "${verify_output}" == *"no signature found"* ]]; then
-    verification="ref-commit"
+  if [[ "${verify_output}" == *"no signature found"* ]]; then
+    verification="annotated-tag"
   else
     printf '%s\n' "${verify_output}" >&2
     die "tag contains a signature that git verify-tag could not validate"
   fi
 
-  echo "::warning::Tag ${release_tag} is unsigned; signature authenticity is unavailable. The exact remote tag ref and expected commit equality were verified."
+  echo "release tag ${release_tag}: unsigned annotated tag object and exact peeled commit verified"
 fi
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

@@ -11,6 +11,7 @@ $fixtureScript = Join-Path $repoRoot ".github\scripts\create-release-policy-fixt
 $metadataScript = Join-Path $repoRoot ".github\scripts\generate-build-metadata.py"
 $evidenceScript = Join-Path $repoRoot ".github\scripts\generate-evidence-manifest.py"
 $pythonPolicyScript = Join-Path $repoRoot ".github\scripts\test-release-assets-policy.py"
+$publishedPolicyScript = Join-Path $repoRoot ".github\scripts\test-published-release-policy.py"
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tachyon-release-policy-" + [guid]::NewGuid().ToString("N"))
 $previousPolicyEnvironment = $env:TACHYON_RELEASE_POLICY_TEST
 
@@ -103,6 +104,7 @@ try {
     Remove-Item -LiteralPath (Join-Path $releaseDir "unexpected.txt") -Force
 
     Invoke-Python @($pythonPolicyScript)
+    Invoke-Python @($publishedPolicyScript)
 
     $gitRepo = Join-Path $tempDir "tag-policy-repo"
     git init --quiet --initial-branch=main $gitRepo

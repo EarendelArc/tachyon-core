@@ -10,6 +10,8 @@ Tachyon Core 的版本变更记录。该文件与英文 `CHANGELOG.md` 同步维
 - 增加覆盖全部资产的严格 SHA-256 校验，以及发布后 immutable、资产集合和远端 digest 校验。
 - 收紧本地发布准备：强制使用已存在且指向目标 commit 的 annotated tag，拒绝未声明资产，
   通过统一 Python 路径校验官方 Wintun DLL hash 与 size，并在官方验证不可用时 fail-closed。
+- 移除远端 lightweight tag 兼容路径，并为 immutable release 身份、digest、size 与资产集合
+  增加可持久复跑的负向 fixture。
 - 明确发布边界：不包含真实 WFP callout、签名驱动、内核注入、进程捕获，也不声称完成真实游戏 E2E。
 
 ## [v0.1.0-alpha.23] - 2026-07-29

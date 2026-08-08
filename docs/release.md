@@ -60,6 +60,9 @@ is restricted to policy tests and cannot bypass production network verification.
 
 ## Publication gates
 
+The remote tag gate accepts only a real annotated tag object whose peeled commit
+matches the verified checkout. A correctly targeted lightweight tag is still rejected.
+
 Before publishing, the workflow requires the verified tag, green Linux and Windows
 CI, six platform ZIPs, all bilingual notes, all manifests, and a strict SHA-256
 check. It creates one draft, uploads the complete asset set once, and publishes

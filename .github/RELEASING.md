@@ -95,13 +95,12 @@ GNU-format lines: the two notes, six platform ZIPs, four release metadata/eviden
 
 - `signature`: `git verify-tag` successfully validates an annotated signed tag. A present but invalid
   or unverifiable signature fails closed.
-- `ref-commit`: compatibility mode for the repository's existing lightweight or unsigned annotated
-  tags. Signature authenticity is unavailable; publishing is allowed only after fetching the exact
-  remote tag ref and proving that it peels to the expected checkout commit.
+- `annotated-tag`: the fetched remote object is a real annotated tag object without a signature, and
+  its peeled commit exactly matches the verified checkout. Lightweight tags are always rejected.
 - `signature`：`git verify-tag` 已成功验证带签名的 annotated tag。标签存在签名但签名无效或无法验证时，
   流程会直接失败。
-- `ref-commit`：兼容仓库现有的轻量标签或未签名 annotated tag。该模式不具备签名真实性保证；只有精确抓取
-  远端标签 ref，并证明其最终指向预期 checkout commit 后才允许发布。
+- `annotated-tag`：远端对象必须是真正的 annotated tag object；未签名时还必须证明其 peeled commit
+  与已验证 checkout 完全一致。lightweight tag 一律拒绝。
 
 ## TOCTOU boundary / TOCTOU 边界
 

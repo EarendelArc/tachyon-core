@@ -52,6 +52,9 @@ sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 
 ## 发布门禁
 
+远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
+即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。
+
 发布前必须满足：tag 已验证、Linux/Windows CI 全绿、六个 ZIP、双语 notes、全部 manifest
 和严格 SHA-256 校验均通过。workflow 只创建一个 draft，只上传一次完整资产集，然后
 发布该 draft。最后调用 `verify-published-release.sh`，检查：

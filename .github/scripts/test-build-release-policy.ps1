@@ -17,6 +17,7 @@ $publishScript = Join-Path $repoRoot ".github\scripts\publish-release.sh"
 $bashPolicyScript = Join-Path $repoRoot ".github\scripts\test-release-policy.sh"
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tachyon-release-policy-" + [guid]::NewGuid().ToString("N"))
 $previousPolicyEnvironment = $env:TACHYON_RELEASE_POLICY_TEST
+$previousPythonBytecodeEnvironment = $env:PYTHONDONTWRITEBYTECODE
 
 function Fail {
     param([string]$Message)
@@ -59,6 +60,7 @@ try {
     if (-not $pythonCommand) { Fail "python is required" }
     $pythonExecutable = $pythonCommand.Source
     $env:TACHYON_RELEASE_POLICY_TEST = "1"
+    $env:PYTHONDONTWRITEBYTECODE = "1"
 
     New-Item -ItemType Directory -Path $tempDir | Out-Null
     $releaseDir = Join-Path $tempDir "release"
@@ -181,6 +183,9 @@ try {
     foreach ($required in @("non-prerelease publication", "run_publish happy false v1.2.4-alpha.24", "prerelease=false reached the GitHub API")) {
         if (-not $bashPolicyContent.Contains($required)) { Fail "Bash prerelease policy is missing: $required" }
     }
+    if (Test-Path -LiteralPath (Join-Path $repoRoot ".github\scripts\__pycache__")) {
+        Fail "release policy tests left a Python bytecode cache in the worktree"
+    }
 }
 finally {
     if ($null -eq $previousPolicyEnvironment) {
@@ -188,6 +193,12 @@ finally {
     }
     else {
         $env:TACHYON_RELEASE_POLICY_TEST = $previousPolicyEnvironment
+    }
+    if ($null -eq $previousPythonBytecodeEnvironment) {
+        Remove-Item Env:PYTHONDONTWRITEBYTECODE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:PYTHONDONTWRITEBYTECODE = $previousPythonBytecodeEnvironment
     }
     if (Test-Path -LiteralPath $tempDir) {
         Remove-Item -LiteralPath $tempDir -Recurse -Force

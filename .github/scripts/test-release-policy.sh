@@ -2,6 +2,7 @@
 
 set -euo pipefail
 export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 verify_script="${repo_root}/.github/scripts/verify-release-tag.sh"
@@ -343,5 +344,6 @@ fi
 if grep -Fq -- '--clobber' "${workflow}" "${publish_script}"; then
   fail "release policy must never clobber published assets"
 fi
+[[ ! -d "${repo_root}/.github/scripts/__pycache__" ]] || fail "release policy tests left a Python bytecode cache in the worktree"
 
 echo "release policy tests passed"

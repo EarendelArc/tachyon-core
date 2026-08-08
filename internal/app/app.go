@@ -245,32 +245,62 @@ func (a *App) runClient(ctx context.Context) error {
 		},
 	})
 
-	telemetryCollector = observability.NewCollector(packetPipeline, tgpManager)
-	telemetryBroadcaster = observability.NewBroadcaster(observability.BroadcasterOptions{
-		Collector:         telemetryCollector,
-		Logger:            a.logger,
-		Version:           "dev",
-		ConfigPath:        "",
-		TelemetryInterval: time.Duration(a.cfg.IPC.TelemetryIntervalMS) * time.Millisecond,
-	})
-	go telemetryBroadcaster.Start(ctx)
-
-	ipcHTTP := ipc.NewHTTPServer(ipc.HTTPOptions{
-		Routing:     routingService,
-		Broadcaster: telemetryBroadcaster,
-	})
-	httpServer := &http.Server{
-		Addr:              clientHTTPAddr(a.cfg.IPC),
-		Handler:           ipcHTTP.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
+	ipcAddress, err := ipc.ParseListenAddress(clientHTTPAddr(a.cfg.IPC))
+	if err != nil {
+		return fmt.Errorf("validate IPC HTTP bridge address: %w", err)
 	}
-
-	go func() {
-		a.logger.Info("IPC HTTP bridge listening", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("IPC HTTP bridge: %w", err)
+	var httpServer *http.Server
+	if ipc.SessionTokenHandoffConfigured() {
+		listener, err := net.Listen("tcp", ipcAddress.String())
+		if err != nil {
+			return fmt.Errorf("listen IPC HTTP bridge: %w", err)
 		}
-	}()
+		sessionToken, err := ipc.NewSessionToken()
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		telemetryCollector = observability.NewCollector(packetPipeline, tgpManager)
+		telemetryBroadcaster = observability.NewBroadcaster(observability.BroadcasterOptions{
+			Collector:         telemetryCollector,
+			Logger:            a.logger,
+			Version:           "dev",
+			ConfigPath:        "",
+			TelemetryInterval: time.Duration(a.cfg.IPC.TelemetryIntervalMS) * time.Millisecond,
+		})
+		ipcHTTP, err := ipc.NewHTTPServer(ipc.HTTPOptions{
+			Routing:        routingService,
+			Broadcaster:    telemetryBroadcaster,
+			ListenAddress:  ipcAddress.String(),
+			SessionToken:   sessionToken,
+			AllowedOrigins: clientHTTPAllowedOrigins(),
+		})
+		if err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("configure IPC HTTP bridge: %w", err)
+		}
+		if err := ipc.HandoffSessionToken(sessionToken); err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("enable IPC HTTP bridge: %w", err)
+		}
+		httpServer = &http.Server{
+			Handler:           ipcHTTP.Handler(),
+			ReadTimeout:       10 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+		}
+		go telemetryBroadcaster.Start(ctx)
+		go func() {
+			a.logger.Info("IPC HTTP bridge listening", "addr", ipcAddress.String())
+			if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("IPC HTTP bridge: %w", err)
+			}
+		}()
+	} else {
+		a.logger.Warn("IPC HTTP bridge disabled", "reason", "secure inherited token handoff was not configured")
+	}
 
 	go refreshRoutingEngine(ctx, routingService, packetRouter, a.logger)
 
@@ -294,10 +324,14 @@ func (a *App) runClient(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
+	if httpServer != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			a.logger.Warn("shutdown IPC HTTP bridge", "error", err)
+		}
 	}
-	telemetryBroadcaster.Close()
+	if telemetryBroadcaster != nil {
+		telemetryBroadcaster.Close()
+	}
 	shutdownErr := a.shutdownClient(shutdownCtx)
 	routeErr := routeTxn.Close()
 	if stats := packetPipeline.Snapshot(); stats.PacketsRead > 0 {
@@ -572,6 +606,21 @@ func clientHTTPAddr(cfg config.IPCConfig) string {
 		return value
 	}
 	return "127.0.0.1:55123"
+}
+
+func clientHTTPAllowedOrigins() []string {
+	raw := strings.TrimSpace(os.Getenv("TACHYON_IPC_ALLOWED_ORIGINS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if origin := strings.TrimSpace(part); origin != "" {
+			result = append(result, origin)
+		}
+	}
+	return result
 }
 
 func clientTGPRemoteAddr(cfg config.ProxyConfig) string {

@@ -25,10 +25,10 @@ type Broadcaster struct {
 
 // BroadcasterOptions configures the telemetry broadcaster.
 type BroadcasterOptions struct {
-	Collector        *Collector
-	Logger           *slog.Logger
-	Version          string
-	ConfigPath       string
+	Collector         *Collector
+	Logger            *slog.Logger
+	Version           string
+	ConfigPath        string
 	TelemetryInterval time.Duration
 }
 
@@ -117,8 +117,8 @@ func (b *Broadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
+	controller := http.NewResponseController(w)
 
 	eventCh := make(chan Event, 64)
 	b.addClient(eventCh)
@@ -127,7 +127,7 @@ func (b *Broadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send hello immediately.
 	hello := NewHello(b.version, b.cfgPath)
 	hello.Seq = b.collector.NextSeq()
-	if !writeSSE(w, flusher, hello) {
+	if !writeSSE(w, flusher, controller, hello) {
 		return
 	}
 
@@ -140,7 +140,7 @@ func (b *Broadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if !writeSSE(w, flusher, event) {
+			if !writeSSE(w, flusher, controller, event) {
 				return
 			}
 		}
@@ -178,12 +178,17 @@ func (b *Broadcaster) collectAndBroadcast() {
 	b.Broadcast(event)
 }
 
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, event Event) bool {
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, controller *http.ResponseController, event Event) bool {
+	// Refresh the server's absolute WriteTimeout for each SSE event while still
+	// bounding a blocked client write.
+	_ = controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	data, err := json.Marshal(event)
 	if err != nil {
 		return false
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data); err != nil {
+		return false
+	}
 	flusher.Flush()
 	return true
 }

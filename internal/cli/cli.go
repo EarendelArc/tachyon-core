@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/tachyon-space/tachyon-core/internal/config"
+	"github.com/tachyon-space/tachyon-core/internal/ipc"
 )
 
 // GenerateConfig returns a JSON config template for the given mode.
@@ -80,9 +82,21 @@ type HealthResponse struct {
 }
 
 // HealthCheck queries the Core health endpoint and returns the response.
-func HealthCheck(addr string) (*HealthResponse, error) {
+func HealthCheck(addr, sessionToken string) (*HealthResponse, error) {
+	endpoint, err := ipc.ParseListenAddress(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid health endpoint: %w", err)
+	}
+	if err := ipc.ValidateSessionToken(strings.TrimSpace(sessionToken)); err != nil {
+		return nil, fmt.Errorf("invalid IPC session token: %w", err)
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://" + addr + "/v1/health")
+	req, err := http.NewRequest(http.MethodGet, "http://"+endpoint.String()+"/v1/health", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build health check: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(sessionToken))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("health check failed: %w", err)
 	}
@@ -183,5 +197,6 @@ func CtlUsage() string {
 		"COMMANDS:\n" +
 		"  health           Query the Core health endpoint\n" +
 		"    --addr/-a      Core HTTP address (default: 127.0.0.1:55123)\n\n" +
+		"    --token-stdin   Read the one-time IPC bearer token from standard input\n\n" +
 		"  version          Print version information\n"
 }

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/tachyon-space/tachyon-core/internal/cli"
 )
@@ -45,8 +48,18 @@ func cmdHealth(args []string) {
 		return
 	}
 	addr := cli.FlagValue(args, "--addr", "-a", "127.0.0.1:55123")
+	if !hasFlag(args, "--token-stdin") {
+		fmt.Fprintln(os.Stderr, "health requires --token-stdin; bearer tokens are never accepted in argv or environment")
+		os.Exit(1)
+	}
+	token, err := bufio.NewReader(io.LimitReader(os.Stdin, 4096)).ReadString('\n')
+	if err != nil && err != io.EOF {
+		fmt.Fprintln(os.Stderr, "read IPC token from stdin")
+		os.Exit(1)
+	}
+	token = strings.TrimSpace(token)
 
-	resp, err := cli.HealthCheck(addr)
+	resp, err := cli.HealthCheck(addr, token)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -58,4 +71,13 @@ func cmdHealth(args []string) {
 	}
 	pretty, _ := json.MarshalIndent(resp.Body, "", "  ")
 	fmt.Printf("%d\n%s\n", resp.StatusCode, string(pretty))
+}
+
+func hasFlag(args []string, target string) bool {
+	for _, arg := range args {
+		if arg == target {
+			return true
+		}
+	}
+	return false
 }

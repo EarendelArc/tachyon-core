@@ -434,7 +434,7 @@ func defaults() *Config {
 			SessionIdleTimeout:  60 * time.Second,
 		},
 		IPC: IPCConfig{
-			WebSocketAddr:       "127.0.0.1:9999",
+			WebSocketAddr:       "127.0.0.1:55123",
 			GRPCAddr:            "127.0.0.1:50051",
 			TelemetryIntervalMS: 500,
 		},
@@ -459,6 +459,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("tgp.max_datagram_size %d must be between %d and %d", maxDatagramSize, tgp.MinTGPDatagramSize, tgp.MaxTGPDatagramSize)
 	}
 	if c.Mode == ModeClient {
+		if err := validateIPCConfig(c.IPC); err != nil {
+			return err
+		}
 		if c.Client.Proxy.ServerAddr == "" {
 			return fmt.Errorf("client.proxy.server_addr is required in client mode")
 		}
@@ -532,6 +535,33 @@ func (c *Config) Validate() error {
 	}
 	if c.Mode == ModeServer && psk == "" && !c.TGP.Auth.AllowUnauthenticated {
 		return fmt.Errorf("server mode requires tgp.auth.psk unless tgp.auth.allow_unauthenticated is true")
+	}
+	return nil
+}
+
+func validateIPCConfig(config IPCConfig) error {
+	for name, raw := range map[string]string{
+		"ipc.websocket_addr": config.WebSocketAddr,
+		"ipc.grpc_addr":      config.GRPCAddr,
+	} {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		host, portText, err := net.SplitHostPort(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("%s must be a numeric loopback address with a port: %w", name, err)
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil || addr.Zone() != "" || (addr != netip.MustParseAddr("127.0.0.1") && addr != netip.IPv6Loopback()) {
+			return fmt.Errorf("%s host must be exactly 127.0.0.1 or ::1", name)
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil || port == 0 {
+			return fmt.Errorf("%s port must be between 1 and 65535", name)
+		}
+	}
+	if config.TelemetryIntervalMS < 0 || config.TelemetryIntervalMS > 60_000 {
+		return fmt.Errorf("ipc.telemetry_interval_ms must be between 0 and 60000")
 	}
 	return nil
 }

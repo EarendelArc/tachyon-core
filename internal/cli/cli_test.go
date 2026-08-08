@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -297,6 +299,37 @@ func TestCtlUsageContainsCommandNames(t *testing.T) {
 	}
 	if !contains(usage, "version") {
 		t.Error("ctl usage missing version command")
+	}
+	if !contains(usage, "--token-stdin") {
+		t.Error("ctl usage missing secure token input")
+	}
+}
+
+func TestHealthCheckSendsBearerToNumericLoopback(t *testing.T) {
+	token := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("unexpected authorization header %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+	response, err := HealthCheck(server.Listener.Addr().String(), token)
+	if err != nil {
+		t.Fatalf("HealthCheck: %v", err)
+	}
+	if response.StatusCode != http.StatusOK || response.Body["status"] != "ok" {
+		t.Fatalf("unexpected response: %#v", response)
+	}
+}
+
+func TestHealthCheckRejectsHostnameAndInvalidToken(t *testing.T) {
+	if _, err := HealthCheck("localhost:55123", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); err == nil {
+		t.Fatal("hostname health endpoint unexpectedly accepted")
+	}
+	if _, err := HealthCheck("127.0.0.1:55123", "short"); err == nil {
+		t.Fatal("invalid session token unexpectedly accepted")
 	}
 }
 

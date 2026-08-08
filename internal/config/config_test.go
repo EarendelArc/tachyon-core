@@ -633,6 +633,23 @@ func TestValidateServerRequiresAuthByDefault(t *testing.T) {
 	}
 }
 
+func TestValidateIPCConfigRequiresNumericLoopback(t *testing.T) {
+	for _, address := range []string{"localhost:55123", "0.0.0.0:55123", "[::]:55123", "192.0.2.1:55123", "127.0.0.2:55123"} {
+		t.Run(address, func(t *testing.T) {
+			if err := validateIPCConfig(IPCConfig{WebSocketAddr: address}); err == nil {
+				t.Fatalf("unsafe IPC address %q unexpectedly accepted", address)
+			}
+		})
+	}
+	for _, address := range []string{"127.0.0.1:55123", "[::1]:55123"} {
+		t.Run(address, func(t *testing.T) {
+			if err := validateIPCConfig(IPCConfig{WebSocketAddr: address}); err != nil {
+				t.Fatalf("safe IPC address %q rejected: %v", address, err)
+			}
+		})
+	}
+}
+
 func TestValidateClientDuplicateProfileIDs(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,

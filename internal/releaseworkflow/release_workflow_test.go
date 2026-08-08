@@ -170,6 +170,10 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 		`$env:SOURCE_DATE_EPOCH = $sourceDateEpochText`,
 		`[switch]$MetadataOnly`,
 		`LastWriteTimeUtc = $commitTime`,
+		`must be an annotated tag`,
+		`generate-wintun-contract.py`,
+		`--verify-official`,
+		`validate-release-assets.py`,
 		`prepare-release.ps1`,
 	} {
 		if !strings.Contains(localBuild, text) {
@@ -187,6 +191,10 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 		`@("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames + $auxiliaryNames`,
 		"[System.Text.ASCIIEncoding]::new()",
 		"$checksumLines -join",
+		"generate-wintun-contract.py",
+		"--verify-official",
+		"validate-release-assets.py",
+		"unexpected asset",
 	} {
 		if !strings.Contains(windowsPreparation, text) {
 			t.Fatalf("Windows release preparation is missing contract %q", text)
@@ -196,6 +204,13 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 	ci := readRepoFile(t, ".github", "workflows", "ci.yml")
 	if !strings.Contains(ci, ".github/scripts/test-build-release-policy.ps1") {
 		t.Fatal("CI does not run the Windows release golden policy test")
+	}
+
+	wintunContract := readRepoFile(t, ".github", "wintun", "WINTUN_SIDECAR_CONTRACT.json")
+	for _, text := range []string{`"size": 427552`, `"size": 222488`} {
+		if !strings.Contains(wintunContract, text) {
+			t.Fatalf("Wintun sidecar contract is missing verified DLL size %q", text)
+		}
 	}
 }
 

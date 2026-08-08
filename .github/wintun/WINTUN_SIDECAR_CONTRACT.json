@@ -3,12 +3,14 @@
     {
       "path_in_official_archive": "wintun/bin/amd64/wintun.dll",
       "platform": "windows_amd64",
-      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+      "size": 427552
     },
     {
       "path_in_official_archive": "wintun/bin/arm64/wintun.dll",
       "platform": "windows_arm64",
-      "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
+      "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80",
+      "size": 222488
     }
   ],
   "component": "wintun.dll",

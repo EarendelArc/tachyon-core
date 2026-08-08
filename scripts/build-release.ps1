@@ -1,24 +1,25 @@
 param(
-    [string]$Tag = "",
+    [Parameter(Mandatory = $true)]
+    [string]$Tag,
+    [string]$Commit = "",
     [string]$OutputDir = "",
     [switch]$MetadataOnly,
     [string]$EvidenceDirectory = "",
     [string]$EvidenceRunID = "0",
-    [string]$EvidenceRunAttempt = "1"
+    [string]$EvidenceRunAttempt = "1",
+    [string]$RepositoryRoot = "",
+    [switch]$OfflineTestFixture
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+    $RepositoryRoot = Join-Path $PSScriptRoot ".."
+}
+$root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $gitSafeDirectory = "safe.directory=$($root.Replace('\', '/'))"
 
-if ([string]::IsNullOrWhiteSpace($Tag)) {
-    $Tag = (& git -c $gitSafeDirectory -C $root describe --tags --abbrev=0 2>$null)
-    if ([string]::IsNullOrWhiteSpace($Tag)) {
-        $Tag = "v0.0.0-local"
-    }
-    else {
-        $Tag = $Tag.Trim()
-    }
+if ($Tag -notmatch '^v[0-9A-Za-z][0-9A-Za-z._-]*$') {
+    throw "release build failed: invalid release tag"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -28,18 +29,43 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 $releaseDir = Join-Path $OutputDir $Tag
 $workDir = Join-Path $releaseDir "work"
 
-$sourceCommit = (& git -c $gitSafeDirectory -C $root rev-parse --verify HEAD).Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
+$headCommit = ([string](& git -c $gitSafeDirectory -C $root rev-parse --verify HEAD 2>$null)).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $headCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
     throw "could not resolve the source commit"
 }
 
-$null = & git -c $gitSafeDirectory -C $root show-ref --verify --quiet "refs/tags/$Tag"
-if ($LASTEXITCODE -eq 0) {
-    $tagCommit = (& git -c $gitSafeDirectory -C $root rev-parse --verify "$Tag^{commit}")
-    $tagCommit = $tagCommit.Trim().ToLowerInvariant()
-    if ($tagCommit -ne $sourceCommit) {
-        throw "tag $Tag points to $tagCommit, but the working tree is at $sourceCommit"
+if ([string]::IsNullOrWhiteSpace($Commit)) {
+    $sourceCommit = $headCommit
+}
+else {
+    $Commit = $Commit.ToLowerInvariant()
+    if ($Commit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
+        throw "release build failed: specified commit must be a full Git object ID"
     }
+    $sourceCommit = ([string](& git -c $gitSafeDirectory -C $root rev-parse --verify "$Commit^{commit}" 2>$null)).Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $Commit) {
+        throw "release build failed: specified commit could not be resolved exactly"
+    }
+    if ($sourceCommit -ne $headCommit) {
+        throw "release build failed: specified commit $sourceCommit does not match checked-out HEAD $headCommit"
+    }
+}
+
+$null = & git -c $gitSafeDirectory -C $root show-ref --verify --quiet "refs/tags/$Tag"
+if ($LASTEXITCODE -ne 0) {
+    throw "release build failed: tag $Tag does not exist"
+}
+$tagType = ([string](& git -c $gitSafeDirectory -C $root cat-file -t "refs/tags/$Tag" 2>$null)).Trim()
+if ($LASTEXITCODE -ne 0 -or $tagType -ne "tag") {
+    throw "release build failed: tag $Tag must be an annotated tag"
+}
+$tagCommit = ([string](& git -c $gitSafeDirectory -C $root rev-parse --verify "$Tag^{commit}" 2>$null)).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $sourceCommit) {
+    throw "release build failed: tag $Tag points to $tagCommit, expected $sourceCommit"
+}
+
+if ($OfflineTestFixture -and $env:TACHYON_RELEASE_POLICY_TEST -ne "1") {
+    throw "release build failed: offline Wintun mode is restricted to explicit release policy tests"
 }
 
 $sourceDateEpochText = (& git -c $gitSafeDirectory -C $root show -s --format=%ct $sourceCommit).Trim()
@@ -186,8 +212,19 @@ $pythonExecutable = $pythonCommand.Source
     --output (Join-Path $releaseDir "BUILD_METADATA.json")
 if ($LASTEXITCODE -ne 0) { throw "BUILD_METADATA.json generation failed" }
 
-Copy-Item -LiteralPath (Join-Path $root ".github\wintun\WINTUN_SIDECAR_CONTRACT.json") `
-    -Destination (Join-Path $releaseDir "WINTUN_SIDECAR_CONTRACT.json") -Force
+$wintunArguments = @(
+    (Join-Path $root ".github\scripts\generate-wintun-contract.py"),
+    "--output",
+    (Join-Path $releaseDir "WINTUN_SIDECAR_CONTRACT.json")
+)
+if ($OfflineTestFixture) {
+    $wintunArguments += "--offline-test-fixture"
+}
+else {
+    $wintunArguments += "--verify-official"
+}
+& $pythonExecutable @wintunArguments
+if ($LASTEXITCODE -ne 0) { throw "official Wintun contract generation failed" }
 
 & $pythonExecutable (Join-Path $root ".github\scripts\generate-evidence-manifest.py") `
     --directory (Resolve-Path -LiteralPath $EvidenceDirectory).Path `
@@ -199,10 +236,18 @@ Copy-Item -LiteralPath (Join-Path $root ".github\wintun\WINTUN_SIDECAR_CONTRACT.
     --output-directory $releaseDir
 if ($LASTEXITCODE -ne 0) { throw "Helper evidence manifest generation failed" }
 
+& $pythonExecutable (Join-Path $root ".github\scripts\validate-release-assets.py") `
+    --release-directory $releaseDir `
+    --version $Tag `
+    --commit $sourceCommit
+if ($LASTEXITCODE -ne 0) { throw "release asset validation failed" }
+
 & (Join-Path $PSScriptRoot "prepare-release.ps1") `
     -Version $Tag `
     -Commit $sourceCommit `
-    -ReleaseDirectory $releaseDir
+    -ReleaseDirectory $releaseDir `
+    -PythonExecutable $pythonExecutable `
+    -OfflineTestFixture:$OfflineTestFixture
 
 foreach ($metadataName in @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md", "BUILD_METADATA.json", "WINTUN_SIDECAR_CONTRACT.json", "EVIDENCE_MANIFEST.json", "tachyon-helper-evidence_${Tag}.tar.gz", "SHA256SUMS.txt")) {
     (Get-Item -LiteralPath (Join-Path $releaseDir $metadataName)).LastWriteTimeUtc = $commitTime

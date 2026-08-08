@@ -10,6 +10,9 @@ All notable changes to Tachyon Core will be documented in this file.
   and the external Wintun sidecar contract to the release asset set.
 - Added strict SHA-256 coverage and post-publication immutable/asset-digest
   verification.
+- Hardened local release preparation to require an existing annotated tag,
+  reject undeclared assets, verify official Wintun DLL hashes and sizes through
+  the shared Python path, and fail closed when official verification is unavailable.
 - The release boundary remains explicit: no real WFP callout, signed driver,
   kernel injection, process capture, or real game E2E is included or claimed.
 

@@ -46,6 +46,10 @@ workflow 会获取官方 Wintun 页面和压缩包，核对当前正式版及压
 `WINTUN_SIDECAR_CONTRACT.json`。任何版本、hash 或官方来源校验失败都会 fail-closed。
 sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 
+固定的 Wintun 0.14.1 DLL 大小为：Windows AMD64 `427552` 字节、Windows ARM64
+`222488` 字节。两个 PowerShell 准备路径都调用与 CI 相同的官方生成器和 release validator。
+离线 fixture 只允许 policy test 显式启用，不能绕过生产路径的网络验证。
+
 ## 发布门禁
 
 发布前必须满足：tag 已验证、Linux/Windows CI 全绿、六个 ZIP、双语 notes、全部 manifest
@@ -59,6 +63,9 @@ sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 
 `v*` tag 保护规则必须保持启用。不得替换已有 release，也不得修改 immutable release。
 本地发布准备不创建或推送 tag。
+
+本地构建器只接受已存在的 annotated tag，并要求其最终指向当前 `HEAD` 或显式传入的完整
+commit。tag 缺失、lightweight tag 或 commit 不一致都会在构建前失败。
 
 ## 本地准备
 

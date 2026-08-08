@@ -53,6 +53,11 @@ SHA-256 values, then emits `WINTUN_SIDECAR_CONTRACT.json`. Any mismatch or inabi
 to verify fails closed. Prism must refuse to start Core when the sidecar is absent
 or mismatched.
 
+The pinned Wintun 0.14.1 DLL sizes are `427552` bytes for Windows AMD64 and
+`222488` bytes for Windows ARM64. Both PowerShell preparation paths invoke the
+same official generator and release validator as CI. The offline fixture option
+is restricted to policy tests and cannot bypass production network verification.
+
 ## Publication gates
 
 Before publishing, the workflow requires the verified tag, green Linux and Windows
@@ -68,6 +73,10 @@ only that draft. The final step calls `verify-published-release.sh`, which check
 The tag protection ruleset must remain active for `v*`. Do not replace an existing
 release or mutate an immutable release. Never create or push a tag as part of local
 release preparation.
+
+The local builder accepts only an existing annotated tag that peels to the
+checked-out `HEAD` or the explicitly supplied full commit. A missing tag,
+lightweight tag, or commit mismatch fails before building.
 
 ## Local preparation
 

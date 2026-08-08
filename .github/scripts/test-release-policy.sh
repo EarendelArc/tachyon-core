@@ -116,10 +116,20 @@ bash "${prepare_script}" \
   v9.8.7-alpha.6 \
   0123456789abcdef0123456789abcdef01234567 \
   "${golden_release}"
-for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md; do
-  [[ -s "${testdata}/golden/${golden_name}" ]] || fail "shared golden ${golden_name} is missing"
+for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md SHA256SUMS.txt; do
+  cmp "${golden_release}/${golden_name}" "${testdata}/golden/${golden_name}" || \
+    fail "Bash output differs from shared golden ${golden_name}"
 done
 [[ $(wc -l < "${golden_release}/SHA256SUMS.txt") -eq 12 ]] || fail "golden checksum manifest must contain exactly twelve entries"
+
+printf 'unexpected\n' > "${golden_release}/unexpected.txt"
+expect_failure \
+  "undeclared release asset" \
+  "release directory contains an unexpected asset set" \
+  bash "${prepare_script}" v9.8.7-alpha.6 0123456789abcdef0123456789abcdef01234567 "${golden_release}"
+rm "${golden_release}/unexpected.txt"
+
+TACHYON_RELEASE_POLICY_TEST=1 python3 "${repo_root}/.github/scripts/test-release-assets-policy.py"
 
 fake_bin="${tmp_dir}/fake-bin"
 fake_state="${tmp_dir}/fake-gh-state"

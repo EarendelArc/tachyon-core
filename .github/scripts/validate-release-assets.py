@@ -23,8 +23,14 @@ PLATFORMS = (
 WIN_TUN = {
     "version": "0.14.1",
     "archive_sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
-    "windows_amd64": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
-    "windows_arm64": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80",
+    "windows_amd64": {
+        "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+        "size": 427552,
+    },
+    "windows_arm64": {
+        "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80",
+        "size": 222488,
+    },
 }
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
@@ -101,8 +107,11 @@ def validate_wintun(root: Path) -> None:
     if not isinstance(architectures, list) or len(architectures) != 2:
         raise ValueError("Wintun contract must cover Windows AMD64 and ARM64")
     for item in architectures:
-        if not isinstance(item, dict) or item.get("sha256") != WIN_TUN.get(str(item.get("platform"))):
-            raise ValueError("Wintun contract contains an unverified architecture digest")
+        expected = WIN_TUN.get(str(item.get("platform"))) if isinstance(item, dict) else None
+        if not isinstance(item, dict) or not isinstance(expected, dict):
+            raise ValueError("Wintun contract contains an unverified architecture")
+        if item.get("sha256") != expected["sha256"] or item.get("size") != expected["size"]:
+            raise ValueError("Wintun contract contains an unverified architecture digest or size")
 
 
 def validate_evidence(root: Path, version: str, commit: str) -> None:

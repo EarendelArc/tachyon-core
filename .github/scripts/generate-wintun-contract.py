@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -23,10 +24,12 @@ DLLS = {
     "windows_amd64": (
         "wintun/bin/amd64/wintun.dll",
         "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+        427552,
     ),
     "windows_arm64": (
         "wintun/bin/arm64/wintun.dll",
         "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80",
+        222488,
     ),
 }
 
@@ -41,34 +44,40 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
-def verify_official() -> None:
-    page = fetch(OFFICIAL_PAGE).decode("utf-8", errors="strict")
+def verify_official(fetcher=fetch) -> None:
+    page = fetcher(OFFICIAL_PAGE).decode("utf-8", errors="strict")
     if f"Download Wintun {VERSION}" not in page:
         raise ValueError("official Wintun page does not advertise the pinned stable version")
     if ARCHIVE_SHA256 not in page:
         raise ValueError("official Wintun page digest differs from the pinned archive digest")
 
-    archive = fetch(ARCHIVE_URL)
+    archive = fetcher(ARCHIVE_URL)
     if sha256(archive) != ARCHIVE_SHA256:
         raise ValueError("official Wintun archive SHA-256 mismatch")
     with zipfile.ZipFile(io.BytesIO(archive)) as handle:
-        for architecture, (member, expected) in DLLS.items():
+        for architecture, (member, expected, expected_size) in DLLS.items():
             try:
                 data = handle.read(member)
             except KeyError as error:
                 raise ValueError(f"official Wintun archive is missing {member}") from error
             if sha256(data) != expected:
                 raise ValueError(f"official Wintun {architecture} DLL SHA-256 mismatch")
+            if len(data) != expected_size:
+                raise ValueError(f"official Wintun {architecture} DLL size mismatch")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--verify-official", action="store_true")
+    verification = parser.add_mutually_exclusive_group(required=True)
+    verification.add_argument("--verify-official", action="store_true")
+    verification.add_argument("--offline-test-fixture", action="store_true")
     args = parser.parse_args()
 
     if args.verify_official:
         verify_official()
+    elif args.offline_test_fixture and os.environ.get("TACHYON_RELEASE_POLICY_TEST") != "1":
+        raise ValueError("offline Wintun fixture generation is restricted to explicit release policy tests")
 
     document = {
         "schema_version": 1,
@@ -87,8 +96,13 @@ def main() -> int:
             "placement": "side-by-side with tachyon-core.exe",
         },
         "architectures": [
-            {"platform": architecture, "path_in_official_archive": member, "sha256": digest}
-            for architecture, (member, digest) in DLLS.items()
+            {
+                "platform": architecture,
+                "path_in_official_archive": member,
+                "sha256": digest,
+                "size": size,
+            }
+            for architecture, (member, digest, size) in DLLS.items()
         ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

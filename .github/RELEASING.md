@@ -24,8 +24,16 @@ release。
 Build metadata and ZIP file timestamps come from the verified commit's `SOURCE_DATE_EPOCH`, so a
 rebuild of the same commit does not embed the workflow wall clock in binaries or archives.
 
+The local PowerShell builder requires an existing annotated tag. Missing tags, lightweight tags,
+and tags that peel to a commit other than the checked-out `HEAD` or explicitly supplied full commit
+fail closed before metadata or binaries are produced.
+
 构建元数据和 ZIP 文件时间戳均来自已验证 commit 的 `SOURCE_DATE_EPOCH`，因此同一 commit 重构时不会把
 workflow 的实时钟表时间写入二进制或归档。
+
+本地 PowerShell 构建器要求 tag 已存在且必须是 annotated tag。tag 缺失、lightweight tag，或 tag
+最终指向的 commit 与当前 `HEAD` 或显式传入的完整 commit 不一致时，都会在生成元数据或二进制前
+fail-closed。
 
 ## Bilingual metadata contract / 双语元数据契约
 
@@ -63,6 +71,17 @@ CI 的 Bash 生成器与 Windows 本地 `scripts/prepare-release.ps1` 都渲染
 `.github/release-notes` 下的共享模板。本地 `scripts/build-release.ps1` 解析当前完整 commit，
 要求已存在的指定 tag 最终指向该 commit，并从 commit time 派生 `SOURCE_DATE_EPOCH`、嵌入式
 构建时间和归档时间戳；它不依赖 Bash，也不使用实时时钟元数据。
+
+Both PowerShell release paths call the same Python Wintun generator with `--verify-official` and the
+same release asset validator used by CI. The Wintun 0.14.1 contract pins archive SHA-256 plus DLL
+SHA-256 and sizes: Windows AMD64 `427552` bytes and ARM64 `222488` bytes. Network, version, digest,
+or size verification failures stop preparation. Offline generation is restricted to the explicit
+policy-test fixture gate and is never a production fallback.
+
+两个 PowerShell 发布路径都调用与 CI 相同的 Python Wintun 生成器（`--verify-official`）和发布资产
+validator。Wintun 0.14.1 契约同时固定压缩包 SHA-256、DLL SHA-256 与大小：Windows AMD64
+为 `427552` 字节，ARM64 为 `222488` 字节。网络、版本、digest 或 size 校验失败都会终止准备；
+离线生成仅允许显式 policy-test fixture 使用，不能作为生产回退。
 
 Both implementations must preserve the shared template and fixture policy in
 `.github/testdata/release-metadata`. The manifest contract is twelve LF-terminated, BOM-free

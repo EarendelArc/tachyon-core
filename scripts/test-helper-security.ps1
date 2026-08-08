@@ -59,19 +59,33 @@ namespace TachyonHarness {
 
     public sealed class AssignedProcessStartResult {
         private readonly List<string> errors = new List<string>();
+        internal IntPtr ProcessHandle { get; set; }
+        internal IntPtr ThreadHandle { get; set; }
+        public KillOnCloseJob Job { get; internal set; }
         public Process Process { get; internal set; }
         public int ProcessId { get; internal set; }
         public long StartTicksUtc { get; internal set; }
         public bool Created { get; internal set; }
         public bool Assigned { get; internal set; }
         public bool Resumed { get; internal set; }
+        public bool ExitConfirmed { get; internal set; }
+        public bool HandoffCompleted { get; internal set; }
+        public bool NativeHandlesClosed { get { return ProcessHandle == IntPtr.Zero && ThreadHandle == IntPtr.Zero; } }
+        public bool HasNativeProcessHandle { get { return ProcessHandle != IntPtr.Zero; } }
+        public bool HasNativeThreadHandle { get { return ThreadHandle != IntPtr.Zero; } }
+        public bool Success { get; internal set; }
+        public string[] Errors { get { return errors.ToArray(); } }
+        internal void AddError(string value) { errors.Add(value); }
+    }
+
+    public sealed class OwnedProcessActionResult {
+        private readonly List<string> errors = new List<string>();
+        public bool IdentityConfirmed { get; internal set; }
         public bool TerminationAttempted { get; internal set; }
         public bool TerminationSucceeded { get; internal set; }
-        public bool IndependentFallbackAttempted { get; internal set; }
-        public bool IndependentFallbackSucceeded { get; internal set; }
-        public bool CleanupConfirmed { get; internal set; }
-        public bool PidResidual { get; internal set; }
-        public bool PidReused { get; internal set; }
+        public bool WaitCompleted { get; internal set; }
+        public bool ExitConfirmed { get; internal set; }
+        public bool HandlesClosed { get; internal set; }
         public bool Success { get; internal set; }
         public string[] Errors { get { return errors.ToArray(); } }
         internal void AddError(string value) { errors.Add(value); }
@@ -153,6 +167,7 @@ namespace TachyonHarness {
 
         public AssignedProcessStartResult StartAssignedProcess(string applicationPath, string[] arguments) {
             AssignedProcessStartResult result = new AssignedProcessStartResult();
+            result.Job = this;
             IntPtr job = RequireHandle();
             string commandLine = QuoteArgument(applicationPath);
             if (arguments != null) {
@@ -165,20 +180,19 @@ namespace TachyonHarness {
             if (!CreateProcessW(applicationPath, mutableCommandLine, IntPtr.Zero, IntPtr.Zero, false,
                 CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, Environment.CurrentDirectory, ref startup, out information)) {
                 result.AddError("create_process_failed win32=" + Marshal.GetLastWin32Error());
-                result.CleanupConfirmed = true;
                 return result;
             }
             result.Created = true;
             result.ProcessId = unchecked((int)information.dwProcessId);
-            Process managed = null;
+            result.ProcessHandle = information.hProcess;
+            result.ThreadHandle = information.hThread;
             try {
                 long startTicks;
                 if (!TryGetStartTicks(information.hProcess, out startTicks)) {
                     result.AddError("get_process_times_failed win32=" + Marshal.GetLastWin32Error());
                 }
                 else { result.StartTicksUtc = startTicks; }
-                managed = Process.GetProcessById(result.ProcessId);
-                result.Process = managed;
+                result.Process = Process.GetProcessById(result.ProcessId);
 
                 int operationError;
                 if (!TryAssign(job, information.hProcess, out operationError)) {
@@ -195,18 +209,98 @@ namespace TachyonHarness {
                     }
                     else {
                         result.Resumed = true;
-                        result.Success = true;
+                        if (result.StartTicksUtc != 0 && result.Process != null) result.Success = true;
+                        else result.AddError("launch identity was incomplete after resume");
                     }
                 }
             }
             catch (Exception error) {
                 result.AddError("start_exception type=" + error.GetType().Name + " message=" + error.Message);
             }
-            finally {
-                if (!result.Success) CleanupFailedStart(result, information.hProcess, managed);
-                CloseHandle(information.hThread);
-                CloseHandle(information.hProcess);
+            return result;
+        }
+
+        public OwnedProcessActionResult AcceptSuccessfulLaunch(AssignedProcessStartResult owned) {
+            OwnedProcessActionResult result = new OwnedProcessActionResult();
+            if (!ValidateOwnership(owned, result)) return result;
+            if (!owned.Success || !owned.Assigned || !owned.Resumed || owned.Process == null) {
+                result.AddError("launch is not eligible for successful handoff");
+                return result;
             }
+            try {
+                if (owned.Process.Id != owned.ProcessId || owned.Process.StartTime.ToUniversalTime().Ticks != owned.StartTicksUtc) {
+                    result.AddError("managed process identity did not match launch ownership");
+                    return result;
+                }
+                result.IdentityConfirmed = true;
+            }
+            catch (Exception error) {
+                result.AddError("managed process identity check failed type=" + error.GetType().Name + " message=" + error.Message);
+                return result;
+            }
+            if (!CloseOwnedHandles(owned, result)) return result;
+            owned.HandoffCompleted = true;
+            result.Success = true;
+            return result;
+        }
+
+        public OwnedProcessActionResult TryTerminateAndWait(AssignedProcessStartResult owned, int waitMilliseconds) {
+            OwnedProcessActionResult result = new OwnedProcessActionResult();
+            if (!ValidateOwnership(owned, result)) return result;
+            if (waitMilliseconds < 0) {
+                result.AddError("wait timeout must be non-negative");
+                return result;
+            }
+            if (owned.ExitConfirmed) {
+                result.IdentityConfirmed = true;
+                result.WaitCompleted = true;
+                result.ExitConfirmed = true;
+                result.Success = CloseOwnedHandles(owned, result);
+                return result;
+            }
+            if (!ConfirmNativeProcessIdentity(owned, result)) return result;
+            result.TerminationAttempted = true;
+            int terminateError;
+            result.TerminationSucceeded = TryTerminate(owned.ProcessHandle, out terminateError);
+            if (!result.TerminationSucceeded) result.AddError("terminate_process_failed win32=" + terminateError);
+            uint wait = WaitForSingleObject(owned.ProcessHandle, result.TerminationSucceeded ? (uint)waitMilliseconds : Math.Min((uint)waitMilliseconds, 100u));
+            if (wait == WAIT_OBJECT_0) {
+                owned.ExitConfirmed = true;
+                result.WaitCompleted = true;
+                result.ExitConfirmed = true;
+                result.Success = CloseOwnedHandles(owned, result);
+                return result;
+            }
+            if (wait != WAIT_TIMEOUT) result.AddError("process_wait_failed win32=" + Marshal.GetLastWin32Error());
+            else result.AddError("process_wait_timed_out");
+            return result;
+        }
+
+        public OwnedProcessActionResult TryWaitForExitAndRelease(AssignedProcessStartResult owned, int waitMilliseconds) {
+            OwnedProcessActionResult result = new OwnedProcessActionResult();
+            if (!ValidateOwnership(owned, result)) return result;
+            if (waitMilliseconds < 0) {
+                result.AddError("wait timeout must be non-negative");
+                return result;
+            }
+            if (owned.ExitConfirmed) {
+                result.IdentityConfirmed = true;
+                result.WaitCompleted = true;
+                result.ExitConfirmed = true;
+                result.Success = CloseOwnedHandles(owned, result);
+                return result;
+            }
+            if (!ConfirmNativeProcessIdentity(owned, result)) return result;
+            uint wait = WaitForSingleObject(owned.ProcessHandle, (uint)waitMilliseconds);
+            if (wait != WAIT_OBJECT_0) {
+                if (wait == WAIT_TIMEOUT) result.AddError("process_wait_timed_out");
+                else result.AddError("process_wait_failed win32=" + Marshal.GetLastWin32Error());
+                return result;
+            }
+            owned.ExitConfirmed = true;
+            result.WaitCompleted = true;
+            result.ExitConfirmed = true;
+            result.Success = CloseOwnedHandles(owned, result);
             return result;
         }
 
@@ -319,46 +413,57 @@ namespace TachyonHarness {
             return true;
         }
 
-        private void CleanupFailedStart(AssignedProcessStartResult result, IntPtr processHandle, Process managed) {
-            result.TerminationAttempted = true;
-            int terminateError;
-            result.TerminationSucceeded = TryTerminate(processHandle, out terminateError);
-            if (!result.TerminationSucceeded) result.AddError("terminate_process_failed win32=" + terminateError);
+        private bool ValidateOwnership(AssignedProcessStartResult owned, OwnedProcessActionResult result) {
+            if (owned == null) { result.AddError("launch ownership is null"); return false; }
+            if (!Object.ReferenceEquals(owned.Job, this)) { result.AddError("launch ownership belongs to a different Job"); return false; }
+            if (!owned.Created) { result.AddError("launch did not create a process"); return false; }
+            return true;
+        }
 
-            uint wait = WaitForSingleObject(processHandle, result.TerminationSucceeded ? 5000u : 100u);
-            if (wait != WAIT_OBJECT_0) {
-                if (wait != WAIT_TIMEOUT) result.AddError("initial_process_wait_failed win32=" + Marshal.GetLastWin32Error());
-                result.IndependentFallbackAttempted = true;
-                try {
-                    if (managed == null) managed = Process.GetProcessById(result.ProcessId);
-                    if (!managed.HasExited) managed.Kill();
-                    bool waited = managed.WaitForExit(5000);
-                    result.IndependentFallbackSucceeded = waited && managed.HasExited;
-                    if (!result.IndependentFallbackSucceeded) result.AddError("independent_process_kill_wait_failed");
-                }
-                catch (Exception error) {
-                    result.AddError("independent_process_kill_failed type=" + error.GetType().Name + " message=" + error.Message);
-                }
-                wait = WaitForSingleObject(processHandle, 5000);
+        private bool ConfirmNativeProcessIdentity(AssignedProcessStartResult owned, OwnedProcessActionResult result) {
+            if (owned.ProcessHandle == IntPtr.Zero) {
+                result.AddError("owned native process handle is unavailable");
+                return false;
             }
+            uint nativeProcessId = GetProcessId(owned.ProcessHandle);
+            if (nativeProcessId == 0) {
+                result.AddError("GetProcessId failed win32=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            if (nativeProcessId != unchecked((uint)owned.ProcessId)) {
+                result.AddError("native process handle PID did not match launch ownership");
+                return false;
+            }
+            long nativeStartTicks;
+            if (owned.StartTicksUtc == 0 || !TryGetStartTicks(owned.ProcessHandle, out nativeStartTicks)) {
+                result.AddError("native process handle start time could not be verified win32=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            if (nativeStartTicks != owned.StartTicksUtc) {
+                result.AddError("native process handle start time did not match launch ownership");
+                return false;
+            }
+            result.IdentityConfirmed = true;
+            return true;
+        }
 
-            bool residual = false;
-            try {
-                using (Process candidate = Process.GetProcessById(result.ProcessId)) {
-                    long candidateTicks = candidate.StartTime.ToUniversalTime().Ticks;
-                    if (result.StartTicksUtc != 0 && candidateTicks == result.StartTicksUtc) residual = true;
-                    else if (result.StartTicksUtc != 0) result.PidReused = true;
-                    else residual = true;
+        private static bool CloseOwnedHandles(AssignedProcessStartResult owned, OwnedProcessActionResult result) {
+            if (owned.ThreadHandle != IntPtr.Zero) {
+                if (!CloseHandle(owned.ThreadHandle)) {
+                    result.AddError("CloseHandle(thread) failed win32=" + Marshal.GetLastWin32Error());
+                    return false;
                 }
+                owned.ThreadHandle = IntPtr.Zero;
             }
-            catch (ArgumentException) { }
-            catch (Exception error) {
-                residual = true;
-                result.AddError("process_residual_check_failed type=" + error.GetType().Name + " message=" + error.Message);
+            if (owned.ProcessHandle != IntPtr.Zero) {
+                if (!CloseHandle(owned.ProcessHandle)) {
+                    result.AddError("CloseHandle(process) failed win32=" + Marshal.GetLastWin32Error());
+                    return false;
+                }
+                owned.ProcessHandle = IntPtr.Zero;
             }
-            result.PidResidual = residual;
-            result.CleanupConfirmed = wait == WAIT_OBJECT_0 && !residual;
-            if (!result.CleanupConfirmed) result.AddError("failed_start_cleanup_not_confirmed");
+            result.HandlesClosed = owned.NativeHandlesClosed;
+            return result.HandlesClosed;
         }
 
         private static string QuoteArgument(string value) {
@@ -473,6 +578,8 @@ namespace TachyonHarness {
         private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetProcessId(IntPtr process);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
     }
@@ -938,18 +1045,47 @@ function Stop-VerifiedHarnessProcess {
         $identityVerified = $false
     }
 
+    $resolveKillTarget = {
+        param([string]$Stage)
+        $candidate = $null
+        try { $candidate = & $FindProcessByID $ExpectedProcessID }
+        catch {
+            $errors.Add("$Stage PID lookup failed; termination refused: $($_.Exception.Message)")
+            return $null
+        }
+        if ($null -eq $candidate) { return $null }
+        try {
+            if ($candidate -is [Diagnostics.Process] -and $candidate.Handle -eq [IntPtr]::Zero) { throw "process handle is unavailable" }
+            $candidateID = [int]$candidate.Id
+            $candidateStartTicks = [long]$candidate.StartTime.ToUniversalTime().Ticks
+            if ($candidateID -ne $ExpectedProcessID -or $candidateStartTicks -ne $ExpectedStartTicks) {
+                if ($candidateID -eq $ExpectedProcessID) { $result.pid_reused = $true }
+                $errors.Add("$Stage PID/StartTime mismatch; termination refused.")
+                return $null
+            }
+            return $candidate
+        }
+        catch {
+            $errors.Add("$Stage StartTime could not be read; termination refused: $($_.Exception.Message)")
+            return $null
+        }
+    }
+
     if ($identityVerified -and $result.initially_exited) {
         try { $result.initial_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
         catch { $errors.Add("Exited Core process wait confirmation failed: $($_.Exception.Message)") }
     }
     elseif ($identityVerified) {
-        try {
-            $result.process_kill_attempted = $true
-            & $KillProcess $Process
-        }
-        catch {
-            try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process termination failed: $($_.Exception.Message)") } }
-            catch { $errors.Add("Core process termination and state check failed: $($_.Exception.Message)") }
+        $killTarget = & $resolveKillTarget 'Core process termination'
+        if ($null -ne $killTarget) {
+            try {
+                $result.process_kill_attempted = $true
+                & $KillProcess $killTarget
+            }
+            catch {
+                try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process termination failed: $($_.Exception.Message)") } }
+                catch { $errors.Add("Core process termination and state check failed: $($_.Exception.Message)") }
+            }
         }
         try { $result.initial_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
         catch {
@@ -961,16 +1097,16 @@ function Stop-VerifiedHarnessProcess {
         try { $stillRunning = -not [bool]$Process.HasExited }
         catch { $errors.Add("Core process state check failed: $($_.Exception.Message)") }
         if (-not $result.initial_wait_completed -or $stillRunning) {
-            try {
-                if ([int]$Process.Id -ne $ExpectedProcessID -or [long]$Process.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) {
-                    throw "Core process identity changed before tree termination."
+            $treeTarget = & $resolveKillTarget 'Core process tree termination'
+            if ($null -ne $treeTarget) {
+                try {
+                    $result.tree_kill_attempted = $true
+                    & $KillProcessTree $treeTarget
                 }
-                $result.tree_kill_attempted = $true
-                & $KillProcessTree $Process
-            }
-            catch {
-                try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process tree termination failed: $($_.Exception.Message)") } }
-                catch { $errors.Add("Core process tree termination and state check failed: $($_.Exception.Message)") }
+                catch {
+                    try { if (-not [bool]$Process.HasExited) { $errors.Add("Core process tree termination failed: $($_.Exception.Message)") } }
+                    catch { $errors.Add("Core process tree termination and state check failed: $($_.Exception.Message)") }
+                }
             }
             try { $result.tree_wait_completed = [bool](& $WaitForExit $Process $WaitMilliseconds) }
             catch {
@@ -1001,6 +1137,163 @@ function Stop-VerifiedHarnessProcess {
     $waitConfirmed = $result.initial_wait_completed -or $result.tree_wait_completed
     $result.success = $identityVerified -and $waitConfirmed -and $result.final_has_exited -and -not $result.pid_residual -and $errors.Count -eq 0
     return [PSCustomObject]$result
+}
+
+function Stop-OwnedHarnessLaunch {
+    param(
+        [Parameter(Mandatory = $true)]$Launch,
+        [int]$WaitMilliseconds = 5000,
+        [scriptblock]$FindProcessByID = { param($ProcessID) return Get-Process -Id $ProcessID -ErrorAction SilentlyContinue },
+        [scriptblock]$KillFallback = { param($Target) $Target.Kill() },
+        [scriptblock]$WaitFallback = { param($Target, $Timeout) return $Target.WaitForExit($Timeout) }
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $result = [ordered]@{
+        pid = $Launch.ProcessId
+        start_ticks_utc = $Launch.StartTicksUtc
+        native = $null
+        fallback_attempted = $false
+        fallback_identity_confirmed = $false
+        fallback_wait_completed = $false
+        fallback_kill_refused = $false
+        pid_reused = $false
+        release = $null
+        exit_confirmed = $false
+        handles_closed = [bool]$Launch.NativeHandlesClosed
+        success = $false
+        errors = @()
+    }
+    try {
+        $native = $Launch.Job.TryTerminateAndWait($Launch, $WaitMilliseconds)
+        $result.native = $native
+        if ($native.Success) {
+            $result.exit_confirmed = [bool]$native.ExitConfirmed
+            $result.handles_closed = [bool]$native.HandlesClosed
+            $result.success = $result.exit_confirmed -and $result.handles_closed
+            return [PSCustomObject]$result
+        }
+        $errors.Add("native owned-handle cleanup failed: $($native.Errors -join '; ')")
+    }
+    catch { $errors.Add("native owned-handle cleanup threw: $($_.Exception.Message)") }
+
+    $candidate = $null
+    try { $candidate = & $FindProcessByID $Launch.ProcessId }
+    catch {
+        $result.fallback_kill_refused = $true
+        $errors.Add("PID fallback lookup failed; kill refused: $($_.Exception.Message)")
+    }
+    if ($null -eq $candidate -and -not $result.fallback_kill_refused) {
+        try {
+            $release = $Launch.Job.TryWaitForExitAndRelease($Launch, $WaitMilliseconds)
+            $result.release = $release
+            if ($release.Success) {
+                $result.exit_confirmed = [bool]$release.ExitConfirmed
+                $result.handles_closed = [bool]$release.HandlesClosed
+                $result.success = $result.exit_confirmed -and $result.handles_closed
+                $result.errors = @($errors)
+                return [PSCustomObject]$result
+            }
+            $errors.Add("PID was absent but owned handle did not confirm exit: $($release.Errors -join '; ')")
+        }
+        catch { $errors.Add("PID-absent owned-handle release failed: $($_.Exception.Message)") }
+    }
+    elseif ($null -ne $candidate) {
+        $candidateMatches = $false
+        try {
+            if ($candidate -isnot [Diagnostics.Process] -or $candidate.Handle -eq [IntPtr]::Zero) {
+                throw "PID fallback could not acquire a stable process handle"
+            }
+            $candidateID = [int]$candidate.Id
+            $candidateStartTicks = [long]$candidate.StartTime.ToUniversalTime().Ticks
+            if ($candidateID -eq [int]$Launch.ProcessId -and $candidateStartTicks -eq [long]$Launch.StartTicksUtc) {
+                $candidateMatches = $true
+                $result.fallback_identity_confirmed = $true
+            }
+            else {
+                $result.fallback_kill_refused = $true
+                $result.pid_reused = $candidateID -eq [int]$Launch.ProcessId -and $candidateStartTicks -ne [long]$Launch.StartTicksUtc
+                $errors.Add("PID fallback identity mismatch; kill refused.")
+            }
+        }
+        catch {
+            $result.fallback_kill_refused = $true
+            $errors.Add("PID fallback StartTime could not be read; kill refused: $($_.Exception.Message)")
+        }
+        if ($candidateMatches) {
+            $result.fallback_attempted = $true
+            try { & $KillFallback $candidate }
+            catch { $errors.Add("PID fallback termination failed: $($_.Exception.Message)") }
+            try { $result.fallback_wait_completed = [bool](& $WaitFallback $candidate $WaitMilliseconds) }
+            catch { $errors.Add("PID fallback wait failed: $($_.Exception.Message)") }
+            if (-not $result.fallback_wait_completed) { $errors.Add("PID fallback wait timed out.") }
+            try {
+                $release = $Launch.Job.TryWaitForExitAndRelease($Launch, $WaitMilliseconds)
+                $result.release = $release
+                if ($release.Success) {
+                    $result.exit_confirmed = [bool]$release.ExitConfirmed
+                    $result.handles_closed = [bool]$release.HandlesClosed
+                }
+                else { $errors.Add("owned handle did not confirm fallback exit: $($release.Errors -join '; ')") }
+            }
+            catch { $errors.Add("owned-handle fallback release failed: $($_.Exception.Message)") }
+        }
+    }
+
+    $result.handles_closed = [bool]$Launch.NativeHandlesClosed
+    $result.success = $result.exit_confirmed -and $result.handles_closed -and -not $result.fallback_kill_refused -and $errors.Count -eq 0
+    $result.errors = @($errors)
+    return [PSCustomObject]$result
+}
+
+function Confirm-OwnedHarnessLaunchReleased {
+    param(
+        $Launch,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [int]$WaitMilliseconds = 5000
+    )
+    if ($null -eq $Launch -or -not $Launch.Created -or $Launch.NativeHandlesClosed) { return $null }
+    $release = $Launch.Job.TryWaitForExitAndRelease($Launch, $WaitMilliseconds)
+    if (-not $release.Success -or -not $release.ExitConfirmed -or -not $release.HandlesClosed) {
+        throw "$Label did not release owned native handles after Job cleanup: $($release.Errors -join '; ')"
+    }
+    return $release
+}
+
+function Start-HarnessOwnedProcess {
+    param(
+        [Parameter(Mandatory = $true)]$Job,
+        [Parameter(Mandatory = $true)][string]$ApplicationPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $launch = $null
+    $handoff = $null
+    $cleanup = $null
+    $primaryErrors = [System.Collections.Generic.List[string]]::new()
+    try {
+        $launch = $Job.StartAssignedProcess($ApplicationPath, $Arguments)
+        if (-not $launch.Success) { $primaryErrors.Add("process launch failed: $($launch.Errors -join '; ')") }
+        else {
+            $handoff = $Job.AcceptSuccessfulLaunch($launch)
+            if (-not $handoff.Success) { $primaryErrors.Add("process ownership handoff failed: $($handoff.Errors -join '; ')") }
+        }
+    }
+    catch { $primaryErrors.Add("process launch threw before ownership handoff: $($_.Exception.Message)") }
+    finally {
+        if ($null -ne $launch -and $launch.Created -and $primaryErrors.Count -gt 0 -and -not $launch.NativeHandlesClosed) {
+            try { $cleanup = Stop-OwnedHarnessLaunch $launch }
+            catch { $primaryErrors.Add("initial failed-launch cleanup threw: $($_.Exception.Message)") }
+        }
+    }
+    $cleanupSucceeded = $null -eq $cleanup -or [bool]$cleanup.success
+    return [PSCustomObject]@{
+        launch = $launch
+        process = if ($null -ne $launch) { $launch.Process } else { $null }
+        start_ticks_utc = if ($null -ne $launch) { $launch.StartTicksUtc } else { [long]0 }
+        handoff = $handoff
+        cleanup = $cleanup
+        success = $primaryErrors.Count -eq 0 -and $cleanupSucceeded
+        primary_errors = @($primaryErrors)
+    }
 }
 
 function Wait-HarnessProcessIdentityGone {
@@ -1324,17 +1617,19 @@ function Invoke-HarnessJobProcessFixture {
     )
     $job = $null
     $process = $null
+    $startResult = $null
     $startTicks = [long]0
     $cleanup = $null
     try {
         $powerShellPath = (Get-Process -Id $PID).Path
         $job = [TachyonHarness.KillOnCloseJob]::Create()
-        $startResult = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', $Command))
-        if (-not $startResult.Success) {
-            throw "$Label fixture process failed to start safely: $($startResult | ConvertTo-Json -Depth 4 -Compress)"
+        $startOutcome = Start-HarnessOwnedProcess $job $powerShellPath ([string[]]@('-NoProfile', '-NonInteractive', '-Command', $Command))
+        $startResult = $startOutcome.launch
+        if (-not $startOutcome.success) {
+            throw "$Label fixture process failed to start safely: $($startOutcome | Select-Object success,primary_errors,cleanup | ConvertTo-Json -Depth 6 -Compress)"
         }
-        $process = $startResult.Process
-        $startTicks = [long]$startResult.StartTicksUtc
+        $process = $startOutcome.process
+        $startTicks = [long]$startOutcome.start_ticks_utc
         if (@($job.ActiveProcessIds()) -notcontains [uint64]$process.Id) { throw "$Label fixture process was not assigned to the Job." }
         $cleanup = Close-HarnessJobAndVerifyCleanup $job $process $process.Id $startTicks $true
         if (-not $cleanup.success -or -not $cleanup.assigned -or -not $cleanup.closed -or
@@ -1344,9 +1639,14 @@ function Invoke-HarnessJobProcessFixture {
         return $cleanup
     }
     finally {
+        if ($null -ne $startResult -and $startResult.Created -and -not $startResult.NativeHandlesClosed) {
+            $ownedFallback = Stop-OwnedHarnessLaunch $startResult
+            if (-not $ownedFallback.success) { throw "$Label fixture owner fallback failed: $($ownedFallback.errors -join '; ')" }
+        }
         if ($null -ne $job -and -not $job.IsClosed) {
             [void](Close-HarnessJobWithBoundedFallback $job "$Label fixture")
         }
+        [void](Confirm-OwnedHarnessLaunchReleased $startResult "$Label fixture")
         if ($null -ne $process -and $startTicks -ne 0) {
             $fallback = Stop-VerifiedHarnessProcess $process $process.Id $startTicks
             if (-not $fallback.success) { throw "$Label fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
@@ -1359,6 +1659,7 @@ function Invoke-FastParentJobCleanupFixture {
     $childPIDPath = Join-Path $directory 'child.pid'
     $job = $null
     $parent = $null
+    $parentStartResult = $null
     $parentStartTicks = [long]0
     $child = $null
     $childStartTicks = [long]0
@@ -1371,12 +1672,13 @@ function Invoke-FastParentJobCleanupFixture {
         $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($parentScript))
 
         $job = [TachyonHarness.KillOnCloseJob]::Create()
-        $parentStartResult = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand))
-        if (-not $parentStartResult.Success) {
-            throw "Fast-parent fixture process failed to start safely: $($parentStartResult | ConvertTo-Json -Depth 4 -Compress)"
+        $parentStartOutcome = Start-HarnessOwnedProcess $job $powerShellPath ([string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand))
+        $parentStartResult = $parentStartOutcome.launch
+        if (-not $parentStartOutcome.success) {
+            throw "Fast-parent fixture process failed to start safely: $($parentStartOutcome | Select-Object success,primary_errors,cleanup | ConvertTo-Json -Depth 6 -Compress)"
         }
-        $parent = $parentStartResult.Process
-        $parentStartTicks = [long]$parentStartResult.StartTicksUtc
+        $parent = $parentStartOutcome.process
+        $parentStartTicks = [long]$parentStartOutcome.start_ticks_utc
         $parentWaitCompleted = [bool]$parent.WaitForExit(5000)
         if (-not $parentWaitCompleted -or -not $parent.HasExited) { throw "Fast-parent fixture parent did not exit within the bounded wait." }
 
@@ -1402,9 +1704,14 @@ function Invoke-FastParentJobCleanupFixture {
         return $cleanup
     }
     finally {
+        if ($null -ne $parentStartResult -and $parentStartResult.Created -and -not $parentStartResult.NativeHandlesClosed) {
+            $ownedFallback = Stop-OwnedHarnessLaunch $parentStartResult
+            if (-not $ownedFallback.success) { throw "Fast-parent fixture owner fallback failed: $($ownedFallback.errors -join '; ')" }
+        }
         if ($null -ne $job -and -not $job.IsClosed) {
             [void](Close-HarnessJobWithBoundedFallback $job 'Fast-parent fixture')
         }
+        [void](Confirm-OwnedHarnessLaunchReleased $parentStartResult 'Fast-parent fixture')
         foreach ($entry in @(
             @{ Label = 'child'; Process = $child; StartTicks = $childStartTicks },
             @{ Label = 'parent'; Process = $parent; StartTicks = $parentStartTicks }
@@ -1424,65 +1731,97 @@ function Invoke-HarnessJobFaultInjectionTests {
     $powerShellPath = (Get-Process -Id $PID).Path
     $failedStartEvidence = [System.Collections.Generic.List[object]]::new()
     foreach ($fixture in @(
-        @{ Label = 'assign'; AssignFailures = 1; TerminateFailures = 0; ResumeFailures = 0; ExpectAssigned = $false; ExpectIndependentFallback = $false },
-        @{ Label = 'terminate'; AssignFailures = 1; TerminateFailures = 1; ResumeFailures = 0; ExpectAssigned = $false; ExpectIndependentFallback = $true },
-        @{ Label = 'resume'; AssignFailures = 0; TerminateFailures = 0; ResumeFailures = 1; ExpectAssigned = $true; ExpectIndependentFallback = $false }
+        @{ Label = 'assign'; AssignFailures = 1; TerminateFailures = 0; ResumeFailures = 0; ExpectAssigned = $false; InjectFallbackFailure = $false },
+        @{ Label = 'terminate-fallback'; AssignFailures = 1; TerminateFailures = 1; ResumeFailures = 0; ExpectAssigned = $false; InjectFallbackFailure = $true },
+        @{ Label = 'resume'; AssignFailures = 0; TerminateFailures = 0; ResumeFailures = 1; ExpectAssigned = $true; InjectFallbackFailure = $false }
     )) {
         $job = $null
         $start = $null
+        $initialCleanup = $null
+        $finalCleanup = $null
         try {
             $job = [TachyonHarness.KillOnCloseJob]::CreateWithFaults($fixture.AssignFailures, $fixture.TerminateFailures, 0, $fixture.ResumeFailures)
             $start = $job.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
             if ($start.Success -or -not $start.Created -or ([bool]$start.Assigned -ne [bool]$fixture.ExpectAssigned) -or $start.Resumed -or
-                -not $start.TerminationAttempted -or -not $start.CleanupConfirmed -or $start.PidResidual) {
-                throw "$($fixture.Label) failure fixture did not return a safe failed-start result: $($start | ConvertTo-Json -Depth 4 -Compress)"
+                -not $start.HasNativeProcessHandle -or -not $start.HasNativeThreadHandle -or $start.NativeHandlesClosed) {
+                throw "$($fixture.Label) fixture did not return an owned failed-start state."
             }
-            if ([bool]$start.IndependentFallbackAttempted -ne [bool]$fixture.ExpectIndependentFallback) {
-                throw "$($fixture.Label) failure fixture used an unexpected independent fallback path."
+            if ($fixture.InjectFallbackFailure) {
+                $initialCleanup = Stop-OwnedHarnessLaunch $start -KillFallback { param($Target) } -WaitFallback { param($Target, $Timeout) return $false }
+                if ($initialCleanup.success -or -not $initialCleanup.fallback_attempted -or $initialCleanup.fallback_kill_refused -or $start.NativeHandlesClosed) {
+                    throw "Terminate/fallback failure fixture did not preserve ownership for outer finally retry."
+                }
             }
-            if ($fixture.ExpectIndependentFallback -and -not $start.IndependentFallbackSucceeded) {
-                throw "TerminateProcess failure fixture did not complete the independent fallback."
+            else {
+                $initialCleanup = Stop-OwnedHarnessLaunch $start
+                if (-not $initialCleanup.success -or -not $start.NativeHandlesClosed) {
+                    throw "$($fixture.Label) fixture did not complete owned-handle cleanup: $($initialCleanup.errors -join '; ')"
+                }
             }
-            $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
-            if (-not $gone.gone -or $gone.residual) { throw "$($fixture.Label) failure fixture left its suspended process behind." }
-            $failedStartEvidence.Add([PSCustomObject]@{
-                label = $fixture.Label
-                created = [bool]$start.Created
-                assigned = [bool]$start.Assigned
-                termination_succeeded = [bool]$start.TerminationSucceeded
-                independent_fallback_attempted = [bool]$start.IndependentFallbackAttempted
-                independent_fallback_succeeded = [bool]$start.IndependentFallbackSucceeded
-                cleanup_confirmed = [bool]$start.CleanupConfirmed
-                pid_residual = [bool]$start.PidResidual
-            })
         }
         finally {
-            if ($null -ne $job -and -not $job.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $job "$($fixture.Label) failure fixture") }
-            if ($null -ne $start -and $start.Created -and $start.StartTicksUtc -ne 0) {
-                $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 100
-                if (-not $gone.gone -or $gone.residual) {
-                    $resident = Get-Process -Id $start.ProcessId -ErrorAction SilentlyContinue
-                    if ($null -ne $resident) {
-                        $fallback = Stop-VerifiedHarnessProcess $resident $start.ProcessId $start.StartTicksUtc
-                        if (-not $fallback.success) { throw "$($fixture.Label) test fallback did not prove process exit: $($fallback.errors -join '; ')" }
-                    }
-                }
-                $finalGone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
-                if (-not $finalGone.gone -or $finalGone.residual) { throw "$($fixture.Label) test fallback left a residual process." }
+            if ($null -ne $start -and $start.Created -and -not $start.NativeHandlesClosed) {
+                $finalCleanup = Stop-OwnedHarnessLaunch $start
+                if (-not $finalCleanup.success) { throw "$($fixture.Label) outer finally retry failed: $($finalCleanup.errors -join '; ')" }
             }
+            if ($null -ne $job -and -not $job.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $job "$($fixture.Label) failure fixture") }
+            [void](Confirm-OwnedHarnessLaunchReleased $start "$($fixture.Label) failure fixture")
+        }
+        $gone = Wait-HarnessProcessIdentityGone $start.ProcessId $start.StartTicksUtc 5000
+        if (-not $gone.gone -or $gone.residual -or -not $start.NativeHandlesClosed) { throw "$($fixture.Label) fixture left process ownership unresolved." }
+        $failedStartEvidence.Add([PSCustomObject]@{
+            label = $fixture.Label
+            assigned = [bool]$start.Assigned
+            initial_cleanup_success = [bool]$initialCleanup.success
+            outer_retry_used = $null -ne $finalCleanup
+            outer_retry_success = $null -eq $finalCleanup -or [bool]$finalCleanup.success
+            handles_closed = [bool]$start.NativeHandlesClosed
+            residual = [bool]$gone.residual
+        })
+    }
+
+    $replacementJob = $null
+    $replacementStart = $null
+    $replacementProcess = $null
+    $replacementTicks = [long]0
+    $replacementKillCalls = [PSCustomObject]@{ Value = 0 }
+    try {
+        $replacementJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(1, 1, 0, 0)
+        $replacementStart = $replacementJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
+        $replacementProcess = Start-Process -FilePath $powerShellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden
+        $replacementTicks = [long]$replacementProcess.StartTime.ToUniversalTime().Ticks
+        $refused = Stop-OwnedHarnessLaunch $replacementStart `
+            -FindProcessByID { param($ProcessID) return $replacementProcess } `
+            -KillFallback { param($Target) $replacementKillCalls.Value++ }
+        if ($refused.success -or -not $refused.fallback_kill_refused -or $replacementKillCalls.Value -ne 0 -or $replacementProcess.HasExited) {
+            throw "PID replacement fixture did not refuse fallback termination."
+        }
+    }
+    finally {
+        if ($null -ne $replacementStart -and $replacementStart.Created -and -not $replacementStart.NativeHandlesClosed) {
+            $ownerRetry = Stop-OwnedHarnessLaunch $replacementStart
+            if (-not $ownerRetry.success) { throw "PID replacement fixture owner retry failed: $($ownerRetry.errors -join '; ')" }
+        }
+        if ($null -ne $replacementJob -and -not $replacementJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $replacementJob 'PID replacement fixture') }
+        [void](Confirm-OwnedHarnessLaunchReleased $replacementStart 'PID replacement fixture')
+        if ($null -ne $replacementProcess -and $replacementTicks -ne 0) {
+            $replacementCleanup = Stop-VerifiedHarnessProcess $replacementProcess $replacementProcess.Id $replacementTicks
+            if (-not $replacementCleanup.success) { throw "PID replacement control process cleanup failed: $($replacementCleanup.errors -join '; ')" }
         }
     }
 
     $closeJob = $null
     $closeProcess = $null
+    $closeStart = $null
     $closeStartTicks = [long]0
     $retryEvidence = $null
     try {
         $closeJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(0, 0, 1, 0)
-        $closeStart = $closeJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
-        if (-not $closeStart.Success) { throw "CloseHandle retry fixture could not start: $($closeStart | ConvertTo-Json -Depth 4 -Compress)" }
-        $closeProcess = $closeStart.Process
-        $closeStartTicks = [long]$closeStart.StartTicksUtc
+        $closeOutcome = Start-HarnessOwnedProcess $closeJob $powerShellPath ([string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30'))
+        $closeStart = $closeOutcome.launch
+        if (-not $closeOutcome.success) { throw "CloseHandle retry fixture could not start: $($closeOutcome.primary_errors -join '; ')" }
+        $closeProcess = $closeOutcome.process
+        $closeStartTicks = [long]$closeOutcome.start_ticks_utc
         $firstClose = $closeJob.TryClose()
         if ($firstClose.Success -or -not $firstClose.HandleRetained -or $closeJob.IsClosed -or $closeProcess.HasExited) {
             throw "Injected CloseHandle failure did not retain the live Job and process."
@@ -1504,7 +1843,12 @@ function Invoke-HarnessJobFaultInjectionTests {
         }
     }
     finally {
+        if ($null -ne $closeStart -and $closeStart.Created -and -not $closeStart.NativeHandlesClosed) {
+            $ownerFallback = Stop-OwnedHarnessLaunch $closeStart
+            if (-not $ownerFallback.success) { throw "CloseHandle retry fixture owner fallback failed: $($ownerFallback.errors -join '; ')" }
+        }
         if ($null -ne $closeJob -and -not $closeJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $closeJob 'CloseHandle retry fixture') }
+        [void](Confirm-OwnedHarnessLaunchReleased $closeStart 'CloseHandle retry fixture')
         if ($null -ne $closeProcess -and $closeStartTicks -ne 0) {
             $fallback = Stop-VerifiedHarnessProcess $closeProcess $closeProcess.Id $closeStartTicks
             if (-not $fallback.success) { throw "CloseHandle retry fixture fallback did not prove process exit: $($fallback.errors -join '; ')" }
@@ -1513,6 +1857,7 @@ function Invoke-HarnessJobFaultInjectionTests {
 
     $persistentJob = $null
     $persistentProcess = $null
+    $persistentStart = $null
     $persistentStartTicks = [long]0
     $persistentChild = $null
     $persistentChildStartTicks = [long]0
@@ -1526,10 +1871,11 @@ function Invoke-HarnessJobFaultInjectionTests {
         $persistentScript = "`$child = Start-Process -FilePath '$escapedPowerShellPath' -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden; [IO.File]::WriteAllText('$escapedChildPIDPath', [string]`$child.Id); Start-Sleep -Seconds 30"
         $persistentCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($persistentScript))
         $persistentJob = [TachyonHarness.KillOnCloseJob]::CreateWithFaults(0, 0, 3, 0)
-        $persistentStart = $persistentJob.StartAssignedProcess($powerShellPath, [string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $persistentCommand))
-        if (-not $persistentStart.Success) { throw "Persistent CloseHandle fixture could not start safely." }
-        $persistentProcess = $persistentStart.Process
-        $persistentStartTicks = [long]$persistentStart.StartTicksUtc
+        $persistentOutcome = Start-HarnessOwnedProcess $persistentJob $powerShellPath ([string[]]@('-NoProfile', '-NonInteractive', '-EncodedCommand', $persistentCommand))
+        $persistentStart = $persistentOutcome.launch
+        if (-not $persistentOutcome.success) { throw "Persistent CloseHandle fixture could not start safely: $($persistentOutcome.primary_errors -join '; ')" }
+        $persistentProcess = $persistentOutcome.process
+        $persistentStartTicks = [long]$persistentOutcome.start_ticks_utc
         $childDeadline = [DateTime]::UtcNow.AddSeconds(5)
         while (-not (Test-Path -LiteralPath $persistentChildPIDPath)) {
             if ([DateTime]::UtcNow -ge $childDeadline) { throw "Persistent CloseHandle fixture did not publish its child PID." }
@@ -1549,7 +1895,12 @@ function Invoke-HarnessJobFaultInjectionTests {
         }
     }
     finally {
+        if ($null -ne $persistentStart -and $persistentStart.Created -and -not $persistentStart.NativeHandlesClosed) {
+            $ownerFallback = Stop-OwnedHarnessLaunch $persistentStart
+            if (-not $ownerFallback.success) { throw "Persistent CloseHandle fixture owner fallback failed: $($ownerFallback.errors -join '; ')" }
+        }
         if ($null -ne $persistentJob -and -not $persistentJob.IsClosed) { [void](Close-HarnessJobWithBoundedFallback $persistentJob 'Persistent CloseHandle fixture') }
+        [void](Confirm-OwnedHarnessLaunchReleased $persistentStart 'Persistent CloseHandle fixture')
         foreach ($entry in @(
             @{ Label = 'parent'; Process = $persistentProcess; StartTicks = $persistentStartTicks },
             @{ Label = 'child'; Process = $persistentChild; StartTicks = $persistentChildStartTicks }
@@ -1612,7 +1963,8 @@ function Invoke-EvidenceFailureTests {
     $escalated = [PSCustomObject]@{ Id = 4292; StartTime = $start; HasExited = $false }
     $escalatedResult = Stop-VerifiedHarnessProcess $escalated 4292 $start.Ticks -WaitMilliseconds 1 `
         -KillProcess { param($Target) } -KillProcessTree { param($Target) $Target.HasExited = $true } `
-        -WaitForExit { param($Target, $Timeout) return [bool]$Target.HasExited } -FindProcessByID { param($ProcessID) return $null }
+        -WaitForExit { param($Target, $Timeout) return [bool]$Target.HasExited } `
+        -FindProcessByID { param($ProcessID) if ($escalated.HasExited) { return $null }; return $escalated }
     if (-not $escalatedResult.success -or -not $escalatedResult.tree_kill_attempted -or -not $escalatedResult.tree_wait_completed) { throw "Core tree-kill escalation fixture did not prove exit." }
 
     $exited = [PSCustomObject]@{ Id = 4343; StartTime = $start; HasExited = $true }
@@ -1890,6 +2242,7 @@ if ($RunServiceSIDHarness) {
     $serverSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
     $diagnosticOwnerSID = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
     $coreProcess = $null
+    $coreStartResult = $null
     $coreStartTicks = [long]0
     $coreJob = $null
     $coreJobAssigned = $false
@@ -1931,13 +2284,14 @@ if ($RunServiceSIDHarness) {
         & $scPath config $name binPath= $image | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "temporary service configuration failed with exit code $LASTEXITCODE" }
         $coreJob = [TachyonHarness.KillOnCloseJob]::Create()
-        $coreStartResult = $coreJob.StartAssignedProcess($resolvedBinary, [string[]]@('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready))
+        $coreStartOutcome = Start-HarnessOwnedProcess $coreJob $resolvedBinary ([string[]]@('helper', '--test-server', '--pipe', $corePipe, '--allow-sid', $serviceSID, '--ready-file', $harness.Ready))
+        $coreStartResult = $coreStartOutcome.launch
         $coreJobAssigned = [bool]$coreStartResult.Assigned
-        if (-not $coreStartResult.Success) {
-            throw "test Core failed to start safely: $($coreStartResult | Select-Object ProcessId,StartTicksUtc,Created,Assigned,Resumed,TerminationAttempted,TerminationSucceeded,IndependentFallbackAttempted,IndependentFallbackSucceeded,CleanupConfirmed,PidResidual,PidReused,Errors | ConvertTo-Json -Depth 4 -Compress)"
+        if (-not $coreStartOutcome.success) {
+            throw "test Core failed to start safely: $($coreStartOutcome | Select-Object success,primary_errors,cleanup | ConvertTo-Json -Depth 6 -Compress)"
         }
-        $coreProcess = $coreStartResult.Process
-        $coreStartTicks = [long]$coreStartResult.StartTicksUtc
+        $coreProcess = $coreStartOutcome.process
+        $coreStartTicks = [long]$coreStartOutcome.start_ticks_utc
         $readyDeadline = (Get-Date).AddSeconds(10)
         do {
             if ($coreProcess.HasExited) { throw "test Core exited before pipe readiness; exit_code=$($coreProcess.ExitCode)" }
@@ -2011,6 +2365,13 @@ if ($RunServiceSIDHarness) {
             }
         }
         catch { $cleanupFailures.Add("service cleanup failed: $($_.Exception.Message)") }
+        if ($null -ne $coreStartResult -and $coreStartResult.Created -and -not $coreStartResult.NativeHandlesClosed) {
+            try {
+                $ownedCleanup = Stop-OwnedHarnessLaunch $coreStartResult
+                if (-not $ownedCleanup.success) { $cleanupFailures.Add("test Core owned launch cleanup failed: $($ownedCleanup.errors -join '; ')") }
+            }
+            catch { $cleanupFailures.Add("test Core owned launch cleanup threw: $($_.Exception.Message)") }
+        }
         if ($null -ne $coreProcess -and $null -ne $coreJob) {
             try {
                 $jobCleanup = Close-HarnessJobAndVerifyCleanup $coreJob $coreProcess $coreProcess.Id $coreStartTicks $coreJobAssigned
@@ -2074,6 +2435,8 @@ if ($RunServiceSIDHarness) {
             }
             $cleanupFailures.Add("test Core Job cleanup did not produce structured evidence")
         }
+        try { [void](Confirm-OwnedHarnessLaunchReleased $coreStartResult 'test Core Job') }
+        catch { $cleanupFailures.Add("test Core owned handles remained after Job cleanup: $($_.Exception.Message)") }
         try { Remove-VerifiedHarnessArtifacts $harnessPath }
         catch { $cleanupFailures.Add("harness artifact cleanup failed: $($_.Exception.Message)") }
         try {

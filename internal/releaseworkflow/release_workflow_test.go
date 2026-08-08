@@ -39,6 +39,11 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 
 	for _, text := range []string{
 		`bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release`,
+		"generate-build-metadata.py",
+		"generate-evidence-manifest.py",
+		"generate-wintun-contract.py",
+		"verify-published-release.sh",
+		"Upload sanitized Helper evidence",
 		"VERIFIED_COMMIT: ${{ needs.verify_tag.outputs.commit }}",
 	} {
 		if !strings.Contains(workflow, text) {
@@ -54,20 +59,21 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 		"Version: `{{VERSION}}`",
 		"Source commit: `{{COMMIT}}`",
 		"## Compatibility",
-		"## Installation",
-		"## Verification",
-		"## Alpha limitations",
-		"Tachyon Core is alpha software and is not stable or complete.",
-		"System proxy takeover remains disabled by default in Prism-managed alpha flows",
-		"Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.",
-		"Real VPS, real client, and real game UDP acceleration paths still need field testing.",
+		"## Verification and release assets",
+		"## Limitations",
+		"WFP Helper / Captured UDP Named Pipe v2 Preview",
+		"no real WFP callout",
+		"no signed WFP driver",
+		"no process capture",
+		"no real game end-to-end (E2E) validation",
+		"Prism-managed system-proxy takeover remains disabled by default",
 		"RELEASE_NOTES.zh-CN.md",
 		"版本：`{{VERSION}}`",
 		"源代码提交：`{{COMMIT}}`",
 		"## 兼容性",
-		"## 安装",
-		"## 校验",
-		"## Alpha 限制",
+		"## 校验与发布资产",
+		"## 限制",
+		"不包含真实 WFP callout",
 	} {
 		if !strings.Contains(templates, text) {
 			t.Fatalf("shared release note templates are missing %q", text)
@@ -86,6 +92,9 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 		`cat "${release_dir}/RELEASE_NOTES.md"`,
 		`cat "${release_dir}/RELEASE_NOTES.zh-CN.md"`,
 		`--notes-file "${body_file}"`,
+		"BUILD_METADATA.json",
+		"WINTUN_SIDECAR_CONTRACT.json",
+		"EVIDENCE_MANIFEST.json",
 	} {
 		if !strings.Contains(publication, text) {
 			t.Fatalf("release publication script is missing bilingual publication behavior %q", text)
@@ -175,7 +184,7 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 	for _, text := range []string{
 		"RELEASE_NOTES.md.tmpl",
 		"RELEASE_NOTES.zh-CN.md.tmpl",
-		`@("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames`,
+		`@("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames + $auxiliaryNames`,
 		"[System.Text.ASCIIEncoding]::new()",
 		"$checksumLines -join",
 	} {

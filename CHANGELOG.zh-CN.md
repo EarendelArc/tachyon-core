@@ -4,6 +4,12 @@ Tachyon Core 的版本变更记录。该文件与英文 `CHANGELOG.md` 同步维
 
 ## [未发布]
 
+### v0.1.0-alpha.24 发布准备
+- 将预览名称统一为 **WFP Helper / Captured UDP Named Pipe v2 Preview（WFP Helper / 捕获 UDP Named Pipe v2 预览版）**。
+- 将确定性 `BUILD_METADATA.json`、去敏 Helper evidence manifest 以及外置 Wintun sidecar 契约纳入发布资产。
+- 增加覆盖全部资产的严格 SHA-256 校验，以及发布后 immutable、资产集合和远端 digest 校验。
+- 明确发布边界：不包含真实 WFP callout、签名驱动、内核注入、进程捕获，也不声称完成真实游戏 E2E。
+
 ## [v0.1.0-alpha.23] - 2026-07-29
 
 ### 发布边界

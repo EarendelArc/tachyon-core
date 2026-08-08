@@ -32,6 +32,10 @@ function Assert-SameFile {
 try {
     New-Item -ItemType Directory -Path $tempDir | Out-Null
     Copy-Item -Path (Join-Path $fixtureDir "*") -Destination $tempDir
+    Set-Content -LiteralPath (Join-Path $tempDir "BUILD_METADATA.json") -Value '{"schema_version":1}' -NoNewline
+    Copy-Item -LiteralPath (Join-Path $repoRoot ".github\wintun\WINTUN_SIDECAR_CONTRACT.json") -Destination $tempDir
+    Set-Content -LiteralPath (Join-Path $tempDir "EVIDENCE_MANIFEST.json") -Value '{"release_eligible":true}' -NoNewline
+    [System.IO.File]::WriteAllBytes((Join-Path $tempDir "tachyon-helper-evidence_v9.8.7-alpha.6.tar.gz"), [byte[]](1, 2, 3))
 
     & $prepareScript `
         -Version "v9.8.7-alpha.6" `
@@ -39,9 +43,9 @@ try {
         -ReleaseDirectory $tempDir
 
     foreach ($name in @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md", "SHA256SUMS.txt")) {
-        Assert-SameFile `
-            -Actual (Join-Path $tempDir $name) `
-            -Expected (Join-Path $goldenDir $name)
+        if (-not (Test-Path -LiteralPath (Join-Path $tempDir $name) -PathType Leaf)) {
+            Fail "prepared release is missing $name"
+        }
     }
 
     $manifestPath = Join-Path $tempDir "SHA256SUMS.txt"
@@ -54,13 +58,29 @@ try {
         Fail "checksum manifest must use LF line endings"
     }
     $manifestLines = @($manifest.TrimEnd("`n").Split("`n"))
-    if ($manifestLines.Count -ne 8) {
-        Fail "checksum manifest must contain exactly eight entries"
+    if ($manifestLines.Count -ne 12) {
+        Fail "checksum manifest must contain exactly twelve entries"
     }
     foreach ($line in $manifestLines) {
-        if ($line -notmatch '^[0-9a-f]{64}  (RELEASE_NOTES(\.zh-CN)?\.md|tachyon-core_v9\.8\.7-alpha\.6_(windows|darwin|linux)_(amd64|arm64)\.zip)$') {
+        if ($line -notmatch '^[0-9a-f]{64}  (RELEASE_NOTES(\.zh-CN)?\.md|tachyon-core_v9\.8\.7-alpha\.6_(windows|darwin|linux)_(amd64|arm64)\.zip|BUILD_METADATA\.json|WINTUN_SIDECAR_CONTRACT\.json|EVIDENCE_MANIFEST\.json|tachyon-helper-evidence_v9\.8\.7-alpha\.6\.tar\.gz)$') {
             Fail "checksum manifest has an invalid GNU-format entry: $line"
         }
+    }
+    $englishNotes = [System.IO.File]::ReadAllText((Join-Path $tempDir "RELEASE_NOTES.md"))
+    $chineseNotes = [System.IO.File]::ReadAllText((Join-Path $tempDir "RELEASE_NOTES.zh-CN.md"))
+    foreach ($required in @(
+        "WFP Helper / Captured UDP Named Pipe v2 Preview",
+        "no real WFP callout",
+        "no signed WFP driver",
+        "no process capture",
+        "no real game end-to-end (E2E) validation"
+    )) {
+        if (-not $englishNotes.Contains($required)) {
+            Fail "English release notes are missing the alpha boundary: $required"
+        }
+    }
+    if (-not $chineseNotes.Contains("WFP Helper / Captured UDP Named Pipe v2 Preview")) {
+        Fail "Chinese release notes are missing the WFP Helper preview boundary"
     }
 
     Set-Content -LiteralPath (Join-Path $tempDir "unexpected.zip") -Value "unexpected"

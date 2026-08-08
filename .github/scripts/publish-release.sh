@@ -26,18 +26,55 @@ repository=${GITHUB_REPOSITORY:-}
 [[ -f "${release_dir}/RELEASE_NOTES.zh-CN.md" ]] || die "Simplified Chinese release notes are missing"
 [[ -f "${release_dir}/SHA256SUMS.txt" ]] || die "checksum file is missing"
 
+platforms=(
+  windows_amd64
+  windows_arm64
+  darwin_amd64
+  darwin_arm64
+  linux_amd64
+  linux_arm64
+)
+zip_assets=()
+for platform in "${platforms[@]}"; do
+  zip_assets+=("${release_dir}/tachyon-core_${version}_$platform.zip")
+done
+auxiliary_assets=(
+  "${release_dir}/BUILD_METADATA.json"
+  "${release_dir}/WINTUN_SIDECAR_CONTRACT.json"
+  "${release_dir}/EVIDENCE_MANIFEST.json"
+  "${release_dir}/tachyon-helper-evidence_${version}.tar.gz"
+)
+for asset in "${zip_assets[@]}" "${auxiliary_assets[@]}"; do
+  [[ -f "${asset}" ]] || die "required release asset is missing: ${asset}"
+done
+
 shopt -s nullglob
-zip_assets=("${release_dir}"/*.zip)
-[[ ${#zip_assets[@]} -gt 0 ]] || die "release ZIP assets are missing"
+actual_zips=("${release_dir}"/*.zip)
+[[ ${#actual_zips[@]} -eq ${#zip_assets[@]} ]] || die "release ZIP asset set is not exactly six platforms"
+expected_files=(
+  "${zip_assets[@]}"
+  "${auxiliary_assets[@]}"
+  "${release_dir}/RELEASE_NOTES.md"
+  "${release_dir}/RELEASE_NOTES.zh-CN.md"
+  "${release_dir}/SHA256SUMS.txt"
+)
+mapfile -t actual_files < <(find "${release_dir}" -maxdepth 1 -type f -printf '%p\n' | LC_ALL=C sort)
+mapfile -t expected_sorted < <(printf '%s\n' "${expected_files[@]}" | LC_ALL=C sort)
+[[ "${actual_files[*]}" == "${expected_sorted[*]}" ]] || die "release directory contains an unexpected asset set"
+python3 "${BASH_SOURCE[0]%/*}/validate-release-assets.py" \
+  --release-directory "${release_dir}" \
+  --version "${version}" \
+  --commit "${commit,,}"
 assets=(
   "${zip_assets[@]}"
+  "${auxiliary_assets[@]}"
   "${release_dir}/RELEASE_NOTES.md"
   "${release_dir}/RELEASE_NOTES.zh-CN.md"
   "${release_dir}/SHA256SUMS.txt"
 )
 
 expected_checksum_entries=(RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md)
-for asset in "${zip_assets[@]}"; do
+for asset in "${zip_assets[@]}" "${auxiliary_assets[@]}"; do
   expected_checksum_entries+=("$(basename "${asset}")")
 done
 

@@ -4,6 +4,15 @@ All notable changes to Tachyon Core will be documented in this file.
 
 ## [Unreleased]
 
+### Release preparation for v0.1.0-alpha.24
+- Reframed the preview as **WFP Helper / Captured UDP Named Pipe v2 Preview**.
+- Added deterministic `BUILD_METADATA.json`, sanitized Helper evidence manifests,
+  and the external Wintun sidecar contract to the release asset set.
+- Added strict SHA-256 coverage and post-publication immutable/asset-digest
+  verification.
+- The release boundary remains explicit: no real WFP callout, signed driver,
+  kernel injection, process capture, or real game E2E is included or claimed.
+
 ## [v0.1.0-alpha.23] - 2026-07-29
 
 ### Release boundary

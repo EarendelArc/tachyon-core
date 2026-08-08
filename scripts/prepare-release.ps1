@@ -59,6 +59,18 @@ if ($actualZips.Count -ne $zipNames.Count) {
     throw "release preparation failed: release directory must contain exactly the six supported ZIP assets"
 }
 
+$auxiliaryNames = @(
+    "BUILD_METADATA.json",
+    "WINTUN_SIDECAR_CONTRACT.json",
+    "EVIDENCE_MANIFEST.json",
+    "tachyon-helper-evidence_${Version}.tar.gz"
+)
+foreach ($name in $auxiliaryNames) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDirectory $name) -PathType Leaf)) {
+        throw "release preparation failed: required release metadata asset is missing: $name"
+    }
+}
+
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $ascii = [System.Text.ASCIIEncoding]::new()
 
@@ -87,7 +99,7 @@ Write-RenderedTemplate `
     -TemplatePath (Join-Path $TemplateDirectory "RELEASE_NOTES.zh-CN.md.tmpl") `
     -OutputPath (Join-Path $ReleaseDirectory "RELEASE_NOTES.zh-CN.md")
 
-$checksumNames = @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames
+$checksumNames = @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames + $auxiliaryNames
 $checksumLines = foreach ($name in $checksumNames) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ReleaseDirectory $name)).Hash.ToLowerInvariant()
     "${hash}  ${name}"

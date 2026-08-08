@@ -30,22 +30,28 @@ workflow 的实时钟表时间写入二进制或归档。
 ## Bilingual metadata contract / 双语元数据契约
 
 `v0.1.0-alpha.20` is a historical exception with an English-only automated body and no release-note
-assets; it remains immutable. Later releases use `.github/scripts/prepare-release.sh` to generate
+assets; it remains immutable. Alpha.24 preparation is the **WFP Helper / Captured UDP Named Pipe v2
+Preview** and explicitly makes no claim of a real WFP callout, signed driver, kernel injection,
+process capture, or game E2E. Later releases use `.github/scripts/prepare-release.sh` to generate
 `RELEASE_NOTES.md` and `RELEASE_NOTES.zh-CN.md` deterministically from the verified tag and full
 commit SHA. The GitHub Release body contains both files in English-then-Chinese order and never uses
 GitHub automatic release-note generation.
 
 `v0.1.0-alpha.20` 是历史例外，只有英文自动正文且没有 release notes 资产，并将保持不可变。
-后续 release 使用 `.github/scripts/prepare-release.sh`，根据已验证 tag 和完整 commit SHA
+Alpha.24 准备版本名称为 **WFP Helper / Captured UDP Named Pipe v2 Preview**，明确不声称
+完成真实 WFP callout、签名驱动、内核注入、进程捕获或游戏 E2E。后续 release 使用 `.github/scripts/prepare-release.sh`，根据已验证 tag 和完整 commit SHA
 确定性生成 `RELEASE_NOTES.md` 与 `RELEASE_NOTES.zh-CN.md`。GitHub Release 正文按先英文、
 后中文的顺序包含两份内容，且不使用 GitHub 自动生成 release notes。
 
-`SHA256SUMS.txt` covers exactly the six platform ZIPs and both note files. Publication verifies every
-entry before the first GitHub write, uploads both notes, the ZIPs, and the manifest exactly once to a
-new draft, then publishes only that draft.
+`SHA256SUMS.txt` covers the six platform ZIPs, both note files, `BUILD_METADATA.json`,
+`WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`, and the sanitized Helper evidence archive:
+twelve entries, excluding the checksum file itself. Publication verifies every entry before the first
+GitHub write, uploads the complete asset set exactly once to a new draft, then publishes only that draft.
 
-`SHA256SUMS.txt` 恰好覆盖六个平台 ZIP 和两份 notes。发布流程会在首次写入 GitHub 前校验
-每个条目，将 notes、ZIP 和 manifest 一次性上传到新 draft，最后仅发布该 draft。
+`SHA256SUMS.txt` 覆盖六个平台 ZIP、两份 notes、`BUILD_METADATA.json`、
+`WINTUN_SIDECAR_CONTRACT.json`、`EVIDENCE_MANIFEST.json` 和去敏 Helper evidence 压缩包，
+共十二项，不包含 checksum 文件自身。发布流程会在首次写入 GitHub 前校验每个条目，
+将完整资产集合一次性上传到新 draft，最后仅发布该 draft。
 
 CI's Bash generator and Windows-local `scripts/prepare-release.ps1` both render the shared templates
 under `.github/release-notes`. The local `scripts/build-release.ps1` resolves the full current commit,
@@ -58,14 +64,13 @@ CI 的 Bash 生成器与 Windows 本地 `scripts/prepare-release.ps1` 都渲染
 要求已存在的指定 tag 最终指向该 commit，并从 commit time 派生 `SOURCE_DATE_EPOCH`、嵌入式
 构建时间和归档时间戳；它不依赖 Bash，也不使用实时时钟元数据。
 
-Both implementations must match the shared fixture and golden files in
-`.github/testdata/release-metadata`. The manifest contract is exactly eight LF-terminated, BOM-free
-GNU-format lines in this order: English notes, Chinese notes, Windows AMD64/ARM64, macOS
-AMD64/ARM64, and Linux AMD64/ARM64.
+Both implementations must preserve the shared template and fixture policy in
+`.github/testdata/release-metadata`. The manifest contract is twelve LF-terminated, BOM-free
+GNU-format lines: the two notes, six platform ZIPs, four release metadata/evidence assets.
 
-两种实现必须匹配 `.github/testdata/release-metadata` 中共享的 fixture 与 golden。manifest
-固定为八行 LF 结尾、无 BOM 的 GNU 格式，顺序为英文 notes、中文 notes、Windows
-AMD64/ARM64、macOS AMD64/ARM64、Linux AMD64/ARM64。
+两种实现必须保持 `.github/testdata/release-metadata` 中的共享模板与 fixture policy。manifest
+固定为十二行 LF 结尾、无 BOM 的 GNU 格式，包含两份 notes、六个平台 ZIP 和四份发布
+元数据/evidence 资产。
 
 ## Verification modes / 验证模式
 
@@ -99,6 +104,7 @@ bash -n .github/scripts/verify-release-tag.sh
 bash -n .github/scripts/prepare-release.sh
 bash -n .github/scripts/publish-release.sh
 bash -n .github/scripts/test-release-policy.sh
+bash -n .github/scripts/verify-published-release.sh
 bash .github/scripts/test-release-policy.sh
 pwsh -NoProfile -File .github/scripts/test-build-release-policy.ps1
 ```

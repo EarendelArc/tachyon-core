@@ -9,31 +9,36 @@
 ## Compatibility
 
 - Windows, macOS, and Linux on AMD64 or ARM64.
-- Artifacts are intended for Prism-managed downloads and integration testing.
-- Windows TUN requires `wintun.dll` next to `tachyon-core.exe`; the DLL is not bundled.
+- Six platform ZIPs contain `tachyon-core` and `tachyonctl`.
+- Windows `wintun.dll` is an external Prism-managed sidecar and is not bundled.
 
-## Installation
+## Verification and release assets
 
-Download the ZIP matching the target OS and architecture. Verify it before extraction, then install
-`tachyon-core` and `tachyonctl` through Prism's managed binary flow. Server deployments should
-pin this exact version when using the repository's server installer.
+Download `SHA256SUMS.txt` and verify the complete asset set before installation.
+The bilingual notes are `RELEASE_NOTES.md` and `RELEASE_NOTES.zh-CN.md`. The
+release also contains deterministic `BUILD_METADATA.json`, the verified
+`WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`, and the sanitized Helper
+evidence archive. The release workflow verifies the published release is immutable
+and that GitHub asset digests and sizes match the local manifest.
 
-## Verification
+## Alpha boundary
 
-Download `SHA256SUMS.txt` with the selected ZIP and verify before installation. On systems with
-GNU coreutils, `sha256sum --check SHA256SUMS.txt` verifies all six ZIP files plus
-`RELEASE_NOTES.md` and `RELEASE_NOTES.zh-CN.md` when the complete asset set is present.
+- `{{VERSION}}` is the **WFP Helper / Captured UDP Named Pipe v2 Preview**.
+- It includes the Core-side authenticated Named Pipe v2 contract, Helper/Service
+  preview contract, lease and registry controls, TGP bridge, lifecycle cleanup,
+  and single-writer close hardening.
+- This preview has **no real WFP callout**, no signed WFP driver, no kernel
+  injection, no process capture, and no real game end-to-end (E2E) validation.
+  The Helper evidence is deliberately fail-closed with `capture_provider=not_ready`.
+- `wintun.dll` is managed by Prism from the official sidecar contract. Prism must
+  refuse to start Core when the sidecar is missing or its SHA-256 does not match.
 
-## Alpha limitations
+## Limitations
 
-- Tachyon Core is alpha software and is not stable or complete.
-- `{{VERSION}}` is the **Captured UDP Named Pipe v2 Preview**. It contains
-  the Core-side authenticated Named Pipe v2 contract, lease/registry controls,
-  TGP bridge, lifecycle cleanup, and single-writer close hardening.
-- This preview does **not** include the helper, Windows Service, WFP callout,
-  UDP injection, or real process-aware capture. Game acceleration is not
-  usable or validated in this release.
-- System proxy takeover remains disabled by default in Prism-managed alpha flows; Tachyon Core does not modify host proxy settings.
-- Client TUN auto-route and DNS hijack are unsupported and rejected by config validation.
-- Real VPS, real client, and real game UDP acceleration paths still need field testing.
-- Windows TUN uses a dynamic `wintun.dll` backend and still needs elevated-host validation.
+- Tachyon Core remains alpha software and is not stable or complete.
+- Prism-managed system-proxy takeover remains disabled by default; Core does not
+  modify host proxy settings.
+- Client TUN auto-route and DNS hijack remain unsupported and are rejected by
+  configuration validation.
+- Real VPS, carrier/network, client, target-game UDP, and elevated Windows TUN
+  validation remain required.

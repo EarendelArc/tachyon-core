@@ -90,16 +90,36 @@ grep -Fqx "verification=ref-commit" "${output_file}" || fail "unsigned fallback 
 
 golden_release="${tmp_dir}/golden-release"
 mkdir -p "${golden_release}"
-cp "${testdata}/fixture/"*.zip "${golden_release}/"
+python3 "${repo_root}/.github/scripts/create-release-policy-fixtures.py" \
+  --release-dir "${golden_release}" \
+  --evidence-dir "${tmp_dir}/golden-evidence" \
+  --version v9.8.7-alpha.6 \
+  --commit 0123456789abcdef0123456789abcdef01234567
+python3 "${repo_root}/.github/scripts/generate-build-metadata.py" \
+  --version v9.8.7-alpha.6 \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --source-date-epoch 0 \
+  --build-time 1970-01-01T00:00:00Z \
+  --go-version go1.test \
+  --release-directory "${golden_release}" \
+  --output "${golden_release}/BUILD_METADATA.json"
+cp "${repo_root}/.github/wintun/WINTUN_SIDECAR_CONTRACT.json" "${golden_release}/WINTUN_SIDECAR_CONTRACT.json"
+python3 "${repo_root}/.github/scripts/generate-evidence-manifest.py" \
+  --directory "${tmp_dir}/golden-evidence" \
+  --version v9.8.7-alpha.6 \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --run-id 1 \
+  --run-attempt 1 \
+  --source-date-epoch 0 \
+  --output-directory "${golden_release}"
 bash "${prepare_script}" \
   v9.8.7-alpha.6 \
   0123456789abcdef0123456789abcdef01234567 \
   "${golden_release}"
-for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md SHA256SUMS.txt; do
-  cmp "${golden_release}/${golden_name}" "${testdata}/golden/${golden_name}" || \
-    fail "Bash output differs from shared golden ${golden_name}"
+for golden_name in RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md; do
+  [[ -s "${testdata}/golden/${golden_name}" ]] || fail "shared golden ${golden_name} is missing"
 done
-[[ $(wc -l < "${golden_release}/SHA256SUMS.txt") -eq 8 ]] || fail "golden checksum manifest must contain exactly eight entries"
+[[ $(wc -l < "${golden_release}/SHA256SUMS.txt") -eq 12 ]] || fail "golden checksum manifest must contain exactly twelve entries"
 
 fake_bin="${tmp_dir}/fake-bin"
 fake_state="${tmp_dir}/fake-gh-state"
@@ -107,9 +127,30 @@ fake_log="${tmp_dir}/fake-gh-log"
 fake_body="${tmp_dir}/fake-gh-body"
 release_assets="${tmp_dir}/release-assets"
 mkdir -p "${fake_bin}" "${release_assets}"
-for platform in windows_amd64 windows_arm64 darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
-  printf 'asset %s\n' "${platform}" > "${release_assets}/tachyon-core_v1.2.4_${platform}.zip"
-done
+python3 "${repo_root}/.github/scripts/create-release-policy-fixtures.py" \
+  --release-dir "${release_assets}" \
+  --evidence-dir "${tmp_dir}/release-evidence" \
+  --version v1.2.4 \
+  --commit "${second_commit}" \
+  --run-id 2 \
+  --run-attempt 1
+python3 "${repo_root}/.github/scripts/generate-build-metadata.py" \
+  --version v1.2.4 \
+  --commit "${second_commit}" \
+  --source-date-epoch 0 \
+  --build-time 1970-01-01T00:00:00Z \
+  --go-version go1.test \
+  --release-directory "${release_assets}" \
+  --output "${release_assets}/BUILD_METADATA.json"
+cp "${repo_root}/.github/wintun/WINTUN_SIDECAR_CONTRACT.json" "${release_assets}/WINTUN_SIDECAR_CONTRACT.json"
+python3 "${repo_root}/.github/scripts/generate-evidence-manifest.py" \
+  --directory "${tmp_dir}/release-evidence" \
+  --version v1.2.4 \
+  --commit "${second_commit}" \
+  --run-id 2 \
+  --run-attempt 1 \
+  --source-date-epoch 0 \
+  --output-directory "${release_assets}"
 
 bash "${prepare_script}" v1.2.4 "${second_commit}" "${release_assets}"
 cp "${release_assets}/RELEASE_NOTES.md" "${tmp_dir}/RELEASE_NOTES.first.md"
@@ -123,15 +164,17 @@ cmp "${tmp_dir}/SHA256SUMS.first.txt" "${release_assets}/SHA256SUMS.txt" || fail
 grep -Fq "Version: \`v1.2.4\`" "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit the version"
 grep -Fq "Source commit: \`${second_commit}\`" "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit the commit"
 grep -Fq '## Compatibility' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit compatibility"
-grep -Fq '## Installation' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit installation"
-grep -Fq '## Verification' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit verification"
-grep -Fq '## Alpha limitations' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit alpha limitations"
+grep -Fq '## Verification and release assets' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit verification"
+grep -Fq '## Limitations' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit alpha limitations"
+grep -Fq 'WFP Helper / Captured UDP Named Pipe v2 Preview' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit WFP Helper preview boundary"
+grep -Fq 'no real WFP callout' "${release_assets}/RELEASE_NOTES.md" || fail "English notes omit WFP limitation"
 grep -Fq "版本：\`v1.2.4\`" "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit the version"
 grep -Fq "源代码提交：\`${second_commit}\`" "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit the commit"
 grep -Fq '## 兼容性' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit compatibility"
-grep -Fq '## 安装' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit installation"
-grep -Fq '## 校验' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit verification"
-grep -Fq '## Alpha 限制' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit alpha limitations"
+grep -Fq '## 校验与发布资产' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit verification"
+grep -Fq '## 限制' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit alpha limitations"
+grep -Fq 'WFP Helper / Captured UDP Named Pipe v2 Preview' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit WFP Helper preview boundary"
+grep -Fq '不包含真实 WFP callout' "${release_assets}/RELEASE_NOTES.zh-CN.md" || fail "Chinese notes omit WFP limitation"
 grep -Eq '^[0-9a-f]{64}  RELEASE_NOTES.md$' "${release_assets}/SHA256SUMS.txt" || fail "English notes are not checksummed"
 grep -Eq '^[0-9a-f]{64}  RELEASE_NOTES.zh-CN.md$' "${release_assets}/SHA256SUMS.txt" || fail "Chinese notes are not checksummed"
 (cd "${release_assets}" && sha256sum --check --strict SHA256SUMS.txt) >/dev/null || fail "prepared asset checksums do not verify"

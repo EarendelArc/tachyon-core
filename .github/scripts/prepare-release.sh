@@ -31,6 +31,13 @@ platforms=(
   linux_arm64
 )
 
+auxiliary_assets=(
+  BUILD_METADATA.json
+  WINTUN_SIDECAR_CONTRACT.json
+  EVIDENCE_MANIFEST.json
+  "tachyon-helper-evidence_${version}.tar.gz"
+)
+
 zip_names=()
 for platform in "${platforms[@]}"; do
   asset="tachyon-core_${version}_${platform}.zip"
@@ -42,6 +49,18 @@ shopt -s nullglob
 actual_zips=("${release_dir}"/*.zip)
 [[ ${#actual_zips[@]} -eq ${#zip_names[@]} ]] || \
   die "release directory must contain exactly the six supported ZIP assets"
+
+for asset in "${auxiliary_assets[@]}"; do
+  [[ -f "${release_dir}/${asset}" ]] || die "required release metadata asset is missing: ${asset}"
+done
+
+expected_files=("${zip_names[@]}" "${auxiliary_assets[@]}")
+mapfile -t actual_files < <(find "${release_dir}" -maxdepth 1 -type f \
+  ! -name 'RELEASE_NOTES.md' ! -name 'RELEASE_NOTES.zh-CN.md' ! -name 'SHA256SUMS.txt' \
+  -printf '%f\n' | LC_ALL=C sort)
+mapfile -t expected_sorted < <(printf '%s\n' "${expected_files[@]}" | LC_ALL=C sort)
+[[ "${actual_files[*]}" == "${expected_sorted[*]}" ]] || \
+  die "release directory contains an unexpected asset set"
 
 render_template() {
   local template=$1
@@ -59,10 +78,25 @@ render_template() {
 render_template "${template_dir}/RELEASE_NOTES.md.tmpl" "${release_dir}/RELEASE_NOTES.md"
 render_template "${template_dir}/RELEASE_NOTES.zh-CN.md.tmpl" "${release_dir}/RELEASE_NOTES.zh-CN.md"
 
-checksum_inputs=(RELEASE_NOTES.md RELEASE_NOTES.zh-CN.md "${zip_names[@]}")
+python3 "${script_dir}/validate-release-assets.py" \
+  --release-directory "${release_dir}" \
+  --version "${version}" \
+  --commit "${commit}"
+
+checksum_inputs=(
+  RELEASE_NOTES.md
+  RELEASE_NOTES.zh-CN.md
+  "${zip_names[@]}"
+  "${auxiliary_assets[@]}"
+)
 (
   cd "${release_dir}"
   sha256sum --text "${checksum_inputs[@]}" > SHA256SUMS.txt
+)
+
+(
+  cd "${release_dir}"
+  sha256sum --check --strict SHA256SUMS.txt >/dev/null
 )
 
 echo "prepared deterministic bilingual release metadata for ${version} at ${commit}"

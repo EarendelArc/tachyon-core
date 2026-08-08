@@ -1,7 +1,10 @@
 param(
     [string]$Tag = "",
     [string]$OutputDir = "",
-    [switch]$MetadataOnly
+    [switch]$MetadataOnly,
+    [string]$EvidenceDirectory = "",
+    [string]$EvidenceRunID = "0",
+    [string]$EvidenceRunAttempt = "1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +59,10 @@ if ($MetadataOnly) {
         BuildTime = $buildTime
     }
     return
+}
+
+if ([string]::IsNullOrWhiteSpace($EvidenceDirectory) -or -not (Test-Path -LiteralPath $EvidenceDirectory -PathType Container)) {
+    throw "release candidate preparation requires a validated CI Helper evidence directory; pass -EvidenceDirectory or use the GitHub Release workflow"
 }
 
 $goCommand = (Get-Command go -ErrorAction SilentlyContinue)
@@ -160,12 +167,44 @@ foreach ($target in $targets) {
 
 Remove-Item -LiteralPath $workDir -Recurse -Force
 
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw "python is required to generate release manifests"
+}
+$pythonExecutable = $pythonCommand.Source
+
+& $pythonExecutable (Join-Path $root ".github\scripts\generate-build-metadata.py") `
+    --version $Tag `
+    --commit $sourceCommit `
+    --source-date-epoch $sourceDateEpochText `
+    --build-time $buildTime `
+    --go-version $goVersion `
+    --release-directory $releaseDir `
+    --output (Join-Path $releaseDir "BUILD_METADATA.json")
+if ($LASTEXITCODE -ne 0) { throw "BUILD_METADATA.json generation failed" }
+
+Copy-Item -LiteralPath (Join-Path $root ".github\wintun\WINTUN_SIDECAR_CONTRACT.json") `
+    -Destination (Join-Path $releaseDir "WINTUN_SIDECAR_CONTRACT.json") -Force
+
+& $pythonExecutable (Join-Path $root ".github\scripts\generate-evidence-manifest.py") `
+    --directory (Resolve-Path -LiteralPath $EvidenceDirectory).Path `
+    --version $Tag `
+    --commit $sourceCommit `
+    --run-id $EvidenceRunID `
+    --run-attempt $EvidenceRunAttempt `
+    --source-date-epoch $sourceDateEpochText `
+    --output-directory $releaseDir
+if ($LASTEXITCODE -ne 0) { throw "Helper evidence manifest generation failed" }
+
 & (Join-Path $PSScriptRoot "prepare-release.ps1") `
     -Version $Tag `
     -Commit $sourceCommit `
     -ReleaseDirectory $releaseDir
 
-foreach ($metadataName in @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md", "SHA256SUMS.txt")) {
+foreach ($metadataName in @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md", "BUILD_METADATA.json", "WINTUN_SIDECAR_CONTRACT.json", "EVIDENCE_MANIFEST.json", "tachyon-helper-evidence_${Tag}.tar.gz", "SHA256SUMS.txt")) {
     (Get-Item -LiteralPath (Join-Path $releaseDir $metadataName)).LastWriteTimeUtc = $commitTime
 }
 

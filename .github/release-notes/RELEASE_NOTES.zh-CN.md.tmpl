@@ -8,30 +8,27 @@
 
 ## 兼容性
 
-- 支持 Windows、macOS 和 Linux 的 AMD64 或 ARM64 平台。
-- 产物用于 Prism 托管下载与集成测试。
-- Windows TUN 要求将 `wintun.dll` 放在 `tachyon-core.exe` 同目录；发布包不内置该 DLL。
+- 支持 Windows、macOS 和 Linux 的 AMD64、ARM64。
+- 六个目标平台 ZIP 均包含 `tachyon-core` 和 `tachyonctl`。
+- Windows 的 `wintun.dll` 由 Prism 外置供应链管理，发布包不内置该 DLL。
 
-## 安装
+## 校验与发布资产
 
-下载与目标操作系统和架构匹配的 ZIP。解压前必须完成校验，再通过 Prism 的托管二进制流程
-安装 `tachyon-core` 与 `tachyonctl`。使用仓库内服务端安装脚本时，应固定到本次准确版本。
-
-## 校验
-
-下载所选 ZIP 的同时下载 `SHA256SUMS.txt`，并在安装前完成校验。完整下载全部资产后，
-可在提供 GNU coreutils 的系统上运行 `sha256sum --check SHA256SUMS.txt`，校验六个 ZIP
-以及 `RELEASE_NOTES.md`、`RELEASE_NOTES.zh-CN.md`。
+安装前请下载 `SHA256SUMS.txt` 并校验完整资产集合。发布还包含确定性的
+`BUILD_METADATA.json`、已核实的 `WINTUN_SIDECAR_CONTRACT.json`、
+`EVIDENCE_MANIFEST.json` 以及去敏 Helper evidence 压缩包。发布 workflow 会
+验证发布已变为 immutable，并核对 GitHub 资产 digest、大小与本地清单一致。
 
 ## Alpha 预览边界
 
-- `{{VERSION}}` 是 **Captured UDP Named Pipe v2 Preview（捕获 UDP Named Pipe v2 预览版）**，包含 Core 侧认证 Named Pipe v2 契约、租约与注册表控制、TGP 桥接、生命周期清理以及 single-writer 关闭竞态修复。
-- 本预览版**不包含** helper、Windows Service、WFP callout、UDP 注入或真正的按进程捕获；游戏加速在本版本中不可用，也未经过真实游戏链路验证。
+- `{{VERSION}}` 是 **WFP Helper / Captured UDP Named Pipe v2 Preview（WFP Helper / 捕获 UDP Named Pipe v2 预览版）**。
+- 本版本包含 Core 侧认证 Named Pipe v2 契约、Helper/Service 预览契约、租约与注册表控制、TGP 桥接、生命周期清理以及 single-writer 关闭竞态修复。
+- 本预览版**不包含真实 WFP callout、不包含签名 WFP 驱动、不包含内核注入、不包含进程捕获，也没有真实游戏端到端（E2E）验证**。Helper evidence 明确处于 fail-closed 的 `capture_provider=not_ready` 状态。
+- `wintun.dll` 由 Prism 根据官方 sidecar 契约管理。sidecar 缺失或 SHA-256 不匹配时，Prism 必须拒绝启动 Core。
 
-## Alpha 限制
+## 限制
 
 - Tachyon Core 仍为 alpha 软件，尚不稳定，也不完整。
-- Prism 托管的 alpha 流程默认禁用系统代理接管；Tachyon Core 不会修改宿主机代理设置。
+- Prism 托管的系统代理接管默认关闭；Core 不会修改宿主机代理设置。
 - 客户端 TUN 自动路由和 DNS hijack 尚不受支持，并会被配置校验拒绝。
-- 真实 VPS、真实客户端和真实游戏 UDP 加速路径仍需现场测试。
-- Windows TUN 使用动态 `wintun.dll` 后端，仍需在具备管理员权限的真实主机上验证。
+- 真实 VPS、运营商/网络、客户端、目标游戏 UDP 以及具备管理员权限的 Windows TUN 仍需现场验证。

@@ -1,0 +1,29 @@
+{
+  "architectures": [
+    {
+      "path_in_official_archive": "wintun/bin/amd64/wintun.dll",
+      "platform": "windows_amd64",
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+    },
+    {
+      "path_in_official_archive": "wintun/bin/arm64/wintun.dll",
+      "platform": "windows_arm64",
+      "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
+    }
+  ],
+  "component": "wintun.dll",
+  "distribution": {
+    "bundled_in_tachyon_core": false,
+    "fail_closed_if_missing_or_mismatched": true,
+    "managed_by": "Tachyon Prism",
+    "placement": "side-by-side with tachyon-core.exe"
+  },
+  "schema_version": 1,
+  "source": {
+    "archive_sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+    "archive_url": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+    "official_page": "https://www.wintun.net/",
+    "verification": "official page marker, archive digest, and architecture DLL digests"
+  },
+  "version": "0.14.1"
+}

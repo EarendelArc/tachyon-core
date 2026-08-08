@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -91,6 +92,42 @@ jobs:
 
       - name: Test full Windows suite
         run: go test ./...
+
+      - name: Build Helper service harness binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts/helper-service-harness | Out-Null
+          go build -trimpath -o artifacts/helper-service-harness/tachyon-core.exe ./cmd/tachyon-core
+          if (-not (Test-Path -LiteralPath artifacts/helper-service-harness/tachyon-core.exe)) { throw "Helper harness binary was not built" }
+
+      - name: Run elevated Helper service/Core pipe harness
+        shell: pwsh
+        env:
+          TACHYON_EVIDENCE_COMMIT: ${{ needs.verify_tag.outputs.commit }}
+          TACHYON_EVIDENCE_RUN_ID: ${{ github.run_id }}
+          TACHYON_EVIDENCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "Helper Service SID harness requires an elevated Windows runner"
+          }
+          .\scripts\test-helper-security.ps1 -BinaryPath .\artifacts\helper-service-harness\tachyon-core.exe `
+            -EvidenceDirectory .\artifacts\helper-service-evidence `
+            -CommitSHA $env:TACHYON_EVIDENCE_COMMIT -RunID $env:TACHYON_EVIDENCE_RUN_ID -RunAttempt $env:TACHYON_EVIDENCE_RUN_ATTEMPT `
+            -RunPathSecurityTests -RunProvisioningSecurityTests -RunEvidenceFailureTests -RunServiceSIDHarness
+
+      - name: Upload sanitized Helper evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: helper-service-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/helper-service-evidence
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Test protected HKLM journal and mutex integration
         shell: pwsh
@@ -219,6 +256,12 @@ jobs:
         with:
           ref: ${{ needs.verify_tag.outputs.commit }}
 
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Download artifacts
         uses: actions/download-artifact@v7.0.0
         with:
@@ -240,6 +283,30 @@ jobs:
           version="${VERIFIED_TAG}"
           mkdir -p release
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
+          source_date_epoch=$(git show -s --format=%ct "${VERIFIED_COMMIT}")
+          build_time=$(date -u --date="@${source_date_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+          go_version=$(go version | awk '{print $3}')
+          python3 .github/scripts/generate-build-metadata.py \
+            --version "${version}" \
+            --commit "${VERIFIED_COMMIT}" \
+            --source-date-epoch "${source_date_epoch}" \
+            --build-time "${build_time}" \
+            --go-version "${go_version}" \
+            --release-directory release \
+            --output release/BUILD_METADATA.json
+          python3 .github/scripts/generate-wintun-contract.py \
+            --verify-official \
+            --output release/WINTUN_SIDECAR_CONTRACT.json
+          mapfile -t evidence_dirs < <(find artifacts -type f -name manifest.json -printf '%h\n' | LC_ALL=C sort -u)
+          [[ ${#evidence_dirs[@]} -eq 1 ]] || { echo "expected exactly one sanitized Helper evidence directory" >&2; exit 1; }
+          python3 .github/scripts/generate-evidence-manifest.py \
+            --directory "${evidence_dirs[0]}" \
+            --version "${version}" \
+            --commit "${VERIFIED_COMMIT}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-date-epoch "${source_date_epoch}" \
+            --output-directory release
           bash .github/scripts/prepare-release.sh "${version}" "${VERIFIED_COMMIT}" release
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
@@ -263,3 +330,12 @@ jobs:
         run: |
           set -euo pipefail
           bash .github/scripts/publish-release.sh "${VERSION}" "${COMMIT}" "${PRERELEASE}" release
+
+      - name: Verify immutable published release and asset digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.publish_gate.outputs.commit }}
+        run: bash .github/scripts/verify-published-release.sh "${VERSION}" "${COMMIT}" release

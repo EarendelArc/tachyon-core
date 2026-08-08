@@ -1,81 +1,22 @@
 # Release Process
 
-Tachyon Core releases are published by GitHub Actions from this repository.
-Releases are currently alpha-quality: client TUN auto-route and DNS hijack are
-currently unsupported and rejected by config validation, Windows TUN still
-needs real elevated-host validation, and the artifacts are intended for
-Prism-managed downloads and integration testing.
+Tachyon Core releases are published by GitHub Actions from this repository. The
+current release line is alpha and must not be described as production-ready: the
+WFP Helper is preview-only, and no real process capture or game E2E has been
+validated.
 
-## Current Preview
+## Release boundary
 
-The current published preview tag is `v0.1.0-alpha.20`. That release is a
-historical exception: it has an English-only automated GitHub Release body and
-does not include release-note assets. It remains immutable and will not be
-edited or backfilled.
+The next release is prepared as `v0.1.0-alpha.24` from the verified commit. It is
+the **WFP Helper / Captured UDP Named Pipe v2 Preview**. The release may contain
+Helper and Windows Service preview contracts, but it contains no real WFP callout,
+no signed driver, no kernel injection, no process capture, and no real game E2E.
+These statements must remain synchronized in both release-note files and both
+changelogs.
 
-The deterministic bilingual contract documented below applies to releases
-after `v0.1.0-alpha.20`. Alpha limitations remain explicit in both languages;
-real VPS, real client, carrier/network, target-game UDP, and elevated Windows
-TUN validation are still required before treating Core as production-ready.
+## Deterministic assets
 
-The `main` branch may contain newer unreleased changes after this tag. Create a
-new release tag only after `go test ./...` and the cross-platform build matrix
-pass.
-
-## Trigger
-
-Push a version tag:
-
-```bash
-git tag v0.1.0-alpha.1
-git push origin v0.1.0-alpha.1
-```
-
-The `Release` workflow can also be started manually from GitHub Actions with a
-tag input.
-
-## Bilingual Release Contract
-
-The workflow derives all release metadata from the verified tag and its full
-source commit SHA. It generates, without GitHub automatic release notes:
-
-- `RELEASE_NOTES.md`, containing the English release identity, compatibility,
-  installation, verification, and alpha limitations;
-- `RELEASE_NOTES.zh-CN.md`, containing the matching Simplified Chinese content;
-- a GitHub Release body composed from those two files, with English followed by
-  Simplified Chinese.
-
-Generation uses no workflow wall-clock value or external text generator. Given
-the same tag, commit SHA, and six ZIP files, the notes and checksum manifest are
-byte-for-byte reproducible.
-
-CI and the local PowerShell implementation render the templates in
-`.github/release-notes`. Both are tested against the same fixed fixtures and
-golden outputs under `.github/testdata/release-metadata`; a template, encoding,
-ordering, or checksum-format drift fails release policy tests.
-
-For local verification without publishing to GitHub, run:
-
-```powershell
-scripts\build-release.ps1 -Tag v0.1.0-alpha.2 -OutputDir $env:TEMP\tachyon-core-release
-```
-
-The Windows-local builder does not require Bash. It resolves the full current
-commit and derives `SOURCE_DATE_EPOCH`, embedded `BuildTime`, archive entry
-timestamps, and output timestamps from that commit's Git commit time. If the
-requested tag already exists, it must peel to the current `HEAD`; a mismatch
-fails instead of producing misleading metadata.
-
-After creating the six ZIPs, the builder uses the PowerShell implementation of
-the shared templates. Its output contains the same bilingual metadata contract
-and an eight-entry `SHA256SUMS.txt`, ordered as English notes, Simplified
-Chinese notes, then Windows AMD64/ARM64, macOS AMD64/ARM64, and Linux
-AMD64/ARM64 ZIPs. The manifest uses lowercase SHA-256, two spaces before each
-filename, LF endings, and no BOM.
-
-## Assets
-
-The workflow builds these ZIP assets:
+The workflow builds six ZIPs:
 
 - `tachyon-core_<tag>_windows_amd64.zip`
 - `tachyon-core_<tag>_windows_arm64.zip`
@@ -84,80 +25,53 @@ The workflow builds these ZIP assets:
 - `tachyon-core_<tag>_linux_amd64.zip`
 - `tachyon-core_<tag>_linux_arm64.zip`
 
-Each archive contains:
+It also publishes `RELEASE_NOTES.md`, `RELEASE_NOTES.zh-CN.md`,
+`BUILD_METADATA.json`, `WINTUN_SIDECAR_CONTRACT.json`, `EVIDENCE_MANIFEST.json`,
+the deterministic `tachyon-helper-evidence_<tag>.tar.gz`, and `SHA256SUMS.txt`.
+The checksum file covers every asset except itself: twelve entries in total.
 
-- `tachyon-core` or `tachyon-core.exe`
-- `tachyonctl` or `tachyonctl.exe`
-- `README.md`
-- `README.zh-CN.md`
+`BUILD_METADATA.json` records the tag, full commit, source-date epoch, build time,
+Go version, every target OS/architecture, and each ZIP and embedded binary SHA-256.
+The build uses the verified commit time as `SOURCE_DATE_EPOCH`; no workflow wall
+clock is used for release metadata.
 
-Windows archives do not bundle `wintun.dll` yet. Prism must verify that
-`wintun.dll` exists next to the configured `tachyon-core.exe` before starting
-Core on Windows.
+## Helper evidence
 
-The release also includes `RELEASE_NOTES.md`, `RELEASE_NOTES.zh-CN.md`, and
-`SHA256SUMS.txt`. The checksum manifest covers all six ZIP files and both note
-files. The publisher verifies the complete manifest before any GitHub write,
-then uploads the complete asset set exactly once while the release is a draft.
-Only that newly created draft is published; an existing draft or published
-release causes the run to fail instead of editing or replacing it.
+The Windows CI job uploads a sanitized Helper evidence directory. The release job
+downloads the evidence from the same successful workflow run, validates the inner
+manifest commit/run identity and file hashes, rejects secret-like fields, and
+packages it into a deterministic archive. `EVIDENCE_MANIFEST.json` records the
+source commit, run identity, archive hash, and the fail-closed `not_ready` scope.
+It is not proof of WFP capture, process attribution, injection, or game E2E.
 
-## Prism Contract
+## Wintun sidecar
 
-Prism should select assets by normalized platform:
+Wintun is not bundled by Core. Prism owns the external sidecar supply chain and
+must verify the contract before launch. The release workflow fetches the official
+Wintun page and archive, checks the pinned current stable version and archive/DLL
+SHA-256 values, then emits `WINTUN_SIDECAR_CONTRACT.json`. Any mismatch or inability
+to verify fails closed. Prism must refuse to start Core when the sidecar is absent
+or mismatched.
 
-| Runtime | Asset suffix |
-| --- | --- |
-| Windows x64 | `windows_amd64` |
-| Windows ARM64 | `windows_arm64` |
-| macOS Intel | `darwin_amd64` |
-| macOS Apple Silicon | `darwin_arm64` |
-| Linux x64 | `linux_amd64` |
-| Linux ARM64 | `linux_arm64` |
+## Publication gates
 
-Prism must download `SHA256SUMS.txt`, require exactly one checksum entry for the
-selected archive, verify that archive, extract the binary, and install it into
-its managed `bin` directory. Operators downloading the complete release can run
-`sha256sum --check SHA256SUMS.txt` to verify all archives and both note files.
+Before publishing, the workflow requires the verified tag, green Linux and Windows
+CI, six platform ZIPs, all bilingual notes, all manifests, and a strict SHA-256
+check. It creates one draft, uploads the complete asset set once, and publishes
+only that draft. The final step calls `verify-published-release.sh`, which checks:
 
-## Server Installer Contract
+- the release is not a draft, is a prerelease, and is immutable;
+- the release target commit is the verified commit;
+- the remote asset names exactly equal the local asset set;
+- remote asset sizes and GitHub digests match local files.
 
-The bare-metal and Docker server installers consume the same release ZIP assets:
+The tag protection ruleset must remain active for `v*`. Do not replace an existing
+release or mutate an immutable release. Never create or push a tag as part of local
+release preparation.
 
-- `scripts/install-server.sh` downloads `tachyon-core_<tag>_linux_<arch>.zip`,
-  extracts `tachyon-core`, installs it under `/opt/tachyon`, and creates a
-  hardened systemd service. It can configure ufw, but operators should pass
-  `--ssh-port PORT` for non-standard SSH ports or `--no-firewall` when firewall
-  state is managed elsewhere.
-- `scripts/install-server-docker.sh` downloads the same Linux ZIP, stores the
-  binary under `/opt/tachyon-docker/bin`, and mounts it into a
-  `debian:bookworm-slim` container. The Docker deployment does not require a
-  GHCR image, does not change host firewall rules, and uses host networking
-  intentionally to avoid UDP NAT/userland proxy jitter.
+## Local preparation
 
-Both scripts resolve `--version latest` from the releases list instead of the
-GitHub `latest` endpoint so alpha prereleases remain deployable during the
-current development phase.
-
-Both scripts generate a fresh `tgp.auth.psk` unless `TACHYON_PSK` is supplied.
-The server relay does not become an open UDP relay by default: installers write
-`server.relay.allowed_targets` from `--allow-target` entries or the
-semicolon-separated `TACHYON_ALLOWED_TARGETS` environment variable. Accepted
-entries look like `cidr=198.51.100.0/24,ports=27015-27050` or
-`domain=game.example.com,ports=27015`. If no target is supplied, the generated
-config keeps `allowed_targets` empty and Core runs in safe deny-all mode. The
-installers reject `0.0.0.0/0`, `::/0`, and entries without explicit ports.
-Generated configs also include the relay resource-limit defaults
-(`max_sessions`, `session_queue_size`, `handler_concurrency`, `max_flows`, and
-`max_flows_per_session`).
-
-The bare-metal systemd service runs as the `tachyon` user, keeps only
-`CAP_NET_BIND_SERVICE`, applies `NoNewPrivileges`, read-only system paths,
-private temporary storage, restricted address families, and writes only to the
-Tachyon log directory. The Docker compose deployment uses a read-only root
-filesystem, `no-new-privileges`, `cap_drop: [ALL]`, `cap_add:
-[NET_BIND_SERVICE]`, tmpfs scratch paths, a config validation healthcheck, and
-`restart: unless-stopped`.
-
-After deployment, run `scripts/verify-server.sh` in the matching mode to collect
-read-only diagnostics before testing with real clients and game UDP traffic.
+The local PowerShell builder is a packaging aid. A publishable candidate must carry
+validated CI evidence; it must not synthesize release eligibility from a local fake
+capture. Use the GitHub workflow for the authoritative candidate, then run the
+policy tests and cross-platform build checks before authorizing a tag.

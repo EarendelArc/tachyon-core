@@ -24,9 +24,8 @@ tachyon-core validate --config client.json
 tachyon-core run --config client.json
 tachyon-core run --config server.json
 
-# 检查正在运行的 Core 是否健康
-tachyonctl health
-tachyonctl health --addr 127.0.0.1:55123
+# 健康检查需要认证；Prism 父进程通过 stdin 传入本次启动 token
+tachyonctl health --addr 127.0.0.1:55123 --token-stdin
 ```
 
 ## 设计边界
@@ -70,7 +69,7 @@ Tachyon Core 还不是 stable 或生产完成版本。协议和管道已经可�
 | JSON 配置加载和生成 | 完成 |
 | Core JSON 内嵌 Prism 游戏配置 | 完成 |
 | Legacy PID 感知路由配置 | Preview；生产接管仍为 Proposed |
-| 本地 HTTP 路由桥兼容层 | 完成 |
+| 本地 HTTP 路由桥兼容层 | Fail-closed Preview；必须使用继承 token 管道 |
 | tachyonctl health CLI | 完成 |
 | tachyon-core validate 干运行 | 完成 |
 | Linux TUN 和 PID 追踪 | 完成 |
@@ -120,9 +119,9 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 两种安装脚本都会从 `EarendelArc/tachyon-core` GitHub Releases 下载匹配的
 Linux ZIP 资产。`--version latest` 会选择最新 release 条目，包括 alpha
 预览版；如需可复现部署，可传入明确 tag，例如
-`--version v0.1.0-alpha.15`。Docker 部署会把下载得到的静态
-`tachyon-core` 二进制挂载进 `debian:bookworm-slim` 容器运行，不依赖 GHCR
-镜像。
+`--version v0.1.0-alpha.15`。Docker 部署会把校验后的静态二进制构建进本地
+镜像，不依赖 GHCR。Debian base 固定为
+`deploy/docker/runtime-contract.json` 记录的多架构 manifest digest。
 
 裸机安装脚本可以代管 ufw。脚本会先放行 Tachyon UDP 端口和 SSH TCP 端口，再启用
 ufw；如果服务器 SSH 不是 22 端口，请传入 `--ssh-port PORT`，如果你使用云防火墙、
@@ -133,7 +132,10 @@ nftables、firewalld 或自定义主机防火墙策略，请传入 `--no-firewal
 Docker 安装脚本为了降低游戏 UDP 抖动，仍然有意使用 `network_mode: host`，避免 Docker
 NAT/userland proxy 额外路径。compose 文件同时启用只读 rootfs、no-new-privileges、丢弃
 默认 capabilities、仅恢复 `NET_BIND_SERVICE`、tmpfs 临时目录、健康检查和
-`restart: unless-stopped`。Docker 脚本不会修改宿主机防火墙规则。
+数字 non-root 用户以及 `restart: unless-stopped`。Docker 脚本不会修改宿主机
+防火墙规则。Docker CE 只从 Docker 官方签名 apt repository 安装；脚本在契约允许的
+major 内选择最新包，然后把每个 package 固定到精确 version。脚本不会执行下载得到的
+shell。
 
 服务端 Relay 默认采用 fail-closed 安全策略。安装脚本会生成新的
 `tgp.auth.psk` 并写入 `server.json`，需要把该 PSK 复制到 Prism 的 Tachyon

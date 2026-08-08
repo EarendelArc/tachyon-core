@@ -65,6 +65,11 @@ sudo bash scripts/install-server-docker.sh --version v0.1.0-alpha.17 --port 443 
   --allow-target 'domain=echo.example.com,ports=27015'
 ```
 
+The Docker installer uses Docker's signed Debian/Ubuntu apt repository, exact
+package versions selected within the committed major policy, and the
+digest-pinned Debian base image in `deploy/docker/runtime-contract.json`. It
+does not use Docker's convenience shell installer.
+
 Use the narrowest UDP destination and port list you can. For public E2E
 validation, prefer a UDP echo service you control and include that echo target
 in `server.relay.allowed_targets`. Do not point the verifier at a real game

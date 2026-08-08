@@ -35,6 +35,12 @@ jobs:
           bash -n scripts/verify-server.sh
           bash scripts/verify-server.sh --self-test
 
+      - name: Verify Docker installation policy
+        shell: bash
+        run: |
+          bash -n scripts/install-server-docker.sh
+          bash scripts/test-docker-install-policy.sh
+
       - name: Verify opt-in TGP E2E script
         shell: bash
         run: |

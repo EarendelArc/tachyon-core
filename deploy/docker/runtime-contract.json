@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "base_image": {
+    "repository": "debian",
+    "tag": "bookworm-slim",
+    "manifest_digest": "sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241",
+    "verified_at": "2026-08-08T00:00:00Z",
+    "source": "https://hub.docker.com/v2/repositories/library/debian/tags/bookworm-slim"
+  },
+  "apt": {
+    "repository_template": "https://download.docker.com/linux/{debian|ubuntu}",
+    "channel": "stable",
+    "keyring": "/etc/apt/keyrings/docker.asc",
+    "source_file": "/etc/apt/sources.list.d/docker.sources",
+    "preferences_file": "/etc/apt/preferences.d/tachyon-docker-ce"
+  },
+  "package_major_policy": {
+    "docker-ce": 29,
+    "docker-ce-cli": 29,
+    "containerd.io": 2,
+    "docker-buildx-plugin": 0,
+    "docker-compose-plugin": 5
+  },
+  "supported_hosts": {
+    "debian": ["11", "12", "13"],
+    "ubuntu": ["22.04", "24.04", "25.10", "26.04"],
+    "architectures": ["amd64", "arm64"]
+  }
+}

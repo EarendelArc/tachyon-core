@@ -97,8 +97,10 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
   bash scripts/install-server-docker.sh --version v0.1.0-alpha.15 --port 443
 ```
 
-Docker 路径会把下载得到的静态 `tachyon-core` 二进制挂载进
-`debian:bookworm-slim` 容器，不要求 GHCR 镜像。
+Docker 路径会使用下载并校验的静态 `tachyon-core` 二进制构建本地 non-root 镜像。
+Debian base image 由 `deploy/docker/runtime-contract.json` 固定 digest；Docker CE
+只从 Docker 官方签名 apt repository 安装，并遵守仓库中的 package major 契约。
+该路径不要求 GHCR，也不会执行下载得到的安装 shell。
 
 安装后同时检查宿主 UDP 暴露和容器状态。云安全组仍必须允许入站 UDP 到发布的服务端口。
 

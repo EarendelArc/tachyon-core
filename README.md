@@ -19,9 +19,8 @@ tachyon-core preflight --config client.json --json
 tachyon-core run --config client.json
 tachyon-core run --config server.json
 
-# Check if a running Core is healthy
-tachyonctl health
-tachyonctl health --addr 127.0.0.1:55123
+# Health is authenticated; the Prism parent passes the per-run token on stdin.
+tachyonctl health --addr 127.0.0.1:55123 --token-stdin
 ```
 
 ## Design Boundary
@@ -116,7 +115,7 @@ Windows hosts.
 | JSON config loading and generation | Done |
 | Embedded Prism game profiles in Core JSON | Done |
 | Legacy PID-aware routing profiles | Preview; production capture proposed |
-| Local HTTP routing bridge compatibility | Done |
+| Local HTTP routing bridge compatibility | Fail-closed Preview; inherited token handoff required |
 | tachyonctl health CLI | Done |
 | tachyon-core validate (dry-run) | Done |
 | tachyon-core doctor/preflight (read-only) | Done |
@@ -187,9 +186,10 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
 Both installers download the matching Linux ZIP asset from
 `EarendelArc/tachyon-core` GitHub Releases. `--version latest` selects the
 newest release entry, including alpha prereleases; pass an explicit tag such as
-`--version v0.1.0-alpha.15` for reproducible deployment. The Docker path mounts
-the downloaded static `tachyon-core` binary into a `debian:bookworm-slim`
-container and does not depend on a GHCR image.
+`--version v0.1.0-alpha.15` for reproducible deployment. The Docker path builds
+a local image containing the verified static binary and does not depend on a
+GHCR image. Its Debian base is pinned to the multi-architecture manifest digest
+recorded in `deploy/docker/runtime-contract.json`.
 
 The bare-metal installer can manage ufw for you. It opens the configured
 Tachyon UDP port and keeps the SSH TCP port open before enabling ufw; pass
@@ -203,7 +203,11 @@ The Docker installer intentionally uses `network_mode: host` to avoid Docker
 NAT/userland proxy jitter for latency-sensitive UDP. The compose file is still
 hardened with a read-only root filesystem, no-new-privileges, dropped default
 capabilities, only `NET_BIND_SERVICE` restored, tmpfs scratch space, a health
-check, and `restart: unless-stopped`. It does not modify host firewall rules.
+check, a numeric non-root user, and `restart: unless-stopped`. It does not
+modify host firewall rules. Docker CE is installed only from Docker's official
+signed apt repository; the installer selects the newest package within the
+contracted major versions and pins every package to that exact version. It
+never executes a downloaded shell script.
 
 Server relay security is fail-closed. The installer generates a fresh
 `tgp.auth.psk` and writes it to `server.json`; copy that PSK into the Prism

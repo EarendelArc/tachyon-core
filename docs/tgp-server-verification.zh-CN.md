@@ -58,6 +58,11 @@ sudo bash scripts/install-server-docker.sh --version v0.1.0-alpha.17 --port 443 
   --allow-target 'domain=echo.example.com,ports=27015'
 ```
 
+Docker 安装脚本使用 Docker 官方签名的 Debian/Ubuntu apt repository，在提交的
+major 策略内选择并固定精确 package version，同时使用
+`deploy/docker/runtime-contract.json` 中固定 digest 的 Debian base image。脚本不会
+调用 Docker convenience shell installer。
+
 请尽量使用最窄的 UDP 目标和端口列表。公网 E2E 验证优先使用你自己控制的 UDP echo
 服务，并把该 echo 目标写入 `server.relay.allowed_targets`。不要把验证脚本默认指向
 真实游戏服务器，除非你明确知道该服务器会如何响应任意 UDP 探测包。

@@ -111,8 +111,11 @@ sudo TACHYON_ALLOWED_TARGETS='domain=game.example.com,ports=27015' \
   bash scripts/install-server-docker.sh --version v0.1.0-alpha.15 --port 443
 ```
 
-The Docker path mounts the downloaded static `tachyon-core` binary into a
-`debian:bookworm-slim` container. It does not require a GHCR image.
+The Docker path builds a local non-root image from the downloaded and verified
+static binary. The Debian base image is digest-pinned by
+`deploy/docker/runtime-contract.json`; Docker CE comes only from Docker's
+official signed apt repository under the repository's package-major policy.
+It does not require a GHCR image or execute a downloaded installation script.
 
 After installation, check both the host UDP exposure and the container state.
 The cloud security group must still allow inbound UDP to the published server

@@ -23,6 +23,14 @@ ALLOWED_TARGETS_JSON="[]"
 COMPOSE_DIR="/opt/tachyon-docker"
 GITHUB_REPO="${TACHYON_CORE_REPO:-EarendelArc/tachyon-core}"
 GITHUB_CORE="https://api.github.com/repos/$GITHUB_REPO/releases"
+DOCKER_ENGINE_MAJOR=29
+CONTAINERD_MAJOR=2
+DOCKER_BUILDX_MAJOR=0
+DOCKER_COMPOSE_MAJOR=5
+DOCKER_APT_KEYRING="/etc/apt/keyrings/docker.asc"
+DOCKER_APT_SOURCE="/etc/apt/sources.list.d/docker.sources"
+DOCKER_APT_PREFERENCES="/etc/apt/preferences.d/tachyon-docker-ce"
+TACHYON_BASE_IMAGE="debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
 
 usage() {
   cat <<'USAGE'
@@ -59,28 +67,30 @@ require_option_value() {
   fi
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --port)
-      require_option_value "$@"
-      PORT="$2"
-      shift 2
-      ;;
-    --version)
-      require_option_value "$@"
-      TACHYON_VERSION="$2"
-      shift 2
-      ;;
-    --allow-target)
-      require_option_value "$@"
-      ALLOWED_TARGET_INPUTS+=("$2")
-      shift 2
-      ;;
-    --uninstall) UNINSTALL=true;       shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Unknown option: $1" ;;
-  esac
-done
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        require_option_value "$@"
+        PORT="$2"
+        shift 2
+        ;;
+      --version)
+        require_option_value "$@"
+        TACHYON_VERSION="$2"
+        shift 2
+        ;;
+      --allow-target)
+        require_option_value "$@"
+        ALLOWED_TARGET_INPUTS+=("$2")
+        shift 2
+        ;;
+      --uninstall) UNINSTALL=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+}
 
 check_root() {
   [[ $EUID -eq 0 ]] || die "Run as root."
@@ -95,17 +105,156 @@ validate_listen_port() {
     || die "listen port must be in range 1..65535: $raw"
 }
 
-install_docker() {
-  command -v docker &>/dev/null && { info "Docker already installed."; return; }
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
-  success "Docker installed."
-}
-
 install_deps() {
   apt-get update -qq
   apt-get install -y -qq ca-certificates curl jq unzip
   success "Dependencies installed."
+}
+
+version_allowed() {
+  local package="$1"
+  local version="$2"
+  case "$package" in
+    docker-ce|docker-ce-cli) [[ "$version" =~ ^5:${DOCKER_ENGINE_MAJOR}\. ]] ;;
+    containerd.io) [[ "$version" =~ ^${CONTAINERD_MAJOR}\. ]] ;;
+    docker-buildx-plugin) [[ "$version" =~ ^${DOCKER_BUILDX_MAJOR}\. ]] ;;
+    docker-compose-plugin) [[ "$version" =~ ^${DOCKER_COMPOSE_MAJOR}\. ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+select_version_from_list() {
+  local package="$1"
+  local version
+  while IFS= read -r version; do
+    [[ -n "$version" ]] || continue
+    if version_allowed "$package" "$version"; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
+select_apt_version() {
+  local package="$1"
+  local versions selected
+  versions=$(apt-cache madison "$package" | awk '{print $3}' | sort -Vr) \
+    || die "Unable to enumerate Docker package versions for $package"
+  selected=$(select_version_from_list "$package" <<< "$versions") \
+    || die "No supported $package version is available from the configured stable repository"
+  printf '%s\n' "$selected"
+}
+
+verify_supported_docker_host() {
+  [[ -r /etc/os-release ]] || die "Missing /etc/os-release"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local distro="${ID:-}"
+  local version="${VERSION_ID:-}"
+  case "$distro:$version" in
+    debian:11|debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:25.10|ubuntu:26.04) ;;
+    *) die "Unsupported Docker host $distro $version; use a Docker-supported Debian/Ubuntu release" ;;
+  esac
+  local architecture
+  architecture=$(dpkg --print-architecture)
+  case "$architecture" in
+    amd64|arm64) ;;
+    *) die "No Tachyon release asset is supported for Debian architecture $architecture" ;;
+  esac
+  DOCKER_REPO_OS="$distro"
+  DOCKER_REPO_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  [[ -n "$DOCKER_REPO_CODENAME" ]] || die "Docker repository codename is unavailable"
+}
+
+refuse_conflicting_docker_packages() {
+  local package
+  for package in docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii'; then
+      die "Conflicting package $package is installed; remove it explicitly before installing Docker CE"
+    fi
+  done
+}
+
+configure_docker_repository() {
+  verify_supported_docker_host
+  install -m 0755 -d /etc/apt/keyrings
+  local key_tmp
+  key_tmp=$(mktemp)
+  if ! curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://download.docker.com/linux/$DOCKER_REPO_OS/gpg" -o "$key_tmp"; then
+    rm -f "$key_tmp"
+    die "Unable to download Docker's official apt signing key"
+  fi
+  [[ -s "$key_tmp" ]] || { rm -f "$key_tmp"; die "Docker apt signing key is empty"; }
+  install -m 0644 "$key_tmp" "$DOCKER_APT_KEYRING"
+  rm -f "$key_tmp"
+  cat > "$DOCKER_APT_SOURCE" <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/$DOCKER_REPO_OS
+Suites: $DOCKER_REPO_CODENAME
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: $DOCKER_APT_KEYRING
+EOF
+  cat > "$DOCKER_APT_PREFERENCES" <<EOF
+Package: docker-ce docker-ce-cli
+Pin: version 5:${DOCKER_ENGINE_MAJOR}.*
+Pin-Priority: 1001
+
+Package: containerd.io
+Pin: version ${CONTAINERD_MAJOR}.*
+Pin-Priority: 1001
+
+Package: docker-buildx-plugin
+Pin: version ${DOCKER_BUILDX_MAJOR}.*
+Pin-Priority: 1001
+
+Package: docker-compose-plugin
+Pin: version ${DOCKER_COMPOSE_MAJOR}.*
+Pin-Priority: 1001
+
+Package: docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+Pin: origin "download.docker.com"
+Pin-Priority: -1
+EOF
+  apt-get update -qq
+}
+
+verify_installed_docker_policy() {
+  local package version
+  for package in docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; do
+    version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null) \
+      || die "Required Docker package $package is not installed"
+    version_allowed "$package" "$version" \
+      || die "Installed $package version $version is outside the supported major policy"
+  done
+  docker version --format '{{.Server.Version}}' >/dev/null \
+    || die "Docker daemon is not reachable"
+  docker compose version --short >/dev/null \
+    || die "Docker Compose plugin is unavailable"
+}
+
+install_docker() {
+  refuse_conflicting_docker_packages
+  configure_docker_repository
+  local engine_version cli_version containerd_version buildx_version compose_version
+  engine_version=$(select_apt_version docker-ce)
+  cli_version=$(select_apt_version docker-ce-cli)
+  [[ "$engine_version" == "$cli_version" ]] \
+    || die "docker-ce and docker-ce-cli resolved to different versions"
+  containerd_version=$(select_apt_version containerd.io)
+  buildx_version=$(select_apt_version docker-buildx-plugin)
+  compose_version=$(select_apt_version docker-compose-plugin)
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    "docker-ce=$engine_version" \
+    "docker-ce-cli=$cli_version" \
+    "containerd.io=$containerd_version" \
+    "docker-buildx-plugin=$buildx_version" \
+    "docker-compose-plugin=$compose_version"
+  systemctl enable --now docker
+  verify_installed_docker_policy
+  success "Docker CE installed from the official stable apt repository with exact package versions."
 }
 
 resolve_latest() {
@@ -260,10 +409,9 @@ install_tachyon_binary() {
 write_configs() {
   ensure_tgp_psk
   collect_allowed_targets
-  mkdir -p "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
-  chmod 0750 "$COMPOSE_DIR/config"
-  chmod 0755 "$COMPOSE_DIR/logs"
-  install -m 0600 /dev/null "$COMPOSE_DIR/config/server.json"
+  install -d -m 0750 "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
+  chown 65532:65532 "$COMPOSE_DIR/config" "$COMPOSE_DIR/logs"
+  install -o 65532 -g 65532 -m 0400 /dev/null "$COMPOSE_DIR/config/server.json"
   cat > "$COMPOSE_DIR/config/server.json" <<JSON
 {
   "mode": "server",
@@ -307,7 +455,8 @@ write_configs() {
   }
 }
 JSON
-  chmod 0600 "$COMPOSE_DIR/config/server.json"
+  chown 65532:65532 "$COMPOSE_DIR/config/server.json"
+  chmod 0400 "$COMPOSE_DIR/config/server.json"
   success "Config written."
   info "TGP PSK saved in $COMPOSE_DIR/config/server.json; copy it into the Prism Tachyon server profile."
   if [[ ${#ALLOWED_TARGET_OBJECTS[@]} -eq 0 ]]; then
@@ -315,11 +464,27 @@ JSON
   fi
 }
 
+write_dockerfile() {
+  cat > "$COMPOSE_DIR/Dockerfile" <<EOF
+ARG TACHYON_BASE_IMAGE=$TACHYON_BASE_IMAGE
+FROM \${TACHYON_BASE_IMAGE}
+COPY --chown=65532:65532 --chmod=0555 bin/tachyon-core /opt/tachyon/tachyon-core
+USER 65532:65532
+ENTRYPOINT ["/opt/tachyon/tachyon-core"]
+EOF
+  success "Digest-pinned Dockerfile written."
+}
+
 write_compose() {
   cat > "$COMPOSE_DIR/docker-compose.yaml" <<YAML
 services:
   tachyon-core:
-    image: debian:bookworm-slim
+    image: tachyon-core-local:preview
+    build:
+      context: $COMPOSE_DIR
+      dockerfile: Dockerfile
+      args:
+        TACHYON_BASE_IMAGE: $TACHYON_BASE_IMAGE
     container_name: tachyon-core
     restart: unless-stopped
     # Host networking avoids Docker NAT/userland proxy jitter for latency-sensitive UDP.
@@ -336,11 +501,11 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
       - /run:rw,noexec,nosuid,nodev,size=8m
     pids_limit: 512
+    user: "65532:65532"
     volumes:
-      - $COMPOSE_DIR/bin/tachyon-core:/opt/tachyon/tachyon-core:ro
       - $COMPOSE_DIR/config/server.json:/etc/tachyon/server.json:ro
       - $COMPOSE_DIR/logs:/var/log/tachyon:rw
-    command: ["/opt/tachyon/tachyon-core", "run", "--config", "/etc/tachyon/server.json"]
+    command: ["run", "--config", "/etc/tachyon/server.json"]
     healthcheck:
       test: [ "CMD", "/opt/tachyon/tachyon-core", "validate", "--config", "/etc/tachyon/server.json" ]
       interval: 30s
@@ -356,7 +521,7 @@ YAML
 }
 
 start_services() {
-  docker compose -f "$COMPOSE_DIR/docker-compose.yaml" pull --quiet
+  docker compose -f "$COMPOSE_DIR/docker-compose.yaml" build --pull
   cat > /etc/systemd/system/tachyon-docker.service <<UNIT
 [Unit]
 Description=Tachyon Core Docker TGP relay
@@ -395,6 +560,7 @@ uninstall() {
 }
 
 main() {
+  parse_args "$@"
   validate_listen_port "$PORT"
   check_root
   if [[ "$UNINSTALL" == "true" ]]; then
@@ -405,8 +571,11 @@ main() {
   install_docker
   install_tachyon_binary
   write_configs
+  write_dockerfile
   write_compose
   start_services
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

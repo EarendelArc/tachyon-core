@@ -65,7 +65,36 @@ case "${1:-}" in
   is-active) read_state "$active_file" ;;
   is-enabled) read_state "$enabled_file" ;;
   start)
-    [[ ! -e "$root/control/fail-start" ]] || exit 41
+    count_file="$root/state/start-call-count"
+    call=0
+    [[ ! -f "$count_file" ]] || IFS= read -r call < "$count_file"
+    [[ "$call" =~ ^[0-9]+$ ]] || exit 46
+    call=$((call + 1))
+    printf '%s\n' "$call" > "$count_file"
+    unit=unknown
+    unit_file="$root/systemd/tachyon-docker.service"
+    if [[ -f "$unit_file" ]] && grep -Fxq new-unit "$unit_file"; then
+      unit=new
+    elif [[ -f "$unit_file" ]] && grep -Fxq old-unit "$unit_file"; then
+      unit=old
+    fi
+    phase=none
+    phase_file="$root/.tachyon-docker.transaction/phase"
+    [[ ! -f "$phase_file" ]] || IFS= read -r phase < "$phase_file"
+    failure_spec="$root/control/fail-start.$call"
+    if [[ -f "$failure_spec" ]]; then
+      IFS='|' read -r expected_unit expected_phase extra < "$failure_spec"
+      if [[ -n "${extra:-}" || "$unit" != "$expected_unit" || "$phase" != "$expected_phase" ]]; then
+        printf 'call=%s unit=%s phase=%s result=spec-mismatch expected_unit=%s expected_phase=%s\n' \
+          "$call" "$unit" "$phase" "$expected_unit" "$expected_phase" >> "$root/state/systemctl-start.log"
+        exit 46
+      fi
+      printf 'call=%s unit=%s phase=%s result=injected\n' \
+        "$call" "$unit" "$phase" >> "$root/state/systemctl-start.log"
+      exit 41
+    fi
+    printf 'call=%s unit=%s phase=%s result=success\n' \
+      "$call" "$unit" "$phase" >> "$root/state/systemctl-start.log"
     write_state "$active_file" true
     ;;
   stop) write_state "$active_file" false ;;
@@ -302,7 +331,7 @@ case_signal_term_health() { run_signal_case TERM 143 health-verified inactive; }
 case_start_failure() {
   local root pid status
   root=$(prepare_root start-failure active-disabled)
-  : > "$root/control/fail-start"
+  printf 'new|unit-active\n' > "$root/control/fail-start.1"
   TACHYON_ROTATE_PSK=1 start_installer "$root" install '' --confirm-psk-rotation
   pid="$LAST_PID"
   set +e
@@ -311,6 +340,49 @@ case_start_failure() {
   set -e
   CHILDREN=()
   [[ "$status" -ne 0 ]] || fail "start failure fixture unexpectedly succeeded"
+  grep -Fxq 'call=1 unit=new phase=unit-active result=injected' "$root/state/systemctl-start.log" \
+    || fail "start failure did not target the new deployment precisely"
+  grep -Fxq 'call=2 unit=old phase=unit-active result=success' "$root/state/systemctl-start.log" \
+    || fail "rollback did not successfully restart the old deployment"
+  assert_restored "$root"
+  rm -rf -- "$root"
+  unset TACHYON_ROTATE_PSK
+}
+
+case_old_service_restore_failure() {
+  local root pid status first_output
+  root=$(prepare_root old-service-restore-failure active-disabled)
+  printf 'new|unit-active\n' > "$root/control/fail-start.1"
+  printf 'old|unit-active\n' > "$root/control/fail-start.2"
+  TACHYON_ROTATE_PSK=1 start_installer "$root" install '' --confirm-psk-rotation
+  pid="$LAST_PID"
+  first_output="$LAST_OUTPUT"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  CHILDREN=()
+  [[ "$status" -ne 0 ]] || fail "old-service restore failure fixture unexpectedly succeeded"
+  grep -Fxq 'call=1 unit=new phase=unit-active result=injected' "$root/state/systemctl-start.log" \
+    || fail "old-service fixture did not first fail the new deployment"
+  grep -Fxq 'call=2 unit=old phase=unit-active result=injected' "$root/state/systemctl-start.log" \
+    || fail "old-service fixture did not precisely fail rollback restart"
+  grep -Fq 'Rollback was incomplete; the persistent journal remains' "$first_output" \
+    || fail "failed old-service restart did not report retained journal"
+  [[ -d "$root/.tachyon-docker.transaction" ]] \
+    || fail "failed old-service restart did not retain the transaction journal"
+  grep -Fxq unit-active "$root/.tachyon-docker.transaction/phase" \
+    || fail "retained journal lost the failing transaction phase"
+  grep -Fq old-private-psk-0001 "$root/live/config/server.json" \
+    || fail "failed old-service restart did not restore old deployment files"
+  grep -Fxq old-unit "$root/systemd/tachyon-docker.service" \
+    || fail "failed old-service restart did not restore old unit"
+  grep -Fxq false "$root/state/service-active" \
+    || fail "failed old-service restart unexpectedly left service active"
+  start_installer "$root" recover ''
+  wait_for_status "$LAST_PID" 0
+  grep -Fxq 'call=3 unit=old phase=unit-active result=success' "$root/state/systemctl-start.log" \
+    || fail "next recovery process did not restart the restored old service"
   assert_restored "$root"
   rm -rf -- "$root"
   unset TACHYON_ROTATE_PSK
@@ -392,6 +464,7 @@ run_selected_case() {
     signal-int-unit) case_signal_int_unit ;;
     signal-term-health) case_signal_term_health ;;
     start-failure) case_start_failure ;;
+    old-service-restore-failure) case_old_service_restore_failure ;;
     concurrency) case_concurrency ;;
     sigkill-recovery) case_sigkill_recovery ;;
     lock-symlink) case_lock_symlink ;;
@@ -410,6 +483,7 @@ run_suite() {
     signal-int-unit \
     signal-term-health \
     start-failure \
+    old-service-restore-failure \
     concurrency \
     sigkill-recovery \
     lock-symlink \

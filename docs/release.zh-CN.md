@@ -82,6 +82,11 @@ Launcher 在 `exec` 前创建新 session，将 INT、TERM、HUP 显式恢复为 
 mode-0600 JSON 审计，证明 PID/PGID/SID 与信号处置。每个场景使用八秒内部超时；失败会
 输出有界诊断并继续执行后续 TERM、HUP、锁竞争和 SIGKILL 恢复场景。
 
+Mock `systemctl start` 的故障契约精确绑定调用序号、已安装 unit 身份（`new`/`old`）和
+transaction phase。新部署启动失败场景因此允许 rollback 成功重启旧服务。另一个独立场景
+会故意让旧服务恢复启动也失败，要求生产 rollback 保留 journal 与 phase，再证明新恢复进程
+可以重启旧服务并删除 journal。
+
 远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
 即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。
 

@@ -520,6 +520,13 @@ func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
 		"kill -KILL",
 		"another Docker installer owns the lifecycle lock",
 		"SIGKILL did not leave a recovery journal",
+		`failure_spec="$root/control/fail-start.$call"`,
+		"call=1 unit=new phase=unit-active result=injected",
+		"call=2 unit=old phase=unit-active result=success",
+		"old-service-restore-failure",
+		"call=2 unit=old phase=unit-active result=injected",
+		"call=3 unit=old phase=unit-active result=success",
+		"failed old-service restart did not retain the transaction journal",
 	} {
 		if !strings.Contains(fixture, required) {
 			t.Fatalf("Docker lifecycle fixture is missing %q", required)
@@ -543,6 +550,17 @@ func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
 	}
 	if strings.Contains(fixture, "setsid env") {
 		t.Fatal("Docker lifecycle fixture still inherits background-shell signal dispositions through setsid")
+	}
+	installer := readRepoFile(t, "scripts", "install-server-docker.sh")
+	for _, required := range []string{
+		"rollback_pending_transaction()",
+		"restore_service_state \"$previous_state\" \"$previous_enabled\" || rollback_failed=true",
+		"Rollback was incomplete; the persistent journal remains",
+		"Automatic Docker transaction recovery failed; refusing a new deployment",
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("production rollback contract is missing %q", required)
+		}
 	}
 
 	fixtureGenerator := readRepoFile(t, ".github", "scripts", "create-release-policy-fixtures.py")

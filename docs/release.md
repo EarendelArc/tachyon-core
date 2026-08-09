@@ -102,6 +102,13 @@ PID/PGID/SID identity and signal dispositions. Every scenario has an eight-secon
 inner timeout; failures print bounded diagnostics and do not prevent later TERM,
 HUP, lock-contention, or SIGKILL recovery scenarios from running.
 
+The mocked `systemctl start` fault contract is phase- and identity-specific: each
+injection names an exact call number, expected installed unit (`new` or `old`), and
+transaction phase. The new-deployment start-failure case therefore allows rollback
+to restart the old service. A separate case intentionally fails that old-service
+restart, requires the production rollback to retain its journal and phase, then
+proves a fresh recovery process can restart the old service and remove the journal.
+
 The remote tag gate accepts only a real annotated tag object whose peeled commit
 matches the verified checkout. A correctly targeted lightweight tag is still rejected.
 

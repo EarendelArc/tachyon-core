@@ -82,6 +82,7 @@ jobs:
           bash .github/scripts/test-release-policy.sh
 
       - name: Verify two-run thirteen-asset reproducibility
+        if: ${{ always() }}
         timeout-minutes: 2
         run: python3 .github/scripts/test-reproducible-release.py
 
@@ -102,7 +103,7 @@ jobs:
           test "$(uname -s)" = Linux
           bash -n scripts/install-server-docker.sh
           bash -n scripts/test-docker-installer-lifecycle.sh
-          timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh
+          timeout --signal=TERM --kill-after=5s 120s bash scripts/test-docker-installer-lifecycle.sh
 
   test-windows:
     name: Test and route integration (Windows)

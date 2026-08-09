@@ -42,6 +42,10 @@ locale 和 timezone 均不得进入发布字节。
 生成两次全部十三项 fixture 资产。Windows 与 Ubuntu CI 都要求逐字节一致，并与提交的
 `EVIDENCE_MANIFEST.json`、evidence archive 和 `SHA256SUMS.txt` golden 完全相同。
 Golden 只能通过该 fixture 的显式 `--update-golden` 参数更新，且内部只调用生产生成器。
+Synthetic Helper evidence 在所有宿主上都显式写成 UTF-8 LF 文本；可重现 fixture 会在打包前
+拒绝 CR 字节和缺少末尾换行的输入，避免平台换行转换改变内层 hash 或被引用归档。
+Ubuntu reproducibility step 使用 `always()`，因此较早的 policy 断言失败不会压掉这份独立
+字节证据；该 step 自身失败仍会使 job 失败。
 
 ## Helper evidence
 
@@ -72,6 +76,11 @@ Tag 触发的 Release workflow 还会针对已验证 commit 独立重跑完整 B
 两轮十三资产逐字节可重现 fixture，以及真实 Linux 安装器生命周期 fixture。
 `prepublish-gate` 使用 `always()` 并显式检查每个前置结果；只有 tag 验证、policy、lifecycle、
 Linux/Windows 测试和六平台构建全部为 `success`，发布 job 才能启动。
+
+Linux lifecycle fixture 通过仓库内的 `fixture_process_launcher.py` 启动每个真实安装器。
+Launcher 在 `exec` 前创建新 session，将 INT、TERM、HUP 显式恢复为 `SIG_DFL`，并写入
+mode-0600 JSON 审计，证明 PID/PGID/SID 与信号处置。每个场景使用八秒内部超时；失败会
+输出有界诊断并继续执行后续 TERM、HUP、锁竞争和 SIGKILL 恢复场景。
 
 远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
 即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。

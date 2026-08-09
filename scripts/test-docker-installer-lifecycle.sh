@@ -4,8 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 INSTALLER="$SCRIPT_DIR/install-server-docker.sh"
+LAUNCHER="$SCRIPT_DIR/fixture_process_launcher.py"
 CHILDREN=()
 LAST_PID=""
+LAST_OUTPUT=""
+LAST_AUDIT=""
+PROCESS_COUNTER=0
+TEST_PARENT=""
 
 fail() {
   echo "docker installer lifecycle test failed: $*" >&2
@@ -27,18 +32,23 @@ cleanup() {
     fi
     wait "$pid" 2>/dev/null || true
   done
-  [[ -z "${TEST_PARENT:-}" ]] || rm -rf -- "$TEST_PARENT"
+  [[ -z "${TEST_PARENT:-}" || ! -d "$TEST_PARENT" ]] || rm -rf -- "$TEST_PARENT"
 }
 
-trap cleanup EXIT INT TERM HUP
+initialize_case() {
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  trap 'cleanup; exit 129' HUP
+  TEST_PARENT=$(mktemp -d /tmp/tachyon-docker-installer-policy.suite.XXXXXX)
+  chmod 0700 "$TEST_PARENT"
+}
 
 [[ "$(uname -s)" == "Linux" ]] || fail "this fixture must execute on Linux; skipping is forbidden"
-for command in flock realpath setsid timeout; do
+[[ -f "$LAUNCHER" && ! -L "$LAUNCHER" ]] || fail "audited fixture launcher is unavailable"
+for command in flock realpath python3 timeout; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required"
 done
-
-TEST_PARENT=$(mktemp -d /tmp/tachyon-docker-installer-policy.suite.XXXXXX)
-chmod 0700 "$TEST_PARENT"
 
 write_mock_commands() {
   local root="$1"
@@ -158,7 +168,10 @@ start_installer() {
   local action="$2"
   local pause_at="${3:-}"
   shift 3 || true
-  setsid env \
+  PROCESS_COUNTER=$((PROCESS_COUNTER + 1))
+  local output="$root/process.$action.$PROCESS_COUNTER.out"
+  local audit="$root/process.$action.$PROCESS_COUNTER.launch.json"
+  python3 "$LAUNCHER" launch --audit-file "$audit" -- env \
     CI=true \
     PATH="$root/bin:$PATH" \
     TACHYON_INSTALLER_POLICY_TEST=1 \
@@ -166,16 +179,44 @@ start_installer() {
     TACHYON_INSTALLER_TEST_PAUSE_AT="$pause_at" \
     TACHYON_ROTATE_PSK="${TACHYON_ROTATE_PSK:-0}" \
     bash "$INSTALLER" --port 443 --policy-test-action "$action" "$@" \
-      >"$root/process.$action.out" 2>&1 &
+      >"$output" 2>&1 &
   LAST_PID=$!
+  LAST_OUTPUT="$output"
+  LAST_AUDIT="$audit"
   CHILDREN+=("$LAST_PID")
+  wait_for_launcher_audit "$audit" "$LAST_PID" "$output" "$action"
+}
+
+wait_for_launcher_audit() {
+  local audit="$1"
+  local pid="$2"
+  local output="$3"
+  local action="$4"
+  local deadline=$((SECONDS + 3))
+  while (( SECONDS < deadline )); do
+    if [[ -f "$audit" ]]; then
+      python3 "$LAUNCHER" verify --audit-file "$audit" --expected-pid "$pid" \
+        --expected-token bash \
+        --expected-token "$INSTALLER" \
+        --expected-token=--policy-test-action \
+        --expected-token "$action" \
+        || fail "launcher audit validation failed for process $pid"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || {
+      sed -n '1,200p' "$output" >&2 || true
+      fail "launcher process $pid exited before writing its audit"
+    }
+    sleep 0.02
+  done
+  fail "timed out waiting for launcher audit from process $pid"
 }
 
 wait_for_checkpoint() {
   local root="$1"
   local checkpoint="$2"
   local pid="$3"
-  local deadline=$((SECONDS + 8))
+  local deadline=$((SECONDS + 3))
   while (( SECONDS < deadline )); do
     [[ -e "$root/events/$checkpoint.$pid" ]] && return 0
     kill -0 "$pid" 2>/dev/null || {
@@ -246,85 +287,161 @@ run_signal_case() {
   wait_for_checkpoint "$root" "$checkpoint" "$pid"
   kill -s "$signal_name" -- "-$pid"
   wait_for_status "$pid" "$expected_status"
+  grep -Fq "Received $signal_name during Docker deployment" "$LAST_OUTPUT" \
+    || fail "installer $pid did not audit receipt of $signal_name at $checkpoint"
   assert_restored "$root"
   rm -rf -- "$root"
 }
 
-# Signals hit real installer subprocesses at every mutation boundary.
-run_signal_case INT 130 transaction-prepared absent
-run_signal_case TERM 143 old-backed-up inactive
-run_signal_case HUP 129 deployment-active active-disabled
-run_signal_case INT 130 unit-active active-disabled
-run_signal_case TERM 143 health-verified inactive
+case_signal_int_transaction() { run_signal_case INT 130 transaction-prepared absent; }
+case_signal_term_backup() { run_signal_case TERM 143 old-backed-up inactive; }
+case_signal_hup_deployment() { run_signal_case HUP 129 deployment-active active-disabled; }
+case_signal_int_unit() { run_signal_case INT 130 unit-active active-disabled; }
+case_signal_term_health() { run_signal_case TERM 143 health-verified inactive; }
 
-# A start failure after an explicit staged PSK replacement restores the old PSK.
-root=$(prepare_root start-failure active-disabled)
-: > "$root/control/fail-start"
-TACHYON_ROTATE_PSK=1 start_installer "$root" install '' --confirm-psk-rotation
-pid="$LAST_PID"
-set +e
-wait "$pid"
-status=$?
-set -e
-CHILDREN=()
-[[ "$status" -ne 0 ]] || fail "start failure fixture unexpectedly succeeded"
-assert_restored "$root"
-rm -rf -- "$root"
-unset TACHYON_ROTATE_PSK
+case_start_failure() {
+  local root pid status
+  root=$(prepare_root start-failure active-disabled)
+  : > "$root/control/fail-start"
+  TACHYON_ROTATE_PSK=1 start_installer "$root" install '' --confirm-psk-rotation
+  pid="$LAST_PID"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  CHILDREN=()
+  [[ "$status" -ne 0 ]] || fail "start failure fixture unexpectedly succeeded"
+  assert_restored "$root"
+  rm -rf -- "$root"
+  unset TACHYON_ROTATE_PSK
+}
 
-# One process holds the same FD lock across install/recovery/uninstall dispatch.
-root=$(prepare_root concurrency active-disabled)
-start_installer "$root" install lock-acquired
-owner_pid="$LAST_PID"
-wait_for_checkpoint "$root" lock-acquired "$owner_pid"
-grep -Fxq "owner_pid=$owner_pid" "$root/lock/docker-installer.lock" || fail "lock owner PID diagnostic is missing"
-start_installer "$root" recover ''
-contender_recover="$LAST_PID"
-wait_for_status "$contender_recover" 1
-grep -Fq 'another Docker installer owns the lifecycle lock' "$root/process.recover.out" \
-  || fail "concurrent recovery did not fail on the lifecycle lock"
-start_installer "$root" uninstall ''
-contender_uninstall="$LAST_PID"
-wait_for_status "$contender_uninstall" 1
-grep -Fq 'another Docker installer owns the lifecycle lock' "$root/process.uninstall.out" \
-  || fail "concurrent uninstall did not fail on the lifecycle lock"
-[[ ! -e "$root/.tachyon-docker.transaction" ]] || fail "lock loser created a transaction journal"
-kill -TERM -- "-$owner_pid"
-wait_for_status "$owner_pid" 143
-assert_restored "$root"
-start_installer "$root" recover ''
-wait_for_status "$LAST_PID" 0
-rm -rf -- "$root"
+case_concurrency() {
+  local root owner_pid contender_recover contender_uninstall recover_output uninstall_output
+  root=$(prepare_root concurrency active-disabled)
+  start_installer "$root" install lock-acquired
+  owner_pid="$LAST_PID"
+  wait_for_checkpoint "$root" lock-acquired "$owner_pid"
+  grep -Fxq "owner_pid=$owner_pid" "$root/lock/docker-installer.lock" || fail "lock owner PID diagnostic is missing"
+  start_installer "$root" recover ''
+  contender_recover="$LAST_PID"
+  recover_output="$LAST_OUTPUT"
+  wait_for_status "$contender_recover" 1
+  grep -Fq 'another Docker installer owns the lifecycle lock' "$recover_output" \
+    || fail "concurrent recovery did not fail on the lifecycle lock"
+  start_installer "$root" uninstall ''
+  contender_uninstall="$LAST_PID"
+  uninstall_output="$LAST_OUTPUT"
+  wait_for_status "$contender_uninstall" 1
+  grep -Fq 'another Docker installer owns the lifecycle lock' "$uninstall_output" \
+    || fail "concurrent uninstall did not fail on the lifecycle lock"
+  [[ ! -e "$root/.tachyon-docker.transaction" ]] || fail "lock loser created a transaction journal"
+  kill -TERM -- "-$owner_pid"
+  wait_for_status "$owner_pid" 143
+  grep -Fq 'Received TERM during Docker deployment' "$root"/process.install.*.out \
+    || fail "lock owner did not audit TERM receipt"
+  assert_restored "$root"
+  start_installer "$root" recover ''
+  wait_for_status "$LAST_PID" 0
+  rm -rf -- "$root"
+}
 
-# SIGKILL cannot run traps; a new real installer process must acquire the released
-# kernel lock and recover the persistent journal before dispatching its action.
-root=$(prepare_root sigkill active-disabled)
-start_installer "$root" install deployment-active
-killed_pid="$LAST_PID"
-wait_for_checkpoint "$root" deployment-active "$killed_pid"
-kill -KILL -- "-$killed_pid"
-wait_for_status "$killed_pid" 137
-[[ -d "$root/.tachyon-docker.transaction" ]] || fail "SIGKILL did not leave a recovery journal"
-start_installer "$root" recover ''
-wait_for_status "$LAST_PID" 0
-assert_restored "$root"
-rm -rf -- "$root"
+case_sigkill_recovery() {
+  local root killed_pid
+  root=$(prepare_root sigkill active-disabled)
+  start_installer "$root" install deployment-active
+  killed_pid="$LAST_PID"
+  wait_for_checkpoint "$root" deployment-active "$killed_pid"
+  kill -KILL -- "-$killed_pid"
+  wait_for_status "$killed_pid" 137
+  [[ -d "$root/.tachyon-docker.transaction" ]] || fail "SIGKILL did not leave a recovery journal"
+  start_installer "$root" recover ''
+  wait_for_status "$LAST_PID" 0
+  assert_restored "$root"
+  rm -rf -- "$root"
+}
 
-# Lock and journal paths reject symlinks before any mutation.
-root=$(prepare_root lock-symlink absent)
-mkdir -p "$root/outside"
-ln -s "$root/outside" "$root/lock"
-start_installer "$root" recover ''
-wait_for_status "$LAST_PID" 1
-[[ -z "$(find "$root/outside" -mindepth 1 -print -quit)" ]] || fail "lock symlink target was modified"
-rm -rf -- "$root"
+case_lock_symlink() {
+  local root
+  root=$(prepare_root lock-symlink absent)
+  mkdir -p "$root/outside"
+  ln -s "$root/outside" "$root/lock"
+  start_installer "$root" recover ''
+  wait_for_status "$LAST_PID" 1
+  [[ -z "$(find "$root/outside" -mindepth 1 -print -quit)" ]] || fail "lock symlink target was modified"
+  rm -rf -- "$root"
+}
 
-root=$(prepare_root journal-symlink active-disabled)
-mkdir -p "$root/journal-target"
-ln -s "$root/journal-target" "$root/.tachyon-docker.transaction"
-start_installer "$root" recover ''
-wait_for_status "$LAST_PID" 1
-grep -Fq 'not a private directory' "$root/process.recover.out" || fail "journal symlink was not rejected"
-rm -rf -- "$root"
+case_journal_symlink() {
+  local root output
+  root=$(prepare_root journal-symlink active-disabled)
+  mkdir -p "$root/journal-target"
+  ln -s "$root/journal-target" "$root/.tachyon-docker.transaction"
+  start_installer "$root" recover ''
+  output="$LAST_OUTPUT"
+  wait_for_status "$LAST_PID" 1
+  grep -Fq 'not a private directory' "$output" || fail "journal symlink was not rejected"
+  rm -rf -- "$root"
+}
 
-echo "docker installer lifecycle tests passed"
+run_selected_case() {
+  case "$1" in
+    signal-int-transaction) case_signal_int_transaction ;;
+    signal-term-backup) case_signal_term_backup ;;
+    signal-hup-deployment) case_signal_hup_deployment ;;
+    signal-int-unit) case_signal_int_unit ;;
+    signal-term-health) case_signal_term_health ;;
+    start-failure) case_start_failure ;;
+    concurrency) case_concurrency ;;
+    sigkill-recovery) case_sigkill_recovery ;;
+    lock-symlink) case_lock_symlink ;;
+    journal-symlink) case_journal_symlink ;;
+    *) fail "unknown lifecycle fixture case: $1" ;;
+  esac
+}
+
+run_suite() {
+  local output_root output name status failures=0
+  output_root=$(mktemp -d /tmp/tachyon-docker-installer-policy.results.XXXXXX)
+  for name in \
+    signal-int-transaction \
+    signal-term-backup \
+    signal-hup-deployment \
+    signal-int-unit \
+    signal-term-health \
+    start-failure \
+    concurrency \
+    sigkill-recovery \
+    lock-symlink \
+    journal-symlink; do
+    output="$output_root/$name.out"
+    set +e
+    timeout --signal=TERM --kill-after=2s 8s bash "$0" --case "$name" >"$output" 2>&1
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
+      printf 'PASS lifecycle case %s\n' "$name"
+    else
+      failures=$((failures + 1))
+      printf 'FAIL lifecycle case %s (status=%s)\n' "$name" "$status" >&2
+      sed -n '1,240p' "$output" >&2 || true
+    fi
+  done
+  rm -rf -- "$output_root"
+  if (( failures > 0 )); then
+    echo "docker installer lifecycle test failed: $failures scenario(s) failed" >&2
+    return 1
+  fi
+  echo "docker installer lifecycle tests passed"
+}
+
+if [[ "${1:-}" == "--case" ]]; then
+  [[ $# -eq 2 ]] || fail "--case requires exactly one scenario name"
+  initialize_case
+  run_selected_case "$2"
+  echo "lifecycle case $2 passed"
+elif [[ $# -eq 0 ]]; then
+  run_suite
+else
+  fail "usage: $0 [--case NAME]"
+fi

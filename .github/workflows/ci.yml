@@ -25,6 +25,7 @@ jobs:
           bash .github/scripts/test-release-policy.sh
 
       - name: Verify byte-for-byte reproducible release fixtures
+        if: ${{ always() }}
         timeout-minutes: 2
         run: python3 .github/scripts/test-reproducible-release.py
 
@@ -54,7 +55,7 @@ jobs:
         shell: bash
         run: |
           test "$(uname -s)" = Linux
-          timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh
+          timeout --signal=TERM --kill-after=5s 120s bash scripts/test-docker-installer-lifecycle.sh
 
       - name: Verify opt-in TGP E2E script
         shell: bash

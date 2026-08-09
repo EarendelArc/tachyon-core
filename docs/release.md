@@ -50,7 +50,12 @@ assets twice after deliberately changing host metadata and creation order. Ubunt
 and Windows CI require byte-for-byte equality plus the same committed golden
 `EVIDENCE_MANIFEST.json`, evidence archive, and `SHA256SUMS.txt`. Golden files may
 only be refreshed with that fixture's explicit `--update-golden` mode, which calls
-the production generators.
+the production generators. Synthetic Helper evidence is written as explicit UTF-8
+LF text on every host; the reproducibility fixture rejects CR bytes and missing
+terminal newlines before packaging so platform newline translation cannot alter
+inner hashes or the referenced archive. The Ubuntu reproducibility step uses
+`always()` so an earlier policy assertion cannot suppress this independent byte
+evidence; its own failure still fails the job.
 
 ## Helper evidence
 
@@ -89,6 +94,13 @@ installer lifecycle fixture against the verified commit. Its `prepublish-gate`
 runs with `always()` and checks every prerequisite result explicitly. Publication
 cannot start unless tag verification, policy, lifecycle, Linux and Windows tests,
 and all six builds report `success`.
+
+Linux lifecycle fixtures launch each real installer through the repository-owned
+`fixture_process_launcher.py`. Before `exec`, the launcher creates a new session,
+resets INT, TERM, and HUP to `SIG_DFL`, and writes a mode-0600 JSON audit proving
+PID/PGID/SID identity and signal dispositions. Every scenario has an eight-second
+inner timeout; failures print bounded diagnostics and do not prevent later TERM,
+HUP, lock-contention, or SIGKILL recovery scenarios from running.
 
 The remote tag gate accepts only a real annotated tag object whose peeled commit
 matches the verified checkout. A correctly targeted lightweight tag is still rejected.

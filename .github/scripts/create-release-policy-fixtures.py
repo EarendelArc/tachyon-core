@@ -46,7 +46,11 @@ def write_evidence(directory: Path, commit: str, run_id: str, attempt: str) -> N
         "cleanup.json": {"status": "ok"},
     }
     for name, document in documents.items():
-        (directory / name).write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+        (directory / name).write_text(
+            json.dumps(document, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     hashes = {
         name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
         for name in documents
@@ -57,9 +61,17 @@ def write_evidence(directory: Path, commit: str, run_id: str, attempt: str) -> N
         "run_attempt": int(attempt),
         "run_id": int(run_id),
     }
-    (directory / "manifest.json").write_text(json.dumps(inner, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (directory / "manifest.json").write_text(
+        json.dumps(inner, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     manifest_hash = hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest()
-    (directory / "manifest.sha256").write_text(f"{manifest_hash}  manifest.json\n", encoding="utf-8")
+    (directory / "manifest.sha256").write_text(
+        f"{manifest_hash}  manifest.json\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 def main() -> int:

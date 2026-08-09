@@ -273,10 +273,11 @@ func TestReleaseRequiresPolicyReproducibilityLifecycleAndPrepublishAggregate(t *
 		"name: Release policy and reproducibility",
 		"bash .github/scripts/test-release-policy.sh",
 		"name: Verify two-run thirteen-asset reproducibility",
+		"name: Verify two-run thirteen-asset reproducibility\n        if: ${{ always() }}",
 		"python3 .github/scripts/test-reproducible-release.py",
 		"linux-lifecycle:",
 		"name: Linux installer lifecycle evidence",
-		"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh",
+		"timeout --signal=TERM --kill-after=5s 120s bash scripts/test-docker-installer-lifecycle.sh",
 		"prepublish-gate:",
 		"if: ${{ always() }}",
 		"needs: [verify_tag, release-policy, linux-lifecycle, test, test-windows, build]",
@@ -292,9 +293,9 @@ func TestReleaseRequiresPolicyReproducibilityLifecycleAndPrepublishAggregate(t *
 		}
 	}
 	for text, want := range map[string]int{
-		"bash .github/scripts/test-release-policy.sh":                                                 1,
-		"python3 .github/scripts/test-reproducible-release.py":                                        1,
-		"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh": 1,
+		"bash .github/scripts/test-release-policy.sh":                                                1,
+		"python3 .github/scripts/test-reproducible-release.py":                                       1,
+		"timeout --signal=TERM --kill-after=5s 120s bash scripts/test-docker-installer-lifecycle.sh": 1,
 	} {
 		if count := strings.Count(workflow, text); count != want {
 			t.Fatalf("Release workflow contains mandatory command %q %d times, want %d", text, count, want)
@@ -509,7 +510,12 @@ func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
 	fixture := readRepoFile(t, "scripts", "test-docker-installer-lifecycle.sh")
 	for _, required := range []string{
 		`[[ "$(uname -s)" == "Linux" ]] || fail`,
-		"setsid env",
+		`python3 "$LAUNCHER" launch`,
+		`python3 "$LAUNCHER" verify`,
+		`timeout --signal=TERM --kill-after=2s 8s bash "$0" --case "$name"`,
+		"Received $signal_name during Docker deployment",
+		"PASS lifecycle case",
+		"FAIL lifecycle case",
 		"kill -s",
 		"kill -KILL",
 		"another Docker installer owns the lifecycle lock",
@@ -519,6 +525,40 @@ func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
 			t.Fatalf("Docker lifecycle fixture is missing %q", required)
 		}
 	}
+	launcher := readRepoFile(t, "scripts", "fixture_process_launcher.py")
+	for _, required := range []string{
+		"os.setsid()",
+		"signal.signal(item, signal.SIG_DFL)",
+		`"process_group_id": os.getpgrp()`,
+		`"session_id": os.getsid(0)`,
+		`"signal_dispositions"`,
+		"os.replace(temporary, path)",
+		"os.fsync(directory)",
+		"launcher audit PID does not match the supervised child",
+		"launcher audit command is missing expected token",
+	} {
+		if !strings.Contains(launcher, required) {
+			t.Fatalf("Docker lifecycle launcher is missing %q", required)
+		}
+	}
+	if strings.Contains(fixture, "setsid env") {
+		t.Fatal("Docker lifecycle fixture still inherits background-shell signal dispositions through setsid")
+	}
+
+	fixtureGenerator := readRepoFile(t, ".github", "scripts", "create-release-policy-fixtures.py")
+	if count := strings.Count(fixtureGenerator, `newline="\n"`); count != 3 {
+		t.Fatalf("release evidence fixture contains %d canonical LF writes, want 3", count)
+	}
+	reproducibility := readRepoFile(t, ".github", "scripts", "test-reproducible-release.py")
+	for _, required := range []string{"verify_evidence_source", `b"\r" in payload`, "evidence fixture is not canonical LF text"} {
+		if !strings.Contains(reproducibility, required) {
+			t.Fatalf("release reproducibility fixture is missing LF contract %q", required)
+		}
+	}
+	ci := readRepoFile(t, ".github", "workflows", "ci.yml")
+	if !strings.Contains(ci, "name: Verify byte-for-byte reproducible release fixtures\n        if: ${{ always() }}") {
+		t.Fatal("CI reproducibility evidence is skipped after an earlier release-policy failure")
+	}
 
 	for name, workflow := range map[string]string{
 		"CI":      readRepoFile(t, ".github", "workflows", "ci.yml"),
@@ -527,7 +567,7 @@ func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
 		for _, required := range []string{
 			"Verify Docker installer process lifecycle",
 			"timeout-minutes: 3",
-			"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh",
+			"timeout --signal=TERM --kill-after=5s 120s bash scripts/test-docker-installer-lifecycle.sh",
 		} {
 			if !strings.Contains(workflow, required) {
 				t.Fatalf("%s workflow is missing mandatory Docker lifecycle gate %q", name, required)

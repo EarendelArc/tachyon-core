@@ -57,6 +57,13 @@ def perturb_evidence(directory: Path, reverse: bool) -> None:
         os.utime(path, (1_700_000_000 + index, 1_600_000_000 + index))
 
 
+def verify_evidence_source(directory: Path) -> None:
+    for path in sorted(directory.iterdir()):
+        payload = path.read_bytes()
+        if b"\r" in payload or not payload.endswith(b"\n"):
+            raise AssertionError(f"evidence fixture is not canonical LF text: {path.name}")
+
+
 def generate(repo: Path, root: Path, reverse: bool) -> Path:
     release = root / "release"
     evidence = root / "evidence"
@@ -72,6 +79,7 @@ def generate(repo: Path, root: Path, reverse: bool) -> Path:
         "--source-date-epoch", str(SOURCE_DATE_EPOCH),
         timezone_name="Pacific/Kiritimati" if reverse else "America/Los_Angeles",
     )
+    verify_evidence_source(evidence)
     perturb_evidence(evidence, reverse)
     invoke(
         repo,

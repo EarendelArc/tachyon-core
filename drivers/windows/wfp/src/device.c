@@ -46,7 +46,11 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
     RtlZeroMemory(context, sizeof(*context));
     context->device = *device_out;
     context->queue_capacity = TACHYON_WFP_DEFAULT_QUEUE_CAPACITY;
+    context->resident_byte_capacity = TACHYON_WFP_DEFAULT_RESIDENT_BYTES;
     context->verdict_timeout_ms = TACHYON_WFP_DEFAULT_VERDICT_TIMEOUT_MS;
+    ExInitializeRundownProtection(&context->callback_rundown);
+    KeInitializeEvent(&context->flows_drained, NotificationEvent, TRUE);
+    KeInitializeEvent(&context->injections_drained, NotificationEvent, TRUE);
     InitializeListHead(&context->capture_queue);
     InitializeListHead(&context->pending_packets);
     InitializeListHead(&context->flows);
@@ -87,7 +91,8 @@ VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFIL
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(device);
     UNREFERENCED_PARAMETER(file_object);
-    if (InterlockedCompareExchange(&context->client_open, 1, 0) != 0) {
+    if (InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
+        InterlockedCompareExchange(&context->client_open, 1, 0) != 0) {
         WdfRequestComplete(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -158,7 +163,8 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
     if (!NT_SUCCESS(status) || !TgValidateHeader(&input->header, input_size, TachyonWfpMessageNegotiateRequest)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (input->required_capabilities != TACHYON_WFP_REQUIRED_CAPABILITIES ||
+    if (input->header.flags != 0 || (input->required_capabilities & ~TACHYON_WFP_REQUIRED_CAPABILITIES) != 0 ||
+        input->required_capabilities != TACHYON_WFP_REQUIRED_CAPABILITIES ||
         input->requested_queue_capacity == 0 || input->requested_queue_capacity > TACHYON_WFP_DEFAULT_QUEUE_CAPACITY ||
         input->requested_timeout_ms < 25 || input->requested_timeout_ms > 1000) {
         return STATUS_REVISION_MISMATCH;
@@ -217,7 +223,8 @@ BOOLEAN TgValidateHeader(const TACHYON_WFP_MESSAGE_HEADER* header, SIZE_T actual
     return header != NULL && actual >= TACHYON_WFP_HEADER_SIZE && actual <= TACHYON_WFP_MAX_MESSAGE_SIZE &&
            header->magic == TACHYON_WFP_ABI_MAGIC && header->header_size == TACHYON_WFP_HEADER_SIZE &&
            header->abi_major == TACHYON_WFP_ABI_MAJOR && header->abi_minor <= TACHYON_WFP_ABI_MINOR &&
-           header->kind == kind && header->total_size == actual && header->request_id != 0 && header->reserved == 0;
+           header->kind == kind && header->flags == 0 && header->total_size == actual &&
+           header->request_id != 0 && header->reserved == 0;
 }
 
 UINT64 TgNow100ns(VOID)

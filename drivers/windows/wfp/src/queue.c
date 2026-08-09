@@ -19,6 +19,45 @@ static BOOLEAN TgEqualIdentity(const TG_PENDING_PACKET* packet, const TACHYON_WF
            RtlCompareMemory(packet->flow->lease_nonce, verdict->lease_nonce, 16) == 16;
 }
 
+static VOID TgDetachQueueLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
+{
+    if (!packet->queued) return;
+    RemoveEntryList(&packet->queue_link);
+    InitializeListHead(&packet->queue_link);
+    packet->queued = FALSE;
+    --context->queue_depth;
+    context->queue_bytes -= packet->record_size;
+}
+
+static VOID TgDetachPendingLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
+{
+    if (!packet->pending) return;
+    RemoveEntryList(&packet->pending_link);
+    InitializeListHead(&packet->pending_link);
+    packet->pending = FALSE;
+    --context->pending_count;
+    context->pending_bytes -= packet->record_size;
+}
+
+static BOOLEAN TgBeginCompletionLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
+{
+    LONG state = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketCaptured);
+    if (state != TgPacketCaptured) {
+        state = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued);
+        if (state != TgPacketDequeued) return FALSE;
+    }
+    TgPacketReference(packet); /* local completion path */
+    TgDetachQueueLocked(context, packet);
+    TgDetachPendingLocked(context, packet);
+    return TRUE;
+}
+
+static VOID TgReleasePendingOwnerAndComplete(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UINT32 action)
+{
+    TgPacketDereference(packet); /* pending-list/base owner */
+    TgCompletePacket(context, packet, action); /* consumes local completion reference */
+}
+
 NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size)
 {
     const TACHYON_WFP_POLICY_HEADER* header = (const TACHYON_WFP_POLICY_HEADER*)input;
@@ -30,7 +69,8 @@ NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input
     UINT32 index;
 
     if (input_size < TACHYON_WFP_POLICY_HEADER_SIZE || !TgValidateHeader(&header->header, input_size, TachyonWfpMessagePolicy) ||
-        header->entry_count == 0 || header->entry_count > 1024 || TgAllZero(header->lease_nonce, sizeof(header->lease_nonce))) {
+        header->entry_count == 0 || header->entry_count > 1024 || header->policy_flags != 0 ||
+        TgAllZero(header->lease_nonce, sizeof(header->lease_nonce))) {
         return STATUS_INVALID_PARAMETER;
     }
     entries_size = (SIZE_T)header->entry_count * TACHYON_WFP_POLICY_ENTRY_SIZE;
@@ -135,8 +175,14 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
         PLIST_ENTRY entry = RemoveHeadList(&context->capture_queue);
         packet = CONTAINING_RECORD(entry, TG_PENDING_PACKET, queue_link);
         InitializeListHead(&packet->queue_link);
-        packet->dequeued = TRUE;
+        packet->queued = FALSE;
         --context->queue_depth;
+        context->queue_bytes -= packet->record_size;
+        if (InterlockedCompareExchange(&packet->state, TgPacketDequeued, TgPacketCaptured) != TgPacketCaptured) {
+            packet = NULL;
+        } else {
+            TgPacketReference(packet); /* protects copy against timeout/verdict/flush */
+        }
     }
     WdfSpinLockRelease(context->lock);
     if (packet == NULL) {
@@ -144,16 +190,37 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
         return NT_SUCCESS(status) ? STATUS_PENDING : status;
     }
     if (output_size < packet->record_size) {
-        TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect);
+        BOOLEAN claimed;
+        WdfSpinLockAcquire(context->lock);
+        claimed = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued) == TgPacketDequeued;
+        if (claimed) TgDetachPendingLocked(context, packet);
+        WdfSpinLockRelease(context->lock);
+        if (claimed) {
+            TgPacketDereference(packet); /* pending-list/base owner */
+            TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect); /* consumes copy reference */
+        } else {
+            TgPacketDereference(packet);
+        }
         return STATUS_BUFFER_TOO_SMALL;
     }
     status = WdfRequestRetrieveOutputBuffer(request, packet->record_size, &output, NULL);
     if (!NT_SUCCESS(status)) {
-        TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect);
+        BOOLEAN claimed;
+        WdfSpinLockAcquire(context->lock);
+        claimed = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued) == TgPacketDequeued;
+        if (claimed) TgDetachPendingLocked(context, packet);
+        WdfSpinLockRelease(context->lock);
+        if (claimed) {
+            TgPacketDereference(packet);
+            TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect);
+        } else {
+            TgPacketDereference(packet);
+        }
         return status;
     }
     RtlCopyMemory(output, packet->record, packet->record_size);
     WdfRequestSetInformation(request, packet->record_size);
+    TgPacketDereference(packet);
     return STATUS_SUCCESS;
 }
 
@@ -175,24 +242,17 @@ NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T in
     TG_PENDING_PACKET* packet = NULL;
     PLIST_ENTRY entry;
     if (input_size < TACHYON_WFP_VERDICT_HEADER_SIZE || !TgValidateHeader(&verdict->header, input_size, TachyonWfpMessageVerdict) ||
-        verdict->payload_size != input_size - TACHYON_WFP_VERDICT_HEADER_SIZE || verdict->reserved != 0 ||
-        verdict->action < TachyonWfpVerdictTunnel || verdict->action > TachyonWfpVerdictInjectToApplication) {
+        verdict->payload_size != input_size - TACHYON_WFP_VERDICT_HEADER_SIZE || verdict->payload_size != 0 ||
+        verdict->reserved != 0 || verdict->reason != 0 ||
+        verdict->action < TachyonWfpVerdictTunnel || verdict->action > TachyonWfpVerdictDrop) {
         InterlockedIncrement64((volatile LONG64*)&context->statistics.rejected_frames);
         return STATUS_INVALID_PARAMETER;
     }
     WdfSpinLockAcquire(context->lock);
     for (entry = context->pending_packets.Flink; entry != &context->pending_packets; entry = entry->Flink) {
         TG_PENDING_PACKET* candidate = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
-        if (TgEqualIdentity(candidate, verdict)) {
+        if (TgEqualIdentity(candidate, verdict) && TgBeginCompletionLocked(context, candidate)) {
             packet = candidate;
-            RemoveEntryList(&packet->pending_link);
-            InitializeListHead(&packet->pending_link);
-            if (!packet->dequeued && !IsListEmpty(&packet->queue_link)) {
-                RemoveEntryList(&packet->queue_link);
-                InitializeListHead(&packet->queue_link);
-                --context->queue_depth;
-            }
-            --context->pending_count;
             break;
         }
     }
@@ -201,11 +261,7 @@ NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T in
         InterlockedIncrement64((volatile LONG64*)&context->statistics.rejected_frames);
         return STATUS_NOT_FOUND;
     }
-    if (verdict->action == TachyonWfpVerdictInjectToApplication && verdict->payload_size == 0) {
-        TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect);
-        return STATUS_INVALID_PARAMETER;
-    }
-    TgCompletePacket(context, packet, verdict->action);
+    TgReleasePendingOwnerAndComplete(context, packet, verdict->action);
     return STATUS_SUCCESS;
 }
 
@@ -221,15 +277,9 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
     while (entry != &context->pending_packets) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
         entry = entry->Flink;
-        if (packet->deadline_100ns <= now) {
-            RemoveEntryList(&packet->pending_link);
+        if (packet->deadline_100ns <= now && TgBeginCompletionLocked(context, packet)) {
+            /* Move the local completion reference to the detached work list. */
             InsertTailList(&expired, &packet->pending_link);
-            if (!packet->dequeued && !IsListEmpty(&packet->queue_link)) {
-                RemoveEntryList(&packet->queue_link);
-                InitializeListHead(&packet->queue_link);
-                --context->queue_depth;
-            }
-            --context->pending_count;
         }
     }
     WdfSpinLockRelease(context->lock);
@@ -237,7 +287,7 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(RemoveHeadList(&expired), TG_PENDING_PACKET, pending_link);
         InitializeListHead(&packet->pending_link);
         InterlockedIncrement64((volatile LONG64*)&context->statistics.verdict_timeout);
-        TgCompletePacket(context, packet, TachyonWfpVerdictPermitDirect);
+        TgReleasePendingOwnerAndComplete(context, packet, TachyonWfpVerdictPermitDirect);
     }
 }
 
@@ -248,15 +298,18 @@ VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct)
     InitializeListHead(&detached);
     WdfSpinLockAcquire(context->lock);
     while (!IsListEmpty(&context->pending_packets)) {
-        TG_PENDING_PACKET* packet = CONTAINING_RECORD(RemoveHeadList(&context->pending_packets), TG_PENDING_PACKET, pending_link);
-        if (!packet->dequeued && !IsListEmpty(&packet->queue_link)) {
-            RemoveEntryList(&packet->queue_link);
-            InitializeListHead(&packet->queue_link);
+        TG_PENDING_PACKET* packet = CONTAINING_RECORD(context->pending_packets.Flink, TG_PENDING_PACKET, pending_link);
+        if (!TgBeginCompletionLocked(context, packet)) {
+            TgDetachPendingLocked(context, packet);
+            TgPacketDereference(packet);
+            continue;
         }
-        InsertTailList(&detached, &packet->pending_link);
+        InsertTailList(&detached, &packet->pending_link); /* local completion reference */
     }
     context->queue_depth = 0;
+    context->queue_bytes = 0;
     context->pending_count = 0;
+    context->pending_bytes = 0;
     InitializeListHead(&context->capture_queue);
     WdfSpinLockRelease(context->lock);
     while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(context->dequeue_queue, &request))) {
@@ -265,6 +318,7 @@ VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct)
     while (!IsListEmpty(&detached)) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(RemoveHeadList(&detached), TG_PENDING_PACKET, pending_link);
         InitializeListHead(&packet->pending_link);
-        TgCompletePacket(context, packet, permit_direct ? TachyonWfpVerdictPermitDirect : TachyonWfpVerdictDrop);
+        TgReleasePendingOwnerAndComplete(context, packet,
+            permit_direct ? TachyonWfpVerdictPermitDirect : TachyonWfpVerdictDrop);
     }
 }

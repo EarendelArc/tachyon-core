@@ -11,7 +11,8 @@
 #define TACHYON_WFP_ABI_MINOR 0u
 #define TACHYON_WFP_MAX_MESSAGE_SIZE (64u * 1024u)
 #define TACHYON_WFP_MAX_PAYLOAD_SIZE 65507u
-#define TACHYON_WFP_DEFAULT_QUEUE_CAPACITY 4096u
+#define TACHYON_WFP_DEFAULT_QUEUE_CAPACITY 512u
+#define TACHYON_WFP_DEFAULT_RESIDENT_BYTES (8u * 1024u * 1024u)
 #define TACHYON_WFP_DEFAULT_VERDICT_TIMEOUT_MS 250u
 
 #define TACHYON_WFP_CAP_FLOW_V4 (UINT64_C(1) << 0)
@@ -33,7 +34,7 @@
      TACHYON_WFP_CAP_DATAGRAM_V4 | TACHYON_WFP_CAP_DATAGRAM_V6 |             \
      TACHYON_WFP_CAP_PROCESS_IDENTITY | TACHYON_WFP_CAP_USER_SID |           \
      TACHYON_WFP_CAP_APP_ID | TACHYON_WFP_CAP_INJECT_SEND |                  \
-     TACHYON_WFP_CAP_INJECT_RECEIVE | TACHYON_WFP_CAP_INJECTION_STATE |      \
+     TACHYON_WFP_CAP_INJECTION_STATE |                                        \
      TACHYON_WFP_CAP_BOUNDED_QUEUE | TACHYON_WFP_CAP_FAIL_OPEN_TIMEOUT |     \
      TACHYON_WFP_CAP_POLICY_GENERATION)
 
@@ -225,4 +226,14 @@ static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_S
 static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
 static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
 static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
+#else
+_Static_assert(sizeof(TACHYON_WFP_MESSAGE_HEADER) == TACHYON_WFP_HEADER_SIZE, "ABI header size");
+_Static_assert(sizeof(TACHYON_WFP_NEGOTIATE_REQUEST) == TACHYON_WFP_NEGOTIATE_REQUEST_SIZE, "negotiate request size");
+_Static_assert(sizeof(TACHYON_WFP_NEGOTIATE_RESPONSE) == TACHYON_WFP_NEGOTIATE_RESPONSE_SIZE, "negotiate response size");
+_Static_assert(sizeof(TACHYON_WFP_POLICY_HEADER) == TACHYON_WFP_POLICY_HEADER_SIZE, "policy header size");
+_Static_assert(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE, "policy entry size");
+_Static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
+_Static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
+_Static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
+_Static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
 #endif

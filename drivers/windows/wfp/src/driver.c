@@ -2,6 +2,7 @@
 #include "tachyon_wfp.h"
 
 WDFDEVICE TgControlDevice = NULL;
+TG_DEVICE_CONTEXT* volatile TgControlContext = NULL;
 
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver_object, _In_ PUNICODE_STRING registry_path)
 {
@@ -24,11 +25,16 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver_object, _In_ PUNICODE_STRING reg
     if (!NT_SUCCESS(status)) {
         return status;
     }
+    TgControlDevice = device;
+    InterlockedExchangePointer((PVOID volatile*)&TgControlContext, TgGetDeviceContext(device));
     status = TgWfpStart(TgGetDeviceContext(device));
     if (!NT_SUCCESS(status)) {
+        InterlockedExchangePointer((PVOID volatile*)&TgControlContext, NULL);
+        ExWaitForRundownProtectionRelease(&TgGetDeviceContext(device)->callback_rundown);
+        TgControlDevice = NULL;
+        WdfObjectDelete(device);
         return status;
     }
-    TgControlDevice = device;
     WdfControlFinishInitializing(device);
     return STATUS_SUCCESS;
 }
@@ -37,7 +43,8 @@ VOID TgEvtDriverUnload(_In_ WDFDRIVER driver)
 {
     UNREFERENCED_PARAMETER(driver);
     if (TgControlDevice != NULL) {
-        TgWfpStop(TgGetDeviceContext(TgControlDevice));
+        NTSTATUS status = TgWfpStop(TgGetDeviceContext(TgControlDevice));
+        NT_ASSERT(NT_SUCCESS(status));
         TgControlDevice = NULL;
     }
 }

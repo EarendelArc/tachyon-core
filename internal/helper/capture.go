@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-const WFPDriverContractVersion = "tachyon-wfp-callout-v1"
+const WFPDriverContractVersion = "tachyon-wfp-callout-v2"
 
 const (
-	WFPDriverABIVersion uint16 = 1
+	WFPDriverABIVersion uint16 = 2
 	WFPDriverContractID uint32 = 0x54414348
 	WFPMaxMessageSize   uint32 = 64 << 10
 	WFPKindHandshake    uint16 = 1
@@ -51,14 +51,18 @@ type CaptureCapabilities struct {
 }
 
 type FlowIdentity struct {
-	FlowID       [16]byte
-	Generation   uint64
-	LeaseNonce   [16]byte
-	PID          uint32
-	ProcessStart time.Time
-	Local        netip.AddrPort
-	Remote       netip.AddrPort
-	Protocol     uint8
+	FlowID          [16]byte
+	Generation      uint64
+	LeaseNonce      [16]byte
+	PID             uint32
+	ProcessStartKey uint64
+	AppIDHash       [32]byte
+	UserSIDHash     [32]byte
+	Direction       uint8
+	ProcessStart    time.Time
+	Local           netip.AddrPort
+	Remote          netip.AddrPort
+	Protocol        uint8
 }
 
 type CapturedDatagram struct {
@@ -69,6 +73,7 @@ type CapturedDatagram struct {
 
 type Delivery struct {
 	Identity FlowIdentity
+	Sequence uint64
 	Payload  []byte
 }
 

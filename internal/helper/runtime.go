@@ -101,7 +101,11 @@ func NewRuntime(config Config) (*Runtime, error) {
 		return nil, err
 	}
 	if config.Provider == nil {
-		config.Provider = NewUnavailableCaptureProvider()
+		device := NewPlatformCaptureDevice()
+		config.Provider = device
+		if config.Injector == nil {
+			config.Injector = device
+		}
 	}
 	if config.Injector == nil {
 		config.Injector = NewUnavailableInjector()

@@ -141,7 +141,11 @@ context。Release 下载要求官方仓库、immutable prerelease、指向声明
 tag、唯一且精确匹配的资产名，以及一致的 GitHub digest 和 size。
 
 Docker 升级会先在 staging 中完成下载、构建和配置验证，再切换在线目录与 systemd unit；
-切换失败会恢复原 Compose、配置、unit 和服务状态。幂等重跑会保留有效私有配置中的原
+部署目录旁的 root 私有持久事务 journal 不依赖安装进程存活：收到 `INT`、`TERM` 或
+`HUP` 时立即回滚；遭遇 `SIGKILL` 或主机重启后，下次运行安装器会先自动恢复。只有本地
+system Docker daemon、预期 Compose 容器、精确镜像、healthy 状态以及由 Core 进程持有的
+UDP 监听全部通过，事务才会提交。远程 Docker context 和 daemon 环境覆盖会被拒绝。
+幂等重跑会保留有效私有配置中的原
 PSK。轮换必须同时设置 `TACHYON_ROTATE_PSK=1` 和传入
 `--confirm-psk-rotation`。自定义 GitHub 仓库只在 `TACHYON_DEV_MODE=1` 下允许，并会明确
 标记为不可信开发输入。

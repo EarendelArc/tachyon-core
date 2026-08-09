@@ -281,7 +281,7 @@ func TestReleasePinsTagBuildAndAssetsToVerifiedCommit(t *testing.T) {
 	}
 
 	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
-	for _, text := range []string{`--target "${commit}"`, "--verify-tag", "--draft", "gh release upload", "-F draft=false"} {
+	for _, text := range []string{`--target "${commit}"`, "--verify-tag", "--draft", "gh release upload", "-F draft=false", `"repos/${repository}/immutable-releases"`, "X-GitHub-Api-Version: 2026-03-10"} {
 		if !strings.Contains(publication, text) {
 			t.Fatalf("release publication script is missing %q", text)
 		}
@@ -359,6 +359,9 @@ func TestCurrentReleasePipelineIsPrereleaseOnly(t *testing.T) {
 	if count := strings.Count(workflow, `echo "prerelease=true"`); count != 1 {
 		t.Fatalf("release workflow forces prerelease metadata %d times, want exactly 1", count)
 	}
+	if !strings.Contains(workflow, `RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}`) {
+		t.Fatal("release workflow does not provide the immutable-release settings credential")
+	}
 
 	publication := readRepoFile(t, ".github", "scripts", "publish-release.sh")
 	for _, required := range []string{
@@ -367,6 +370,8 @@ func TestCurrentReleasePipelineIsPrereleaseOnly(t *testing.T) {
 		"--prerelease",
 		`[[ ${#assets[@]} -eq 13 ]]`,
 		`[[ ${#expected_checksum_entries[@]} -eq 12 ]]`,
+		`[[ -n "${settings_token}" ]]`,
+		"repository immutable releases are not provably enabled",
 	} {
 		if !strings.Contains(publication, required) {
 			t.Fatalf("prerelease publication policy is missing %q", required)
@@ -377,12 +382,19 @@ func TestCurrentReleasePipelineIsPrereleaseOnly(t *testing.T) {
 	if gate < 0 || firstGitHubRead < 0 || gate > firstGitHubRead {
 		t.Fatal("prerelease-only gate must run before the first GitHub API operation")
 	}
+	immutableGate := strings.Index(publication, `"repos/${repository}/immutable-releases"`)
+	firstReleaseCreate := strings.Index(publication, `gh release create "${version}"`)
+	if immutableGate < 0 || firstReleaseCreate < 0 || immutableGate > firstReleaseCreate {
+		t.Fatal("repository immutable-release setting must be verified before draft creation")
+	}
 
 	bashPolicy := readRepoFile(t, ".github", "scripts", "test-release-policy.sh")
 	for _, required := range []string{
 		"non-prerelease publication",
 		"run_publish happy false v1.2.4-alpha.24",
 		"prerelease=false reached the GitHub API",
+		"mutable repository setting",
+		"missing immutable settings credential",
 	} {
 		if !strings.Contains(bashPolicy, required) {
 			t.Fatalf("persistent prerelease-negative policy is missing %q", required)

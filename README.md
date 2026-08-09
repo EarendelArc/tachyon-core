@@ -215,8 +215,13 @@ repository, an immutable prerelease, an annotated tag targeting the advertised
 commit, a unique exact asset name, and matching GitHub digest and size.
 
 Docker upgrades are staged and validated before the live directory and systemd
-unit are switched. A failed switch restores the previous Compose/config/unit
-and service state. Reruns preserve a valid private existing PSK. Rotation
+unit are switched. A root-private persistent transaction journal beside the
+deployment survives process death: `INT`, `TERM`, and `HUP` roll back immediately,
+while a later installer run rolls back any transaction interrupted by `SIGKILL`
+or host restart. A deployment commits only after the local system Docker daemon,
+exact Compose container and image, healthy state, and Core-owned UDP listener all
+match the staged contract. Remote Docker contexts and daemon environment overrides
+are rejected. Reruns preserve a valid private existing PSK. Rotation
 requires both `TACHYON_ROTATE_PSK=1` and `--confirm-psk-rotation`; custom GitHub
 repositories are accepted only with `TACHYON_DEV_MODE=1` and are prominently
 reported as untrusted development input.

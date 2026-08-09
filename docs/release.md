@@ -67,6 +67,11 @@ matches the verified checkout. A correctly targeted lightweight tag is still rej
 The current alpha release pipeline is prerelease-only. Tag pushes and manual
 `workflow_dispatch` runs both force `prerelease=true`; there is no manual formal-release
 input. The publisher rejects every other value before its first GitHub API operation.
+The repository secret `RELEASE_SETTINGS_TOKEN` must be a fine-grained token with
+repository Administration read permission. Before creating even a draft, the
+publisher uses GitHub REST API version `2026-03-10` to prove that repository
+immutable releases are enabled; a missing token, disabled setting, permission
+failure, or ambiguous response fails before any release write.
 
 Before publishing, the workflow requires the verified tag, green Linux and Windows
 CI, six platform ZIPs, all bilingual notes, all manifests, and a strict SHA-256

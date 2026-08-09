@@ -237,6 +237,14 @@ if [[ "$1 $2" == "release upload" ]]; then
 fi
 
 if [[ "$1" == "api" ]]; then
+  if [[ " $* " == *" repos/tachyon-space/tachyon-core/immutable-releases "* ]]; then
+    if [[ "${FAKE_GH_MODE}" == "immutable-disabled" ]]; then
+      echo 'false'
+    else
+      echo 'true'
+    fi
+    exit 0
+  fi
   if [[ " $* " == *" --method DELETE "* ]]; then
     rm -f "${FAKE_GH_STATE}"
     exit 0
@@ -262,9 +270,24 @@ run_publish() {
     FAKE_GH_STATE="${fake_state}" \
     FAKE_GH_LOG="${fake_log}" \
     FAKE_GH_BODY="${fake_body}" \
+    RELEASE_SETTINGS_TOKEN="fixture-administration-read-token" \
     GITHUB_REPOSITORY="tachyon-space/tachyon-core" \
     bash "${publish_script}" "${version}" "${second_commit}" "${prerelease}" "${release_assets}"
 }
+
+run_publish_without_settings_token() {
+  PATH="${fake_bin}:${PATH}" \
+    FAKE_GH_MODE="happy" \
+    FAKE_GH_STATE="${fake_state}" \
+    FAKE_GH_LOG="${fake_log}" \
+    FAKE_GH_BODY="${fake_body}" \
+    GITHUB_REPOSITORY="tachyon-space/tachyon-core" \
+    bash "${publish_script}" v1.2.4 "${second_commit}" true "${release_assets}"
+}
+
+rm -f "${fake_state}" "${fake_log}" "${fake_body}"
+expect_failure "missing immutable settings credential" "RELEASE_SETTINGS_TOKEN" run_publish_without_settings_token
+[[ ! -f "${fake_log}" ]] || fail "missing settings credential reached the GitHub API"
 
 rm -f "${fake_state}" "${fake_log}" "${fake_body}"
 expect_failure \
@@ -272,6 +295,11 @@ expect_failure \
   "only prerelease publication is supported; prerelease must be true" \
   run_publish happy false v1.2.4-alpha.24
 [[ ! -f "${fake_log}" ]] || fail "prerelease=false reached the GitHub API"
+
+rm -f "${fake_state}" "${fake_log}" "${fake_body}"
+expect_failure "mutable repository setting" "repository immutable releases are not provably enabled" run_publish immutable-disabled
+grep -Fq 'repos/tachyon-space/tachyon-core/immutable-releases' "${fake_log}" || fail "immutable repository setting was not queried"
+! grep -Eq '^release (create|upload)' "${fake_log}" || fail "mutable repository setting reached release creation"
 
 rm -f "${fake_state}" "${fake_log}" "${fake_body}"
 expect_failure "existing release" "already exists; refusing to edit or replace" run_publish existing

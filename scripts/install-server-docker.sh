@@ -40,6 +40,10 @@ TACHYON_BASE_IMAGE="debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629
 SYSTEMD_UNIT="/etc/systemd/system/tachyon-docker.service"
 EXPECTED_PRERELEASE="true"
 INSTALL_WORK_ROOT=""
+TRANSACTION_DIR="$(dirname "$COMPOSE_DIR")/.tachyon-docker.transaction"
+ACTIVE_TRANSACTION=false
+PROC_ROOT="/proc"
+DEPLOYMENT_HEALTH_TIMEOUT_SECONDS=120
 
 usage() {
   cat <<'USAGE'
@@ -141,6 +145,28 @@ validate_repository_policy() {
 
 cleanup_install_work() {
   [[ -z "$INSTALL_WORK_ROOT" ]] || rm -rf -- "$INSTALL_WORK_ROOT"
+}
+
+reject_docker_client_overrides() {
+  local variable
+  for variable in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+    [[ -z "${!variable:-}" ]] \
+      || die "$variable is forbidden; the installer only supports the local system Docker daemon"
+  done
+}
+
+verify_local_docker_daemon() {
+  reject_docker_client_overrides
+  local context endpoint
+  context=$(docker context show) || die "Unable to identify the active Docker context"
+  [[ "$context" == "default" ]] \
+    || die "Docker context must be default, got $context"
+  endpoint=$(docker context inspect default --format '{{ (index .Endpoints "docker").Host }}') \
+    || die "Unable to inspect the default Docker endpoint"
+  [[ "$endpoint" == "unix:///var/run/docker.sock" ]] \
+    || die "Docker endpoint must be unix:///var/run/docker.sock, got $endpoint"
+  [[ -S /var/run/docker.sock ]] \
+    || die "Local Docker socket /var/run/docker.sock is unavailable"
 }
 
 version_allowed() {
@@ -266,6 +292,7 @@ verify_installed_docker_policy() {
     version_allowed "$package" "$version" \
       || die "Installed $package version $version is outside the supported major policy"
   done
+  verify_local_docker_daemon
   docker version --format '{{.Server.Version}}' >/dev/null \
     || die "Docker daemon is not reachable"
   docker compose version --short >/dev/null \
@@ -273,6 +300,7 @@ verify_installed_docker_policy() {
 }
 
 install_docker() {
+  reject_docker_client_overrides
   refuse_conflicting_docker_packages
   configure_docker_repository
   local engine_version cli_version containerd_version buildx_version compose_version
@@ -784,10 +812,130 @@ build_and_validate_staged_deployment() {
   validate_staged_contract "$deployment_dir"
 }
 
+container_owns_udp_listener() {
+  local container_pid="$1"
+  local port="$2"
+  [[ "$container_pid" =~ ^[0-9]+$ && "$container_pid" -gt 1 ]] || return 1
+  [[ -d "$PROC_ROOT/$container_pid/fd" ]] || return 1
+  local port_hex inode fd target
+  port_hex=$(printf '%04X' "$port")
+  while IFS= read -r inode; do
+    [[ "$inode" =~ ^[0-9]+$ ]] || continue
+    for fd in "$PROC_ROOT/$container_pid/fd"/*; do
+      target=$(readlink "$fd" 2>/dev/null || true)
+      [[ "$target" == "socket:[$inode]" ]] && return 0
+    done
+  done < <(awk -v port="$port_hex" '
+    NR > 1 {
+      split($2, local, ":")
+      if (toupper(local[2]) == port && $4 == "07" && $10 ~ /^[0-9]+$/) print $10
+    }
+  ' "$PROC_ROOT/$container_pid/net/udp" "$PROC_ROOT/$container_pid/net/udp6" 2>/dev/null)
+  return 1
+}
+
+verify_running_deployment() {
+  local expected_image="$1"
+  local expected_port="$2"
+  local deadline=$((SECONDS + DEPLOYMENT_HEALTH_TIMEOUT_SECONDS))
+  local compose_id container_id state health configured_image expected_image_id container_image service pid
+  while (( SECONDS < deadline )); do
+    compose_id=$(docker compose -f "$COMPOSE_DIR/docker-compose.yaml" ps -q tachyon-core 2>/dev/null || true)
+    if [[ "$compose_id" =~ ^[0-9a-f]{12,64}$ ]]; then
+      container_id=$(docker inspect --format '{{.Id}}' "$compose_id" 2>/dev/null || true)
+      state=$(docker inspect --format '{{.State.Status}}' "$compose_id" 2>/dev/null || true)
+      health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$compose_id" 2>/dev/null || true)
+      configured_image=$(docker inspect --format '{{.Config.Image}}' "$compose_id" 2>/dev/null || true)
+      container_image=$(docker inspect --format '{{.Image}}' "$compose_id" 2>/dev/null || true)
+      service=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$compose_id" 2>/dev/null || true)
+      pid=$(docker inspect --format '{{.State.Pid}}' "$compose_id" 2>/dev/null || true)
+      expected_image_id=$(docker image inspect --format '{{.Id}}' "$expected_image" 2>/dev/null || true)
+      if [[ "$container_id" =~ ^[0-9a-f]{64}$ && "$state" == "running" && "$health" == "healthy" && \
+            "$configured_image" == "$expected_image" && "$container_image" == "$expected_image_id" && \
+            "$service" == "tachyon-core" ]] && container_owns_udp_listener "$pid" "$expected_port"; then
+        success "Verified healthy Tachyon container $container_id, image $expected_image, and owned UDP/$expected_port listener."
+        return 0
+      fi
+      [[ "$state" != "exited" && "$state" != "dead" ]] \
+        || { warn "Tachyon container entered terminal state $state before becoming healthy."; return 1; }
+    fi
+    sleep 1
+  done
+  warn "Timed out waiting for the expected healthy container and owned UDP/$expected_port listener."
+  return 1
+}
+
+write_transaction_field() {
+  local name="$1"
+  local value="$2"
+  [[ "$name" =~ ^[a-z_]+$ && "$value" != *$'\n'* ]] || return 1
+  local temporary="$TRANSACTION_DIR/.$name.new.$$"
+  printf '%s\n' "$value" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$TRANSACTION_DIR/$name"
+  sync -f "$TRANSACTION_DIR" 2>/dev/null || sync
+}
+
+read_transaction_field() {
+  local name="$1"
+  local path="$TRANSACTION_DIR/$name"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  local value
+  IFS= read -r value < "$path"
+  printf '%s\n' "$value"
+}
+
+validate_transaction_journal() {
+  [[ -d "$TRANSACTION_DIR" && ! -L "$TRANSACTION_DIR" ]] \
+    || die "Pending Docker transaction journal is not a private directory: $TRANSACTION_DIR"
+  [[ $(stat -c '%u:%a' "$TRANSACTION_DIR") == "$EUID:700" ]] \
+    || die "Pending Docker transaction journal has unsafe ownership or permissions"
+  local state enabled deployment_present unit_present phase
+  state=$(read_transaction_field previous_state) || die "Transaction journal has no previous_state"
+  enabled=$(read_transaction_field previous_enabled) || die "Transaction journal has no previous_enabled"
+  deployment_present=$(read_transaction_field deployment_present) || die "Transaction journal has no deployment_present"
+  unit_present=$(read_transaction_field unit_present) || die "Transaction journal has no unit_present"
+  phase=$(read_transaction_field phase) || die "Transaction journal has no phase"
+  [[ "$state" =~ ^(absent|active|inactive)$ ]] || die "Transaction journal previous_state is invalid"
+  [[ "$enabled" =~ ^(enabled|disabled)$ ]] || die "Transaction journal previous_enabled is invalid"
+  [[ "$deployment_present" =~ ^(true|false)$ ]] || die "Transaction journal deployment_present is invalid"
+  [[ "$unit_present" =~ ^(true|false)$ ]] || die "Transaction journal unit_present is invalid"
+  [[ "$phase" =~ ^(prepared|switching|old-backed-up|deployment-active|unit-active|committed)$ ]] \
+    || die "Transaction journal phase is invalid"
+}
+
+initialize_transaction_journal() {
+  local previous_state="$1"
+  local previous_enabled="$2"
+  [[ ! -e "$TRANSACTION_DIR" && ! -L "$TRANSACTION_DIR" ]] \
+    || die "A Docker deployment transaction is already pending"
+  local preparing="$TRANSACTION_DIR.preparing.$$"
+  rm -rf -- "$preparing"
+  install -d -m 0700 "$preparing" "$preparing/backup"
+  printf '%s\n' "$previous_state" > "$preparing/previous_state"
+  printf '%s\n' "$previous_enabled" > "$preparing/previous_enabled"
+  if [[ -d "$COMPOSE_DIR" ]]; then printf 'true\n' > "$preparing/deployment_present"; else printf 'false\n' > "$preparing/deployment_present"; fi
+  if [[ -f "$SYSTEMD_UNIT" ]]; then
+    printf 'true\n' > "$preparing/unit_present"
+    cp -a "$SYSTEMD_UNIT" "$preparing/backup/tachyon-docker.service"
+  else
+    printf 'false\n' > "$preparing/unit_present"
+  fi
+  printf 'prepared\n' > "$preparing/phase"
+  chmod 0600 "$preparing/previous_state" "$preparing/previous_enabled" \
+    "$preparing/deployment_present" "$preparing/unit_present" "$preparing/phase"
+  sync -f "$preparing" 2>/dev/null || sync
+  mv "$preparing" "$TRANSACTION_DIR"
+  sync -f "$(dirname "$TRANSACTION_DIR")" 2>/dev/null || sync
+}
+
 restore_service_state() {
   local state="$1"
   local enabled="$2"
-  [[ "$state" != "absent" ]] || return 0
+  if [[ "$state" == "absent" ]]; then
+    systemctl disable tachyon-docker >/dev/null 2>&1 || true
+    return 0
+  fi
   if [[ "$enabled" == "enabled" ]]; then
     systemctl enable tachyon-docker >/dev/null 2>&1
   else
@@ -800,92 +948,160 @@ restore_service_state() {
   fi
 }
 
-rollback_deployment() {
-  local backup_dir="$1"
-  local previous_state="$2"
-  local previous_enabled="$3"
-  local staged_deployment="$4"
+rollback_pending_transaction() {
+  validate_transaction_journal
+  local backup_dir="$TRANSACTION_DIR/backup"
+  local previous_state previous_enabled deployment_present unit_present phase
+  previous_state=$(read_transaction_field previous_state)
+  previous_enabled=$(read_transaction_field previous_enabled)
+  deployment_present=$(read_transaction_field deployment_present)
+  unit_present=$(read_transaction_field unit_present)
+  phase=$(read_transaction_field phase)
   local rollback_failed=false
   warn "Deployment switch failed; restoring the previous deployment."
   if ! systemctl stop tachyon-docker >/dev/null 2>&1 && [[ "$previous_state" != "absent" ]]; then
     rollback_failed=true
   fi
-  if [[ -d "$backup_dir/deployment" && ! -d "$backup_dir/deployment/logs" ]]; then
+  if [[ "$previous_state" == "absent" ]]; then
+    systemctl disable tachyon-docker >/dev/null 2>&1 || true
+  fi
+  if [[ "$deployment_present" == "true" && -d "$backup_dir/deployment" && ! -d "$backup_dir/deployment/logs" ]]; then
     if [[ -d "$COMPOSE_DIR/logs" ]]; then
       mv "$COMPOSE_DIR/logs" "$backup_dir/deployment/logs" || rollback_failed=true
-    elif [[ -d "$staged_deployment/logs" ]]; then
-      mv "$staged_deployment/logs" "$backup_dir/deployment/logs" || rollback_failed=true
     fi
   fi
-  rm -rf "$COMPOSE_DIR"
-  [[ ! -d "$backup_dir/deployment" ]] || mv "$backup_dir/deployment" "$COMPOSE_DIR" || rollback_failed=true
-  if [[ -f "$backup_dir/tachyon-docker.service" ]]; then
+  if [[ "$deployment_present" == "true" ]]; then
+    if [[ -d "$backup_dir/deployment" ]]; then
+      rm -rf "$COMPOSE_DIR"
+      mv "$backup_dir/deployment" "$COMPOSE_DIR" || rollback_failed=true
+    elif [[ ! -d "$COMPOSE_DIR" ]]; then
+      rollback_failed=true
+    fi
+  else
+    rm -rf "$COMPOSE_DIR"
+  fi
+  if [[ "$unit_present" == "true" && -f "$backup_dir/tachyon-docker.service" ]]; then
     install -m 0644 "$backup_dir/tachyon-docker.service" "$SYSTEMD_UNIT.rollback" || rollback_failed=true
     mv -f "$SYSTEMD_UNIT.rollback" "$SYSTEMD_UNIT" || rollback_failed=true
+  elif [[ "$unit_present" == "true" ]]; then
+    rollback_failed=true
   else
     rm -f "$SYSTEMD_UNIT"
   fi
+  rm -f "$SYSTEMD_UNIT.new" "$SYSTEMD_UNIT.rollback"
   systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
   restore_service_state "$previous_state" "$previous_enabled" || rollback_failed=true
-  [[ "$rollback_failed" == "false" ]] \
-    || die "Rollback was incomplete; inspect $COMPOSE_DIR and $SYSTEMD_UNIT before retrying"
+  if [[ "$rollback_failed" == "false" ]]; then
+    rm -rf -- "$TRANSACTION_DIR"
+    sync -f "$(dirname "$TRANSACTION_DIR")" 2>/dev/null || sync
+    ACTIVE_TRANSACTION=false
+    success "Previous Docker deployment restored from transaction phase $phase."
+    return 0
+  fi
+  warn "Rollback was incomplete; the persistent journal remains at $TRANSACTION_DIR."
+  return 1
+}
+
+recover_pending_transaction() {
+  [[ -e "$TRANSACTION_DIR" || -L "$TRANSACTION_DIR" ]] || return 0
+  validate_transaction_journal
+  local phase
+  phase=$(read_transaction_field phase)
+  if [[ "$phase" == "committed" ]]; then
+    rm -rf -- "$TRANSACTION_DIR"
+    success "Removed a completed Docker transaction journal left by an interrupted cleanup."
+    return 0
+  fi
+  warn "Recovering interrupted Docker deployment transaction at phase $phase."
+  rollback_pending_transaction \
+    || die "Automatic Docker transaction recovery failed; refusing a new deployment"
+}
+
+on_installer_exit() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$ACTIVE_TRANSACTION" == "true" && -d "$TRANSACTION_DIR" ]]; then
+    rollback_pending_transaction || status=1
+  fi
+  cleanup_install_work
+  exit "$status"
+}
+
+on_installer_signal() {
+  local name="$1"
+  local status="$2"
+  warn "Received $name during Docker deployment; rolling back before exit."
+  exit "$status"
 }
 
 commit_deployment() {
   local staged_deployment="$1"
   local staged_unit="$2"
-  local work_root="$3"
-  local backup_dir="$work_root/backup"
+  local expected_image="$3"
+  local expected_port="$4"
   local previous_state="absent"
   local previous_enabled="disabled"
-  install -d -m 0700 "$backup_dir"
   if [[ -f "$SYSTEMD_UNIT" || -d "$COMPOSE_DIR" ]]; then
     systemctl is-active --quiet tachyon-docker && previous_state="active" || previous_state="inactive"
     systemctl is-enabled --quiet tachyon-docker && previous_enabled="enabled" || previous_enabled="disabled"
   fi
+  initialize_transaction_journal "$previous_state" "$previous_enabled"
+  ACTIVE_TRANSACTION=true
+  write_transaction_field phase switching
 
   if [[ "$previous_state" == "active" ]] && ! systemctl stop tachyon-docker; then
     die "Unable to stop the existing Tachyon Docker service; deployment was not changed"
   fi
-  [[ ! -d "$COMPOSE_DIR" ]] || mv "$COMPOSE_DIR" "$backup_dir/deployment"
-  if [[ -f "$SYSTEMD_UNIT" ]]; then
-    cp -a "$SYSTEMD_UNIT" "$backup_dir/tachyon-docker.service"
-  fi
-  if [[ -d "$backup_dir/deployment/logs" ]]; then
-    rm -rf "$staged_deployment/logs"
-    mv "$backup_dir/deployment/logs" "$staged_deployment/logs"
-  fi
+  [[ ! -d "$COMPOSE_DIR" ]] || mv "$COMPOSE_DIR" "$TRANSACTION_DIR/backup/deployment"
+  write_transaction_field phase old-backed-up
 
-  if ! mv "$staged_deployment" "$COMPOSE_DIR"; then
-    rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
-    die "Unable to atomically activate the staged deployment"
+  mv "$staged_deployment" "$COMPOSE_DIR" \
+    || die "Unable to atomically activate the staged deployment"
+  write_transaction_field phase deployment-active
+  if [[ -d "$TRANSACTION_DIR/backup/deployment/logs" ]]; then
+    rm -rf "$staged_deployment/logs"
+    rm -rf "$COMPOSE_DIR/logs"
+    mv "$TRANSACTION_DIR/backup/deployment/logs" "$COMPOSE_DIR/logs"
   fi
-  if ! install -m 0644 "$staged_unit" "$SYSTEMD_UNIT.new" || ! mv -f "$SYSTEMD_UNIT.new" "$SYSTEMD_UNIT" || ! systemctl daemon-reload; then
-    rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
-    die "Unable to activate the staged systemd unit"
-  fi
+  install -m 0644 "$staged_unit" "$SYSTEMD_UNIT.new" \
+    && mv -f "$SYSTEMD_UNIT.new" "$SYSTEMD_UNIT" \
+    && systemctl daemon-reload \
+    || die "Unable to activate the staged systemd unit"
+  write_transaction_field phase unit-active
+
+  systemctl start tachyon-docker \
+    || die "New Docker service failed to start"
+  systemctl is-active --quiet tachyon-docker \
+    || die "New Docker service did not remain active"
+  verify_running_deployment "$expected_image" "$expected_port" \
+    || die "New Docker deployment failed its container identity, health, or UDP listener gate"
 
   if [[ "$previous_state" == "inactive" ]]; then
-    if ! restore_service_state "inactive" "$previous_enabled"; then
-      rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
-      die "Unable to preserve the inactive service state; previous deployment restored"
-    fi
-    success "Deployment updated; the previously inactive service remains inactive."
-  else
-    local activation_failed=false
-    if [[ "$previous_state" == "active" && "$previous_enabled" == "disabled" ]]; then
-      systemctl disable tachyon-docker >/dev/null 2>&1 || activation_failed=true
-      systemctl start tachyon-docker || activation_failed=true
-    else
-      systemctl enable --now tachyon-docker || activation_failed=true
-    fi
-    systemctl is-active --quiet tachyon-docker || activation_failed=true
-    if [[ "$activation_failed" == "true" ]]; then
-      rollback_deployment "$backup_dir" "$previous_state" "$previous_enabled" "$staged_deployment"
-      die "New deployment failed to start; previous deployment restored"
-    fi
-    success "Docker service started on UDP/$PORT."
+    systemctl stop tachyon-docker || die "Unable to restore the previous inactive service state"
   fi
+  if [[ "$previous_enabled" == "enabled" || "$previous_state" == "absent" ]]; then
+    systemctl enable tachyon-docker >/dev/null \
+      || die "Unable to enable the verified Tachyon Docker service"
+  else
+    systemctl disable tachyon-docker >/dev/null \
+      || die "Unable to preserve the previous disabled service state"
+  fi
+  if [[ "$previous_state" == "inactive" ]]; then
+    systemctl is-active --quiet tachyon-docker \
+      && die "Tachyon Docker service should have returned to inactive state"
+    success "Verified deployment updated; the previously inactive service remains inactive."
+  else
+    systemctl is-active --quiet tachyon-docker \
+      || die "Verified Tachyon Docker service is unexpectedly inactive"
+    success "Verified Docker service started on UDP/$expected_port."
+  fi
+
+  sync -f "$COMPOSE_DIR" 2>/dev/null || sync
+  sync -f "$(dirname "$SYSTEMD_UNIT")" 2>/dev/null || sync
+  write_transaction_field phase committed
+  ACTIVE_TRANSACTION=false
+  rm -rf -- "$TRANSACTION_DIR"
+  sync -f "$(dirname "$TRANSACTION_DIR")" 2>/dev/null || sync
 }
 
 uninstall() {
@@ -901,13 +1117,20 @@ main() {
   parse_args "$@"
   validate_listen_port "$PORT"
   check_root
+  trap on_installer_exit EXIT
+  trap 'on_installer_signal INT 130' INT
+  trap 'on_installer_signal TERM 143' TERM
+  trap 'on_installer_signal HUP 129' HUP
+  reject_docker_client_overrides
+  [[ ! -L "$COMPOSE_DIR" ]] || die "Refusing symlinked deployment directory"
+  [[ ! -L "$SYSTEMD_UNIT" ]] || die "Refusing symlinked systemd unit"
+  recover_pending_transaction
   if [[ "$UNINSTALL" == "true" ]]; then
+    verify_local_docker_daemon
     uninstall
     exit 0
   fi
   validate_repository_policy
-  [[ ! -L "$COMPOSE_DIR" ]] || die "Refusing symlinked deployment directory"
-  [[ ! -L "$SYSTEMD_UNIT" ]] || die "Refusing symlinked systemd unit"
   if [[ -e "$COMPOSE_DIR/logs" ]]; then
     [[ -d "$COMPOSE_DIR/logs" && ! -L "$COMPOSE_DIR/logs" ]] \
       || die "Existing logs path is not a regular directory"
@@ -921,7 +1144,6 @@ main() {
   work_root=$(mktemp -d "$(dirname "$COMPOSE_DIR")/.tachyon-install.XXXXXX")
   chmod 0700 "$work_root"
   INSTALL_WORK_ROOT="$work_root"
-  trap cleanup_install_work EXIT
   staged_deployment="$work_root/deployment"
   evidence_dir="$work_root/release-evidence"
   context_dir="$work_root/build-context"
@@ -935,7 +1157,7 @@ main() {
   write_compose "$staged_deployment" "$image"
   write_systemd_unit "$staged_unit"
   build_and_validate_staged_deployment "$staged_deployment" "$context_dir" "$image"
-  commit_deployment "$staged_deployment" "$staged_unit" "$work_root"
+  commit_deployment "$staged_deployment" "$staged_unit" "$image" "$PORT"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

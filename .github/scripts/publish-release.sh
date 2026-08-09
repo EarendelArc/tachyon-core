@@ -17,11 +17,13 @@ commit=$2
 prerelease=$3
 release_dir=$4
 repository=${GITHUB_REPOSITORY:-}
+settings_token=${RELEASE_SETTINGS_TOKEN:-}
 
 [[ "${version}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || die "invalid release tag"
 [[ "${commit}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] || die "commit must be a full Git object ID"
 [[ "${prerelease}" == "true" ]] || die "only prerelease publication is supported; prerelease must be true"
 [[ "${repository}" == */* ]] || die "GITHUB_REPOSITORY must identify owner/repository"
+[[ -n "${settings_token}" ]] || die "RELEASE_SETTINGS_TOKEN with repository Administration read permission is required"
 [[ -f "${release_dir}/RELEASE_NOTES.md" ]] || die "English release notes are missing"
 [[ -f "${release_dir}/RELEASE_NOTES.zh-CN.md" ]] || die "Simplified Chinese release notes are missing"
 [[ -f "${release_dir}/SHA256SUMS.txt" ]] || die "checksum file is missing"
@@ -91,6 +93,19 @@ done
   cd "${release_dir}"
   sha256sum --check --strict SHA256SUMS.txt
 ) || die "release asset checksum verification failed"
+
+# GitHub makes assets immutable only after a draft is published. Prove the
+# repository setting first so a mutable public release can never be created.
+set +e
+immutable_output=$(GH_TOKEN="${settings_token}" gh api \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/${repository}/immutable-releases" \
+  --jq '.enabled' 2>&1)
+immutable_status=$?
+set -e
+[[ ${immutable_status} -eq 0 && "${immutable_output}" == "true" ]] \
+  || die "repository immutable releases are not provably enabled: ${immutable_output}"
 
 body_file=$(mktemp)
 {

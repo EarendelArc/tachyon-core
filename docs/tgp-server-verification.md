@@ -68,7 +68,11 @@ sudo bash scripts/install-server-docker.sh --version v0.1.0-alpha.17 --port 443 
 The Docker installer uses Docker's signed Debian/Ubuntu apt repository, exact
 package versions selected within the committed major policy, and the
 digest-pinned Debian base image in `deploy/docker/runtime-contract.json`. It
-does not use Docker's convenience shell installer.
+does not use Docker's convenience shell installer. It refuses remote Docker
+contexts and daemon overrides. Its persistent transaction journal rolls back
+`INT`/`TERM`/`HUP` immediately and is recovered on the next run after `SIGKILL`
+or reboot. Activation is accepted only after the exact image and Compose service
+are healthy and the container's Core process owns the configured UDP listener.
 
 Use the narrowest UDP destination and port list you can. For public E2E
 validation, prefer a UDP echo service you control and include that echo target

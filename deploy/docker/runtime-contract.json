@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "base_image": {
     "repository": "debian",
     "tag": "bookworm-slim",
@@ -39,6 +39,22 @@
     "files": [".dockerignore", "Dockerfile", "bin/tachyon-core"],
     "deny_secrets_and_runtime_state": true
   },
+  "daemon": {
+    "context": "default",
+    "endpoint": "unix:///var/run/docker.sock",
+    "remote_overrides_forbidden": true
+  },
+  "transaction": {
+    "journal": "/opt/.tachyon-docker.transaction",
+    "signals": ["INT", "TERM", "HUP"],
+    "recover_on_next_run": true
+  },
+  "activation_gates": [
+    "compose-container-identity",
+    "exact-image-id",
+    "healthy",
+    "core-owned-udp-listener"
+  ],
   "container": {
     "uid": 65532,
     "gid": 65532,

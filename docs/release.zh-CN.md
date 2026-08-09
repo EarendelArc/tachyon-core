@@ -59,6 +59,11 @@ sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 `prerelease=true`，不提供手动正式发布输入；publisher 会在首次调用 GitHub API 前拒绝
 任何其他值。
 
+仓库 secret `RELEASE_SETTINGS_TOKEN` 必须使用具备仓库 Administration 只读权限的
+fine-grained token。publisher 在创建 draft 前使用 GitHub REST API `2026-03-10` 明确验证
+仓库已经启用 immutable releases；secret 缺失、设置未启用、权限不足或响应无法确定时，
+都会在任何 release 写操作之前失败。
+
 发布前必须满足：tag 已验证、Linux/Windows CI 全绿、六个 ZIP、双语 notes、全部 manifest
 和严格 SHA-256 校验均通过。workflow 只创建一个 draft，只上传一次完整资产集，然后
 发布该 draft。最后调用 `verify-published-release.sh`，检查：

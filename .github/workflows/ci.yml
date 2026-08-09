@@ -36,10 +36,19 @@ jobs:
           bash scripts/verify-server.sh --self-test
 
       - name: Verify Docker installation policy
+        timeout-minutes: 2
         shell: bash
         run: |
           bash -n scripts/install-server-docker.sh
-          bash scripts/test-docker-install-policy.sh
+          bash -n scripts/test-docker-installer-lifecycle.sh
+          timeout --signal=TERM --kill-after=10s 90s bash scripts/test-docker-install-policy.sh
+
+      - name: Verify Docker installer process lifecycle
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          test "$(uname -s)" = Linux
+          timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh
 
       - name: Verify opt-in TGP E2E script
         shell: bash

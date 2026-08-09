@@ -61,6 +61,15 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Verify Docker installer process lifecycle
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          test "$(uname -s)" = Linux
+          bash -n scripts/install-server-docker.sh
+          bash -n scripts/test-docker-installer-lifecycle.sh
+          timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh
+
   test-windows:
     name: Test and route integration (Windows)
     needs: verify_tag

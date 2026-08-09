@@ -145,7 +145,8 @@ Docker 升级会先在 staging 中完成下载、构建和配置验证，再切�
 `HUP` 时立即回滚；遭遇 `SIGKILL` 或主机重启后，下次运行安装器会先自动恢复。只有本地
 system Docker daemon、预期 Compose 容器、精确镜像、healthy 状态以及由 Core 进程持有的
 UDP 监听全部通过，事务才会提交。远程 Docker context 和 daemon 环境覆盖会被拒绝。
-幂等重跑会保留有效私有配置中的原
+安装、恢复和卸载的完整生命周期由 `/run/tachyon/docker-installer.lock` 上的非阻塞内核
+`flock` 串行化；锁文件内 PID 只用于诊断，不能替代锁 FD。幂等重跑会保留有效私有配置中的原
 PSK。轮换必须同时设置 `TACHYON_ROTATE_PSK=1` 和传入
 `--confirm-psk-rotation`。自定义 GitHub 仓库只在 `TACHYON_DEV_MODE=1` 下允许，并会明确
 标记为不可信开发输入。

@@ -380,7 +380,7 @@ dockerignore = dockerignore_path.read_text(encoding="utf-8")
 installer = installer_path.read_text(encoding="utf-8")
 published_validator = validator_path.read_text(encoding="utf-8")
 
-if contract["schema_version"] != 2:
+if contract["schema_version"] != 3:
     raise SystemExit("Docker runtime contract schema version changed")
 
 digest = contract["base_image"]["manifest_digest"]
@@ -421,6 +421,9 @@ if contract["daemon"] != {
     raise SystemExit("local Docker daemon contract changed")
 if contract["transaction"] != {
     "journal": "/opt/.tachyon-docker.transaction",
+    "lock": "/run/tachyon/docker-installer.lock",
+    "lock_mechanism": "nonblocking-flock-process-lifetime",
+    "owner_pid_is_diagnostic_only": True,
     "signals": ["INT", "TERM", "HUP"],
     "recover_on_next_run": True,
 }:
@@ -458,6 +461,8 @@ for field in ("tag_name", "prerelease", "immutable", "target_commitish", "digest
         raise SystemExit(f"post-release validator contract omits {field}")
 for required in (
     ".tachyon-docker.transaction",
+    "flock -n",
+    "owner_pid=",
     "on_installer_signal INT 130",
     "on_installer_signal TERM 143",
     "on_installer_signal HUP 129",

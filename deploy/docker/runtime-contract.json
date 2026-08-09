@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "base_image": {
     "repository": "debian",
     "tag": "bookworm-slim",
@@ -46,6 +46,9 @@
   },
   "transaction": {
     "journal": "/opt/.tachyon-docker.transaction",
+    "lock": "/run/tachyon/docker-installer.lock",
+    "lock_mechanism": "nonblocking-flock-process-lifetime",
+    "owner_pid_is_diagnostic_only": true,
     "signals": ["INT", "TERM", "HUP"],
     "recover_on_next_run": true
   },

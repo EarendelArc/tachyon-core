@@ -221,7 +221,9 @@ while a later installer run rolls back any transaction interrupted by `SIGKILL`
 or host restart. A deployment commits only after the local system Docker daemon,
 exact Compose container and image, healthy state, and Core-owned UDP listener all
 match the staged contract. Remote Docker contexts and daemon environment overrides
-are rejected. Reruns preserve a valid private existing PSK. Rotation
+are rejected. A nonblocking kernel `flock` on `/run/tachyon/docker-installer.lock`
+serializes installation, recovery, and uninstall for the process lifetime; the
+PID stored in that file is diagnostic only. Reruns preserve a valid private existing PSK. Rotation
 requires both `TACHYON_ROTATE_PSK=1` and `--confirm-psk-rotation`; custom GitHub
 repositories are accepted only with `TACHYON_DEV_MODE=1` and are prominently
 reported as untrusted development input.

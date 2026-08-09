@@ -44,6 +44,13 @@ TRANSACTION_DIR="$(dirname "$COMPOSE_DIR")/.tachyon-docker.transaction"
 ACTIVE_TRANSACTION=false
 PROC_ROOT="/proc"
 DEPLOYMENT_HEALTH_TIMEOUT_SECONDS=120
+LOCK_DIR="/run/tachyon"
+LOCK_FILE="$LOCK_DIR/docker-installer.lock"
+LOCK_FD=""
+POLICY_TEST_MODE="${TACHYON_INSTALLER_POLICY_TEST:-0}"
+POLICY_TEST_ROOT="${TACHYON_INSTALLER_TEST_ROOT:-}"
+POLICY_TEST_ACTION=""
+POLICY_TEST_PAUSE_AT="${TACHYON_INSTALLER_TEST_PAUSE_AT:-}"
 
 usage() {
   cat <<'USAGE'
@@ -104,6 +111,11 @@ parse_args() {
         ;;
       --uninstall) UNINSTALL=true; shift ;;
       --confirm-psk-rotation) CONFIRM_PSK_ROTATION=true; shift ;;
+      --policy-test-action)
+        require_option_value "$@"
+        POLICY_TEST_ACTION="$2"
+        shift 2
+        ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
@@ -112,6 +124,75 @@ parse_args() {
 
 check_root() {
   [[ $EUID -eq 0 ]] || die "Run as root."
+}
+
+configure_policy_test_mode() {
+  case "$POLICY_TEST_MODE" in
+    0)
+      [[ -z "$POLICY_TEST_ACTION" ]] || die "policy test action requires TACHYON_INSTALLER_POLICY_TEST=1"
+      return 0
+      ;;
+    1) ;;
+    *) die "TACHYON_INSTALLER_POLICY_TEST must be 0 or 1" ;;
+  esac
+  [[ "$(uname -s)" == "Linux" ]] || die "installer policy mode requires Linux"
+  [[ "$POLICY_TEST_ROOT" == /tmp/tachyon-docker-installer-policy.* ]] \
+    || die "policy test root must be an isolated /tmp/tachyon-docker-installer-policy.* directory"
+  [[ -d "$POLICY_TEST_ROOT" && ! -L "$POLICY_TEST_ROOT" ]] \
+    || die "policy test root must be a real directory"
+  POLICY_TEST_ROOT=$(realpath -e "$POLICY_TEST_ROOT")
+  [[ "$POLICY_TEST_ROOT" == /tmp/tachyon-docker-installer-policy.* ]] \
+    || die "resolved policy test root escaped its allowed prefix"
+  [[ $(stat -c '%u:%a' "$POLICY_TEST_ROOT") == "$EUID:700" ]] \
+    || die "policy test root has unsafe ownership or permissions"
+  [[ "$POLICY_TEST_ACTION" =~ ^(install|recover|uninstall|hold)$ ]] \
+    || die "policy test action must be install, recover, uninstall, or hold"
+  COMPOSE_DIR="$POLICY_TEST_ROOT/live"
+  SYSTEMD_UNIT="$POLICY_TEST_ROOT/systemd/tachyon-docker.service"
+  TRANSACTION_DIR="$POLICY_TEST_ROOT/.tachyon-docker.transaction"
+  LOCK_DIR="$POLICY_TEST_ROOT/lock"
+  LOCK_FILE="$LOCK_DIR/docker-installer.lock"
+  PROC_ROOT="$POLICY_TEST_ROOT/proc"
+  DEPLOYMENT_HEALTH_TIMEOUT_SECONDS=5
+}
+
+acquire_installer_lock() {
+  command -v flock >/dev/null 2>&1 || die "flock is required for Docker installer serialization"
+  if [[ ! -e "$LOCK_DIR" ]]; then
+    install -d -m 0700 "$LOCK_DIR"
+  fi
+  [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] \
+    || die "Docker installer lock directory is not a real directory"
+  [[ $(stat -c '%u:%a' "$LOCK_DIR") == "$EUID:700" ]] \
+    || die "Docker installer lock directory has unsafe ownership or permissions"
+  if [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+    (umask 077; set -o noclobber; : > "$LOCK_FILE") 2>/dev/null || true
+  fi
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] \
+    || die "Docker installer lock path is not a regular file"
+  [[ $(stat -c '%u:%a' "$LOCK_FILE") == "$EUID:600" ]] \
+    || die "Docker installer lock file has unsafe ownership or permissions"
+  exec {LOCK_FD}<>"$LOCK_FILE"
+  if ! flock -n "$LOCK_FD"; then
+    local diagnostic="unknown"
+    IFS= read -r diagnostic < "$LOCK_FILE" || true
+    die "another Docker installer owns the lifecycle lock (${diagnostic:-unknown})"
+  fi
+  : > "$LOCK_FILE"
+  printf 'owner_pid=%s\n' "$$" >&"$LOCK_FD"
+}
+
+policy_test_checkpoint() {
+  local name="$1"
+  [[ "$POLICY_TEST_MODE" == "1" ]] || return 0
+  [[ "$name" =~ ^[a-z-]+$ ]] || die "invalid policy test checkpoint"
+  install -d -m 0700 "$POLICY_TEST_ROOT/events" "$POLICY_TEST_ROOT/control"
+  : > "$POLICY_TEST_ROOT/events/$name.$$"
+  if [[ "$POLICY_TEST_PAUSE_AT" == "$name" ]]; then
+    while [[ ! -e "$POLICY_TEST_ROOT/control/continue.$$" ]]; do
+      sleep 0.05
+    done
+  fi
 }
 
 validate_listen_port() {
@@ -1047,6 +1128,7 @@ commit_deployment() {
   fi
   initialize_transaction_journal "$previous_state" "$previous_enabled"
   ACTIVE_TRANSACTION=true
+  policy_test_checkpoint transaction-prepared
   write_transaction_field phase switching
 
   if [[ "$previous_state" == "active" ]] && ! systemctl stop tachyon-docker; then
@@ -1054,10 +1136,12 @@ commit_deployment() {
   fi
   [[ ! -d "$COMPOSE_DIR" ]] || mv "$COMPOSE_DIR" "$TRANSACTION_DIR/backup/deployment"
   write_transaction_field phase old-backed-up
+  policy_test_checkpoint old-backed-up
 
   mv "$staged_deployment" "$COMPOSE_DIR" \
     || die "Unable to atomically activate the staged deployment"
   write_transaction_field phase deployment-active
+  policy_test_checkpoint deployment-active
   if [[ -d "$TRANSACTION_DIR/backup/deployment/logs" ]]; then
     rm -rf "$staged_deployment/logs"
     rm -rf "$COMPOSE_DIR/logs"
@@ -1068,6 +1152,7 @@ commit_deployment() {
     && systemctl daemon-reload \
     || die "Unable to activate the staged systemd unit"
   write_transaction_field phase unit-active
+  policy_test_checkpoint unit-active
 
   systemctl start tachyon-docker \
     || die "New Docker service failed to start"
@@ -1075,6 +1160,7 @@ commit_deployment() {
     || die "New Docker service did not remain active"
   verify_running_deployment "$expected_image" "$expected_port" \
     || die "New Docker deployment failed its container identity, health, or UDP listener gate"
+  policy_test_checkpoint health-verified
 
   if [[ "$previous_state" == "inactive" ]]; then
     systemctl stop tachyon-docker || die "Unable to restore the previous inactive service state"
@@ -1099,6 +1185,7 @@ commit_deployment() {
   sync -f "$COMPOSE_DIR" 2>/dev/null || sync
   sync -f "$(dirname "$SYSTEMD_UNIT")" 2>/dev/null || sync
   write_transaction_field phase committed
+  policy_test_checkpoint committed
   ACTIVE_TRANSACTION=false
   rm -rf -- "$TRANSACTION_DIR"
   sync -f "$(dirname "$TRANSACTION_DIR")" 2>/dev/null || sync
@@ -1113,10 +1200,33 @@ uninstall() {
   success "Docker deployment removed."
 }
 
+run_policy_test_action() {
+  case "$POLICY_TEST_ACTION" in
+    install)
+      local staged_deployment="$POLICY_TEST_ROOT/staged"
+      local staged_unit="$POLICY_TEST_ROOT/staged-unit"
+      [[ -d "$staged_deployment" && ! -L "$staged_deployment" ]] \
+        || die "policy test staged deployment is unavailable"
+      [[ -f "$staged_unit" && ! -L "$staged_unit" ]] \
+        || die "policy test staged unit is unavailable"
+      commit_deployment "$staged_deployment" "$staged_unit" \
+        'tachyon-core-local:0123456789ab' "$PORT"
+      ;;
+    recover|hold)
+      policy_test_checkpoint "$POLICY_TEST_ACTION"
+      ;;
+    uninstall)
+      uninstall
+      ;;
+    *) die "unsupported policy test action" ;;
+  esac
+}
+
 main() {
   parse_args "$@"
+  configure_policy_test_mode
   validate_listen_port "$PORT"
-  check_root
+  [[ "$POLICY_TEST_MODE" == "1" ]] || check_root
   trap on_installer_exit EXIT
   trap 'on_installer_signal INT 130' INT
   trap 'on_installer_signal TERM 143' TERM
@@ -1124,7 +1234,14 @@ main() {
   reject_docker_client_overrides
   [[ ! -L "$COMPOSE_DIR" ]] || die "Refusing symlinked deployment directory"
   [[ ! -L "$SYSTEMD_UNIT" ]] || die "Refusing symlinked systemd unit"
+  acquire_installer_lock
+  policy_test_checkpoint lock-acquired
   recover_pending_transaction
+  policy_test_checkpoint recovery-complete
+  if [[ "$POLICY_TEST_MODE" == "1" ]]; then
+    run_policy_test_action
+    exit 0
+  fi
   if [[ "$UNINSTALL" == "true" ]]; then
     verify_local_docker_daemon
     uninstall

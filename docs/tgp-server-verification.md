@@ -71,7 +71,8 @@ digest-pinned Debian base image in `deploy/docker/runtime-contract.json`. It
 does not use Docker's convenience shell installer. It refuses remote Docker
 contexts and daemon overrides. Its persistent transaction journal rolls back
 `INT`/`TERM`/`HUP` immediately and is recovered on the next run after `SIGKILL`
-or reboot. Activation is accepted only after the exact image and Compose service
+or reboot. A process-lifetime, nonblocking `flock` serializes install, recovery,
+and uninstall; the recorded owner PID is diagnostic only. Activation is accepted only after the exact image and Compose service
 are healthy and the container's Core process owns the configured UDP listener.
 
 Use the narrowest UDP destination and port list you can. For public E2E

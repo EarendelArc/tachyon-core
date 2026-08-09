@@ -63,7 +63,8 @@ major 策略内选择并固定精确 package version，同时使用
 `deploy/docker/runtime-contract.json` 中固定 digest 的 Debian base image。脚本不会
 调用 Docker convenience shell installer，也会拒绝远程 Docker context 和 daemon
 环境覆盖。持久事务 journal 会在 `INT`/`TERM`/`HUP` 时立即回滚；若遭遇 `SIGKILL` 或
-重启，则在下次运行时先恢复。只有精确镜像与 Compose service 达到 healthy，且容器内
+重启，则在下次运行时先恢复。安装、恢复和卸载由进程生命周期内持有的非阻塞 `flock`
+串行化，记录的 PID 只用于诊断。只有精确镜像与 Compose service 达到 healthy，且容器内
 Core 进程确实持有配置的 UDP 监听，激活才会提交。
 
 请尽量使用最窄的 UDP 目标和端口列表。公网 E2E 验证优先使用你自己控制的 UDP echo

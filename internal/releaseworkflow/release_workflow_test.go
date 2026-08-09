@@ -401,3 +401,34 @@ func TestCurrentReleasePipelineIsPrereleaseOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestDockerInstallerLifecycleFixturesAreMandatory(t *testing.T) {
+	fixture := readRepoFile(t, "scripts", "test-docker-installer-lifecycle.sh")
+	for _, required := range []string{
+		`[[ "$(uname -s)" == "Linux" ]] || fail`,
+		"setsid env",
+		"kill -s",
+		"kill -KILL",
+		"another Docker installer owns the lifecycle lock",
+		"SIGKILL did not leave a recovery journal",
+	} {
+		if !strings.Contains(fixture, required) {
+			t.Fatalf("Docker lifecycle fixture is missing %q", required)
+		}
+	}
+
+	for name, workflow := range map[string]string{
+		"CI":      readRepoFile(t, ".github", "workflows", "ci.yml"),
+		"Release": readReleaseWorkflow(t),
+	} {
+		for _, required := range []string{
+			"Verify Docker installer process lifecycle",
+			"timeout-minutes: 3",
+			"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh",
+		} {
+			if !strings.Contains(workflow, required) {
+				t.Fatalf("%s workflow is missing mandatory Docker lifecycle gate %q", name, required)
+			}
+		}
+	}
+}

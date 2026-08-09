@@ -148,6 +148,15 @@ function Invoke-Go {
 $goVersion = ((Invoke-Go -Arguments @("version")) -split "\s+")[2]
 $ldflags = "-s -w -X main.Version=$Tag -X main.BuildTime=$buildTime -X main.GoVersion=$goVersion"
 
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw "python is required to generate deterministic release archives and manifests"
+}
+$pythonExecutable = $pythonCommand.Source
+
 $targets = @(
     @{ GOOS = "windows"; GOARCH = "amd64"; AssetOS = "windows"; AssetArch = "amd64"; Ext = ".exe" },
     @{ GOOS = "windows"; GOARCH = "arm64"; AssetOS = "windows"; AssetArch = "arm64"; Ext = ".exe" },
@@ -176,31 +185,23 @@ foreach ($target in $targets) {
     Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $targetDir
     Copy-Item -LiteralPath (Join-Path $root "README.zh-CN.md") -Destination $targetDir
 
-    $archiveInputs = @(Get-ChildItem -LiteralPath $targetDir -File | ForEach-Object { $_.FullName })
-    [Array]::Sort($archiveInputs, [StringComparer]::Ordinal)
-    foreach ($inputPath in $archiveInputs) {
-        (Get-Item -LiteralPath $inputPath).LastWriteTimeUtc = $commitTime
-    }
-
     $assetPath = Join-Path $releaseDir $assetName
     if (Test-Path -LiteralPath $assetPath) {
         Remove-Item -LiteralPath $assetPath -Force
     }
-    Compress-Archive -LiteralPath $archiveInputs -DestinationPath $assetPath -CompressionLevel Optimal
+    & $pythonExecutable (Join-Path $root ".github\scripts\deterministic_archive.py") `
+        --format zip `
+        --source-directory $targetDir `
+        --output $assetPath `
+        --source-date-epoch $sourceDateEpochText `
+        --executable "tachyon-core$($target.Ext)" `
+        --executable "tachyonctl$($target.Ext)"
+    if ($LASTEXITCODE -ne 0) { throw "deterministic archive generation failed for $assetName" }
     (Get-Item -LiteralPath $assetPath).LastWriteTimeUtc = $commitTime
     Write-Host "built $assetName"
 }
 
 Remove-Item -LiteralPath $workDir -Recurse -Force
-
-$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCommand) {
-    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
-}
-if (-not $pythonCommand) {
-    throw "python is required to generate release manifests"
-}
-$pythonExecutable = $pythonCommand.Source
 
 & $pythonExecutable (Join-Path $root ".github\scripts\generate-build-metadata.py") `
     --version $Tag `

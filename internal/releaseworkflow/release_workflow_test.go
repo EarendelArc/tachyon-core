@@ -79,9 +79,15 @@ func TestGitHubReleaseUsesDeterministicBilingualNotesContract(t *testing.T) {
 			t.Fatalf("shared release note templates are missing %q", text)
 		}
 	}
-	for _, text := range []string{"RELEASE_NOTES.md.tmpl", "RELEASE_NOTES.zh-CN.md.tmpl", "{{VERSION}}", "{{COMMIT}}"} {
+	for _, text := range []string{"prepare-release-metadata.py", `--template-directory "${template_dir}"`} {
 		if !strings.Contains(preparation, text) {
-			t.Fatalf("release preparation script is missing shared-template behavior %q", text)
+			t.Fatalf("release preparation script is missing shared metadata generator behavior %q", text)
+		}
+	}
+	metadataGenerator := readRepoFile(t, ".github", "scripts", "prepare-release-metadata.py")
+	for _, text := range []string{"RELEASE_NOTES.md.tmpl", "RELEASE_NOTES.zh-CN.md.tmpl", "{{VERSION}}", "{{COMMIT}}", "SHA256SUMS.txt"} {
+		if !strings.Contains(metadataGenerator, text) {
+			t.Fatalf("shared metadata generator is missing %q", text)
 		}
 	}
 
@@ -124,6 +130,13 @@ func TestGitHubCIDailyBuildCoversSupportedSixPlatformMatrix(t *testing.T) {
 		"- goos: windows\n            goarch: arm64",
 		"- goos: darwin\n            goarch: amd64",
 		"- goos: darwin\n            goarch: arm64",
+		"release-policy:",
+		"linux-lifecycle:",
+		"go-test:",
+		"go-race:",
+		"needs: [release-policy, linux-lifecycle, go-test, go-race, test-windows, build]",
+		"python3 .github/scripts/test-reproducible-release.py",
+		"python .github/scripts/test-reproducible-release.py",
 	}
 	for _, text := range required {
 		if !strings.Contains(workflow, text) {
@@ -172,6 +185,7 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 		`LastWriteTimeUtc = $commitTime`,
 		`must be an annotated tag`,
 		`generate-wintun-contract.py`,
+		`deterministic_archive.py`,
 		`--verify-official`,
 		`validate-release-assets.py`,
 		`prepare-release.ps1`,
@@ -186,11 +200,8 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 
 	windowsPreparation := readRepoFile(t, "scripts", "prepare-release.ps1")
 	for _, text := range []string{
-		"RELEASE_NOTES.md.tmpl",
-		"RELEASE_NOTES.zh-CN.md.tmpl",
-		`@("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames + $auxiliaryNames`,
-		"[System.Text.ASCIIEncoding]::new()",
-		"$checksumLines -join",
+		"prepare-release-metadata.py",
+		"--template-directory $TemplateDirectory",
 		"generate-wintun-contract.py",
 		"--verify-official",
 		"validate-release-assets.py",
@@ -204,6 +215,10 @@ func TestReleaseBuildMatchesSupportedSixPlatformMatrix(t *testing.T) {
 	ci := readRepoFile(t, ".github", "workflows", "ci.yml")
 	if !strings.Contains(ci, ".github/scripts/test-build-release-policy.ps1") {
 		t.Fatal("CI does not run the Windows release golden policy test")
+	}
+	if strings.Index(ci, "release-policy:") > strings.Index(ci, "linux-lifecycle:") ||
+		strings.Index(ci, "linux-lifecycle:") > strings.Index(ci, "go-test:") {
+		t.Fatal("CI independent gate declarations are missing or unexpectedly ordered")
 	}
 
 	wintunContract := readRepoFile(t, ".github", "wintun", "WINTUN_SIDECAR_CONTRACT.json")

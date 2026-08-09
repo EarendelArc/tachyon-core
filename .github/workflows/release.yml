@@ -238,8 +238,15 @@ jobs:
           set -euo pipefail
           asset="tachyon-core_${VERSION}_${ASSET_OS}_${ASSET_ARCH}.zip"
           cp README.md README.zh-CN.md build/
-          touch --date="@${SOURCE_DATE_EPOCH}" build/*
-          (cd build && TZ=UTC zip -X -9 "../${asset}" ./*)
+          executable="tachyon-core"
+          [[ "${ASSET_OS}" == "windows" ]] && executable="tachyon-core.exe"
+          python3 .github/scripts/deterministic_archive.py \
+            --format zip \
+            --source-directory build \
+            --output "${asset}" \
+            --source-date-epoch "${SOURCE_DATE_EPOCH}" \
+            --executable "${executable}" \
+            --executable "tachyonctl${executable#tachyon-core}"
           mkdir -p dist
           mv "${asset}" dist/
 

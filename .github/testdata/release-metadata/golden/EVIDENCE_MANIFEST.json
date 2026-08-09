@@ -1,0 +1,52 @@
+{
+  "archive": {
+    "format": "pax-tar+gzip",
+    "gid": 0,
+    "gname": "root",
+    "member_mode": "0644",
+    "mtime": 0,
+    "name": "tachyon-helper-evidence_v9.8.7-alpha.6.tar.gz",
+    "path_order": "utf8-bytewise",
+    "pax_headers": {},
+    "sha256": "259c74d260fd91ef2f5099035cd808ae1866ee55f3283f47d965264e5b304284",
+    "size": 10263,
+    "uid": 0,
+    "uname": "root"
+  },
+  "capture_state": "not_ready",
+  "files": [
+    {
+      "name": "health.sanitized.json",
+      "sha256": "51966dc836ec0af854e0d224e57fad2b979ba5f45196911a9f58f9f6361790f8",
+      "size": 58
+    },
+    {
+      "name": "ready.sanitized.json",
+      "sha256": "07670889145915a7c480886a524c20f9b89cfac93ee16a4ceaefe0a2f899bbc2",
+      "size": 25
+    },
+    {
+      "name": "cleanup.json",
+      "sha256": "8a49ea5083c8030f058182dcd6ae7da0960e68a0d762f71e8e8375f5732fb2fb",
+      "size": 18
+    },
+    {
+      "name": "manifest.json",
+      "sha256": "e88860f14effcf5a5bf7eb0611d22aa968fb42968f3ba427f23b37a4cc56e48a",
+      "size": 406
+    },
+    {
+      "name": "manifest.sha256",
+      "sha256": "fb8241390272352ddaa9328e864b943eb14e8580429156db634ec6c1240aa844",
+      "size": 81
+    }
+  ],
+  "release_eligible": true,
+  "release_version": "v9.8.7-alpha.6",
+  "run_attempt": 1,
+  "run_id": 1,
+  "schema_version": 1,
+  "scope": "WFP Helper preview evidence only; no real WFP callout, kernel injection, process capture, or game E2E",
+  "source": "github-actions-helper-service-sid-harness",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567"
+}

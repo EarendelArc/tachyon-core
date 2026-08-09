@@ -120,34 +120,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "release preparation failed: official Wintun verification failed"
 }
 
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-$ascii = [System.Text.ASCIIEncoding]::new()
-
-function Write-RenderedTemplate {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$TemplatePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$OutputPath
-    )
-
-    $content = [System.IO.File]::ReadAllText($TemplatePath)
-    $content = $content.Replace("`r`n", "`n").Replace("`r", "`n")
-    $content = $content.Replace("{{VERSION}}", $Version).Replace("{{COMMIT}}", $Commit)
-    if ($content -match '{{(VERSION|COMMIT)}}') {
-        throw "release preparation failed: release note template contains an unresolved placeholder: $([System.IO.Path]::GetFileName($TemplatePath))"
-    }
-    [System.IO.File]::WriteAllText($OutputPath, $content, $utf8NoBom)
-}
-
-Write-RenderedTemplate `
-    -TemplatePath (Join-Path $TemplateDirectory "RELEASE_NOTES.md.tmpl") `
-    -OutputPath (Join-Path $ReleaseDirectory "RELEASE_NOTES.md")
-Write-RenderedTemplate `
-    -TemplatePath (Join-Path $TemplateDirectory "RELEASE_NOTES.zh-CN.md.tmpl") `
-    -OutputPath (Join-Path $ReleaseDirectory "RELEASE_NOTES.zh-CN.md")
-
 & $PythonExecutable (Join-Path $repoRoot ".github\scripts\validate-release-assets.py") `
     --release-directory $ReleaseDirectory `
     --version $Version `
@@ -156,28 +128,18 @@ if ($LASTEXITCODE -ne 0) {
     throw "release preparation failed: release asset validation failed"
 }
 
-$checksumNames = @("RELEASE_NOTES.md", "RELEASE_NOTES.zh-CN.md") + $zipNames + $auxiliaryNames
-$checksumLines = foreach ($name in $checksumNames) {
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ReleaseDirectory $name)).Hash.ToLowerInvariant()
-    "${hash}  ${name}"
+& $PythonExecutable (Join-Path $repoRoot ".github\scripts\prepare-release-metadata.py") `
+    --version $Version `
+    --commit $Commit `
+    --release-directory $ReleaseDirectory `
+    --template-directory $TemplateDirectory
+if ($LASTEXITCODE -ne 0) {
+    throw "release preparation failed: deterministic metadata generation failed"
 }
-[System.IO.File]::WriteAllText(
-    (Join-Path $ReleaseDirectory "SHA256SUMS.txt"),
-    (($checksumLines -join "`n") + "`n"),
-    $ascii
-)
 
 $actualNames = @(Get-ChildItem -LiteralPath $ReleaseDirectory -File | ForEach-Object { $_.Name } | Sort-Object)
 $expectedNames = @($declaredNames | Sort-Object)
 if (($actualNames -join "`n") -ne ($expectedNames -join "`n")) {
     throw "release preparation failed: release directory does not contain the exact declared asset set"
 }
-foreach ($name in $checksumNames) {
-    $expectedHash = (($checksumLines | Where-Object { $_ -like "*  $name" }) -split '  ')[0]
-    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ReleaseDirectory $name)).Hash.ToLowerInvariant()
-    if ($expectedHash -ne $actualHash) {
-        throw "release preparation failed: checksum verification failed for $name"
-    }
-}
-
 Write-Host "prepared deterministic bilingual release metadata for $Version at $Commit"

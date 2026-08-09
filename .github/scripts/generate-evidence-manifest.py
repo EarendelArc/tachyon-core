@@ -4,13 +4,21 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
 import re
 import sys
 import tarfile
 from pathlib import Path
+
+from deterministic_archive import (
+    ARCHIVE_GID,
+    ARCHIVE_GNAME,
+    ARCHIVE_UID,
+    ARCHIVE_UNAME,
+    FILE_MODE,
+    write_tar_gz,
+)
 
 
 REQUIRED_FILES = (
@@ -109,19 +117,29 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_name = f"tachyon-helper-evidence_{args.version}.tar.gz"
     archive_path = output_dir / archive_name
-    with archive_path.open("wb") as output:
-        with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=9, mtime=args.source_date_epoch) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
-                for name in REQUIRED_FILES:
-                    info = archive.gettarinfo(str(evidence_dir / name), arcname=f"helper-evidence/{name}")
-                    info.mtime = args.source_date_epoch
-                    with (evidence_dir / name).open("rb") as handle:
-                        archive.addfile(info, handle)
+    write_tar_gz(
+        archive_path,
+        {f"helper-evidence/{name}": (evidence_dir / name).read_bytes() for name in REQUIRED_FILES},
+        args.source_date_epoch,
+    )
 
     archive_sha256, archive_size = sha256_file(archive_path)
     manifest["release_version"] = args.version
     manifest["release_eligible"] = True
-    manifest["archive"] = {"name": archive_name, "sha256": archive_sha256, "size": archive_size}
+    manifest["archive"] = {
+        "format": "pax-tar+gzip",
+        "gid": ARCHIVE_GID,
+        "gname": ARCHIVE_GNAME,
+        "member_mode": f"{FILE_MODE:04o}",
+        "mtime": args.source_date_epoch,
+        "name": archive_name,
+        "path_order": "utf8-bytewise",
+        "pax_headers": {},
+        "sha256": archive_sha256,
+        "size": archive_size,
+        "uid": ARCHIVE_UID,
+        "uname": ARCHIVE_UNAME,
+    }
     output_path = output_dir / "EVIDENCE_MANIFEST.json"
     output_path.write_text(
         json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",

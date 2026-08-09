@@ -36,6 +36,22 @@ Go version, every target OS/architecture, and each ZIP and embedded binary SHA-2
 The build uses the verified commit time as `SOURCE_DATE_EPOCH`; no workflow wall
 clock is used for release metadata.
 
+All release ZIPs, the Helper evidence PAX tar/gzip archive, bilingual notes, and
+`SHA256SUMS.txt` are produced by shared Python production generators on Bash and
+PowerShell paths. ZIP entries are stored without compressor-dependent output and
+carry a UTC-clamped timestamp, bytewise UTF-8 path order, no extra fields, and
+normalized `0644`/`0755` modes. Evidence tar members use the exact source epoch,
+UID/GID `0`, owner/group `root`, mode `0644`, empty per-member PAX headers, and a
+gzip header with no host filename. Host filesystem ownership, timestamps, mode,
+locale, and timezone never enter release bytes.
+
+`.github/scripts/test-reproducible-release.py` regenerates all thirteen fixture
+assets twice after deliberately changing host metadata and creation order. Ubuntu
+and Windows CI require byte-for-byte equality plus the same committed golden
+`EVIDENCE_MANIFEST.json`, evidence archive, and `SHA256SUMS.txt`. Golden files may
+only be refreshed with that fixture's explicit `--update-golden` mode, which calls
+the production generators.
+
 ## Helper evidence
 
 The Windows CI job uploads a sanitized Helper evidence directory. The release job
@@ -60,6 +76,12 @@ same official generator and release validator as CI. The offline fixture option
 is restricted to policy tests and cannot bypass production network verification.
 
 ## Publication gates
+
+CI keeps release policy, Linux installer lifecycle evidence, ordinary Go tests,
+and Go race tests in independent jobs. A release-policy failure therefore cannot
+hide flock, signal rollback, or SIGKILL recovery evidence; the final required job
+still fails unless every independent job, Windows test, and six-platform build is
+successful.
 
 The remote tag gate accepts only a real annotated tag object whose peeled commit
 matches the verified checkout. A correctly targeted lightweight tag is still rejected.

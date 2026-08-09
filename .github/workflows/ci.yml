@@ -7,20 +7,15 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Test
+  release-policy:
+    name: Release policy and reproducibility (Ubuntu)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Setup Go
-        uses: actions/setup-go@v6.4.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Verify release policy
+        timeout-minutes: 3
         shell: bash
         run: |
           bash -n .github/scripts/verify-release-tag.sh
@@ -28,6 +23,17 @@ jobs:
           bash -n .github/scripts/publish-release.sh
           bash -n .github/scripts/test-release-policy.sh
           bash .github/scripts/test-release-policy.sh
+
+      - name: Verify byte-for-byte reproducible release fixtures
+        timeout-minutes: 2
+        run: python3 .github/scripts/test-reproducible-release.py
+
+  linux-lifecycle:
+    name: Linux lifecycle evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
 
       - name: Verify server diagnostics script
         shell: bash
@@ -56,8 +62,34 @@ jobs:
           bash -n scripts/verify-tgp-e2e.sh
           bash scripts/verify-tgp-e2e.sh --self-test
 
+  go-test:
+    name: Go test (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Test
         run: go test ./...
+
+  go-race:
+    name: Go race (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Race test
         run: go test -race ./...
@@ -72,6 +104,11 @@ jobs:
       - name: Verify Windows release policy
         shell: pwsh
         run: .github/scripts/test-build-release-policy.ps1
+
+      - name: Verify byte-for-byte reproducible release fixtures
+        timeout-minutes: 2
+        shell: pwsh
+        run: python .github/scripts/test-reproducible-release.py
 
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
@@ -173,3 +210,25 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: go build ./...
+
+  required:
+    name: Required CI gate
+    if: ${{ always() }}
+    needs: [release-policy, linux-lifecycle, go-test, go-race, test-windows, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every independent gate
+        env:
+          RELEASE_POLICY_RESULT: ${{ needs.release-policy.result }}
+          LINUX_LIFECYCLE_RESULT: ${{ needs.linux-lifecycle.result }}
+          GO_TEST_RESULT: ${{ needs.go-test.result }}
+          GO_RACE_RESULT: ${{ needs.go-race.result }}
+          WINDOWS_RESULT: ${{ needs.test-windows.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          test "${RELEASE_POLICY_RESULT}" = success
+          test "${LINUX_LIFECYCLE_RESULT}" = success
+          test "${GO_TEST_RESULT}" = success
+          test "${GO_RACE_RESULT}" = success
+          test "${WINDOWS_RESULT}" = success
+          test "${BUILD_RESULT}" = success

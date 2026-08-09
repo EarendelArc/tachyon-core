@@ -62,41 +62,15 @@ mapfile -t expected_sorted < <(printf '%s\n' "${expected_files[@]}" | LC_ALL=C s
 [[ "${actual_files[*]}" == "${expected_sorted[*]}" ]] || \
   die "release directory contains an unexpected asset set"
 
-render_template() {
-  local template=$1
-  local output=$2
-
-  sed \
-    -e "s/{{VERSION}}/${version}/g" \
-    -e "s/{{COMMIT}}/${commit}/g" \
-    "${template}" > "${output}"
-  if grep -Eq '{{(VERSION|COMMIT)}}' "${output}"; then
-    die "release note template contains an unresolved placeholder: $(basename "${template}")"
-  fi
-}
-
-render_template "${template_dir}/RELEASE_NOTES.md.tmpl" "${release_dir}/RELEASE_NOTES.md"
-render_template "${template_dir}/RELEASE_NOTES.zh-CN.md.tmpl" "${release_dir}/RELEASE_NOTES.zh-CN.md"
-
 python3 "${script_dir}/validate-release-assets.py" \
   --release-directory "${release_dir}" \
   --version "${version}" \
   --commit "${commit}"
 
-checksum_inputs=(
-  RELEASE_NOTES.md
-  RELEASE_NOTES.zh-CN.md
-  "${zip_names[@]}"
-  "${auxiliary_assets[@]}"
-)
-(
-  cd "${release_dir}"
-  sha256sum --text "${checksum_inputs[@]}" > SHA256SUMS.txt
-)
-
-(
-  cd "${release_dir}"
-  sha256sum --check --strict SHA256SUMS.txt >/dev/null
-)
+python3 "${script_dir}/prepare-release-metadata.py" \
+  --version "${version}" \
+  --commit "${commit}" \
+  --release-directory "${release_dir}" \
+  --template-directory "${template_dir}"
 
 echo "prepared deterministic bilingual release metadata for ${version} at ${commit}"

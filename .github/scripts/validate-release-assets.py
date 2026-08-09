@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -133,6 +134,53 @@ def validate_evidence(root: Path, version: str, commit: str) -> None:
     archive_hash, archive_size = digest(archive_path)
     if archive.get("sha256") != archive_hash or archive.get("size") != archive_size:
         raise ValueError("EVIDENCE_MANIFEST.json archive digest mismatch")
+    expected_contract = {
+        "format": "pax-tar+gzip",
+        "gid": 0,
+        "gname": "root",
+        "member_mode": "0644",
+        "mtime": document.get("archive", {}).get("mtime"),
+        "path_order": "utf8-bytewise",
+        "pax_headers": {},
+        "uid": 0,
+        "uname": "root",
+    }
+    if not isinstance(expected_contract["mtime"], int) or expected_contract["mtime"] < 0:
+        raise ValueError("EVIDENCE_MANIFEST.json archive mtime is invalid")
+    for field, expected in expected_contract.items():
+        if archive.get(field) != expected:
+            raise ValueError(f"EVIDENCE_MANIFEST.json archive contract mismatch: {field}")
+
+    file_records = document.get("files")
+    if not isinstance(file_records, list):
+        raise ValueError("EVIDENCE_MANIFEST.json file list is invalid")
+    expected_files = {
+        f"helper-evidence/{str(record.get('name'))}": record
+        for record in file_records
+        if isinstance(record, dict)
+    }
+    expected_names = sorted(expected_files, key=lambda name: name.encode("utf-8"))
+    if len(expected_files) != len(file_records):
+        raise ValueError("EVIDENCE_MANIFEST.json contains duplicate or invalid file records")
+    with tarfile.open(archive_path, mode="r:gz") as handle:
+        members = handle.getmembers()
+        names = [member.name for member in members]
+        if names != expected_names:
+            raise ValueError("Helper evidence archive paths are not canonical and bytewise sorted")
+        for member in members:
+            if not member.isfile() or member.uid != 0 or member.gid != 0:
+                raise ValueError(f"Helper evidence archive member type/owner is invalid: {member.name}")
+            if member.uname != "root" or member.gname != "root" or member.mode != 0o644:
+                raise ValueError(f"Helper evidence archive member identity/mode is invalid: {member.name}")
+            if member.mtime != expected_contract["mtime"] or member.pax_headers:
+                raise ValueError(f"Helper evidence archive member time/PAX metadata is invalid: {member.name}")
+            extracted = handle.extractfile(member)
+            if extracted is None:
+                raise ValueError(f"Helper evidence archive member cannot be read: {member.name}")
+            payload = extracted.read()
+            record = expected_files[member.name]
+            if record.get("sha256") != hashlib.sha256(payload).hexdigest() or record.get("size") != len(payload):
+                raise ValueError(f"Helper evidence archive member digest mismatch: {member.name}")
 
 
 def main() -> int:
@@ -153,6 +201,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f"release asset validation failed: {error}", file=sys.stderr)
         raise SystemExit(1)

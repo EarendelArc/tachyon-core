@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import time
-import zipfile
 from pathlib import Path
+
+from deterministic_archive import write_zip as write_deterministic_zip
 
 
 PLATFORMS = (
@@ -21,9 +21,7 @@ PLATFORMS = (
 )
 
 
-def write_zip(path: Path, platform: str, architecture: str, extension: str) -> None:
-    epoch = time.gmtime(0)
-    date_time = (1980, 1, 1, 0, 0, 0)
+def write_zip(path: Path, platform: str, architecture: str, extension: str, source_date_epoch: int) -> None:
     core_name = f"tachyon-core{extension}"
     ctl_name = f"tachyonctl{extension}"
     entries = {
@@ -32,13 +30,12 @@ def write_zip(path: Path, platform: str, architecture: str, extension: str) -> N
         "README.md": b"fixture\n",
         "README.zh-CN.md": b"fixture\n",
     }
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for name in sorted(entries):
-            info = zipfile.ZipInfo(name, date_time)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.create_system = 3
-            info.external_attr = 0o100644 << 16
-            archive.writestr(info, entries[name])
+    write_deterministic_zip(
+        path,
+        entries,
+        source_date_epoch,
+        executable_names=(core_name, ctl_name),
+    )
 
 
 def write_evidence(directory: Path, commit: str, run_id: str, attempt: str) -> None:
@@ -73,11 +70,12 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--run-id", default="1")
     parser.add_argument("--run-attempt", default="1")
+    parser.add_argument("--source-date-epoch", default=0, type=int)
     args = parser.parse_args()
     args.release_dir.mkdir(parents=True, exist_ok=True)
     for platform, architecture, extension in PLATFORMS:
         name = f"tachyon-core_{args.version}_{platform}_{architecture}.zip"
-        write_zip(args.release_dir / name, platform, architecture, extension)
+        write_zip(args.release_dir / name, platform, architecture, extension, args.source_date_epoch)
     write_evidence(args.evidence_dir, args.commit.lower(), args.run_id, args.run_attempt)
     return 0
 

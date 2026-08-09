@@ -31,6 +31,18 @@ workflow 构建六个 ZIP：
 所有目标平台/架构，以及每个 ZIP 与其中二进制的 SHA-256。构建使用已验证提交的
 commit time 作为 `SOURCE_DATE_EPOCH`，不使用 workflow 实时时钟生成发布元数据。
 
+全部发布 ZIP、Helper evidence PAX tar/gzip、双语发布说明和 `SHA256SUMS.txt` 均由
+Bash 与 PowerShell 共用的 Python 生产生成器生成。ZIP 不使用可能随压缩库变化的压缩
+输出，并固定 UTC 时间、UTF-8 字节序路径、空扩展字段以及 `0644`/`0755` mode。
+Evidence tar 固定 source epoch、UID/GID `0`、owner/group `root`、`0644` mode、空的
+成员 PAX header；gzip header 不记录宿主文件名。宿主文件系统的所有者、mtime、mode、
+locale 和 timezone 均不得进入发布字节。
+
+`.github/scripts/test-reproducible-release.py` 会故意改变宿主元数据与创建顺序，然后连续
+生成两次全部十三项 fixture 资产。Windows 与 Ubuntu CI 都要求逐字节一致，并与提交的
+`EVIDENCE_MANIFEST.json`、evidence archive 和 `SHA256SUMS.txt` golden 完全相同。
+Golden 只能通过该 fixture 的显式 `--update-golden` 参数更新，且内部只调用生产生成器。
+
 ## Helper evidence
 
 Windows CI job 会上传去敏 Helper evidence。release job 只下载同一成功 workflow run
@@ -51,6 +63,10 @@ sidecar 缺失或不匹配时，Prism 必须拒绝启动 Core。
 离线 fixture 只允许 policy test 显式启用，不能绕过生产路径的网络验证。
 
 ## 发布门禁
+
+CI 将 release policy、Linux 安装器生命周期证据、普通 Go test 与 Go race 拆成独立 job。
+因此发布策略失败不会遮蔽 flock、信号回滚或 SIGKILL 恢复证据；最终 required job 仍要求
+所有独立 job、Windows 测试及六平台构建全部成功。
 
 远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
 即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。

@@ -2,7 +2,6 @@ package helper
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -59,14 +58,9 @@ func newWFPDeviceProvider(transport wfpDeviceTransport) (*WFPDeviceProvider, err
 	}
 	provider := &WFPDeviceProvider{transport: transport, sequences: make(map[[16]byte]uint64), delivery: make(map[[16]byte]uint64)}
 	provider.requestID.Store(1)
-	var helperBuild [16]byte
-	if _, err := rand.Read(helperBuild[:]); err != nil {
-		_ = transport.Close()
-		return nil, fmt.Errorf("create WFP helper build nonce: %w", err)
-	}
 	requestID := provider.nextRequestID()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	wire, err := transport.Negotiate(ctx, marshalWFPNegotiate(requestID, helperBuild))
+	wire, err := transport.Negotiate(ctx, marshalWFPNegotiate(requestID, wfpHelperBuildID))
 	cancel()
 	if err != nil {
 		_ = transport.Close()
@@ -79,10 +73,10 @@ func newWFPDeviceProvider(transport wfpDeviceTransport) (*WFPDeviceProvider, err
 		return nil, err
 	}
 	provider.health = ProviderHealth{
-		Status: "ready", Reason: fmt.Sprintf("verified WFP ABI %d.%d build %x", wfpDeviceABIMajor, wfpDeviceABIMinor, response.BuildID),
+		Status: "not_ready", Reason: fmt.Sprintf("verified capture-only WFP ABI %d.%d build %x; receive injection is unavailable", wfpDeviceABIMajor, wfpDeviceABIMinor, response.BuildID),
 		Verified: true, MTU: 1500,
 		Capabilities: CaptureCapabilities{FlowCapture: true, DatagramCapture: true, ProcessIdentity: true,
-			PerFlowMTU: true, Cancelable: true, KernelInjection: true},
+			PerFlowMTU: true, Cancelable: true},
 	}
 	return provider, nil
 }
@@ -105,6 +99,12 @@ func (provider *WFPDeviceProvider) Health() ProviderHealth {
 }
 
 func (provider *WFPDeviceProvider) ActivatePolicy(ctx context.Context, policy WFPPolicy) error {
+	provider.mu.RLock()
+	ready := provider.health.Status == "ready" && provider.health.Verified && !provider.closed
+	provider.mu.RUnlock()
+	if !ready {
+		return ErrCaptureUnavailable
+	}
 	entries := make([]wfpPolicyEntry, len(policy.Processes))
 	for index, process := range policy.Processes {
 		entry := wfpPolicyEntry{ProcessID: process.ProcessID, ProcessStart: process.ProcessStart, AppIDHash: process.AppIDHash, UserSIDHash: process.UserSIDHash}
@@ -134,6 +134,31 @@ func (provider *WFPDeviceProvider) ActivatePolicy(ctx context.Context, policy WF
 	provider.policy = WFPPolicy{Generation: policy.Generation, LeaseNonce: policy.LeaseNonce, Processes: append([]WFPProcessPolicy(nil), policy.Processes...)}
 	clear(provider.sequences)
 	clear(provider.delivery)
+	provider.mu.Unlock()
+	return nil
+}
+
+func (provider *WFPDeviceProvider) DisablePolicy(ctx context.Context) error {
+	provider.mu.RLock()
+	policy := provider.policy
+	provider.mu.RUnlock()
+	if policy.Generation == 0 || policy.LeaseNonce == ([16]byte{}) {
+		return nil
+	}
+	wire, err := marshalWFPDisablePolicy(provider.nextRequestID(), policy)
+	if err != nil {
+		return err
+	}
+	defer clear(wire)
+	if err := provider.transport.DisablePolicy(ctx, wire); err != nil {
+		return fmt.Errorf("disable WFP policy: %w", err)
+	}
+	provider.mu.Lock()
+	if provider.policy.Generation == policy.Generation && provider.policy.LeaseNonce == policy.LeaseNonce {
+		provider.policy = WFPPolicy{}
+		clear(provider.sequences)
+		clear(provider.delivery)
+	}
 	provider.mu.Unlock()
 	return nil
 }
@@ -183,6 +208,9 @@ func (provider *WFPDeviceProvider) Start(ctx context.Context, callbacks CaptureC
 		}
 		clear(buffer[:size])
 		clear(frame.Payload)
+		if errors.Is(err, ErrWFPDeviceReplay) || errors.Is(err, ErrWFPDeviceLease) {
+			continue
+		}
 		if err != nil {
 			provider.markFailed(err)
 			return err
@@ -199,8 +227,13 @@ func (provider *WFPDeviceProvider) acceptCapture(ctx context.Context, frame wfpC
 	}
 	last := provider.sequences[frame.FlowID]
 	if frame.Sequence != last+1 {
+		delete(provider.sequences, frame.FlowID)
+		callbacks := provider.callbacks
 		provider.mu.Unlock()
 		_ = provider.writeVerdict(ctx, frame, wfpVerdictPermitDirect, nil)
+		if callbacks.OnFlowEnd != nil {
+			_ = callbacks.OnFlowEnd(ctx, FlowIdentity{FlowID: frame.FlowID, Generation: frame.Generation, LeaseNonce: frame.LeaseNonce}, ErrWFPDeviceReplay)
+		}
 		return ErrWFPDeviceReplay
 	}
 	provider.sequences[frame.FlowID] = frame.Sequence
@@ -237,29 +270,21 @@ func (provider *WFPDeviceProvider) writeVerdict(ctx context.Context, frame wfpCa
 }
 
 func (provider *WFPDeviceProvider) Inject(ctx context.Context, delivery Delivery) error {
-	provider.mu.Lock()
-	if delivery.Identity.Generation != provider.policy.Generation || delivery.Identity.LeaseNonce != provider.policy.LeaseNonce {
-		provider.mu.Unlock()
-		return ErrWFPDeviceLease
-	}
-	sequence := provider.delivery[delivery.Identity.FlowID] + 1
-	if delivery.Sequence != 0 {
-		sequence = delivery.Sequence
-	}
-	if sequence <= provider.delivery[delivery.Identity.FlowID] {
-		provider.mu.Unlock()
-		return ErrWFPDeviceReplay
-	}
-	provider.delivery[delivery.Identity.FlowID] = sequence
-	provider.mu.Unlock()
-	frame := wfpCaptureFrame{RequestID: provider.nextRequestID(), FlowID: delivery.Identity.FlowID,
-		Generation: delivery.Identity.Generation, LeaseNonce: delivery.Identity.LeaseNonce, Sequence: sequence}
-	return provider.writeVerdict(ctx, frame, wfpVerdictInjectToApplication, delivery.Payload)
+	_ = ctx
+	_ = delivery
+	return ErrCaptureUnavailable
 }
 
-func (provider *WFPDeviceProvider) CloseFlow(context.Context, FlowIdentity) error { return nil }
+func (provider *WFPDeviceProvider) CloseFlow(_ context.Context, identity FlowIdentity) error {
+	provider.mu.Lock()
+	delete(provider.sequences, identity.FlowID)
+	delete(provider.delivery, identity.FlowID)
+	provider.mu.Unlock()
+	return nil
+}
 
 func (provider *WFPDeviceProvider) Stop(ctx context.Context) error {
+	disableErr := provider.DisablePolicy(ctx)
 	provider.mu.RLock()
 	cancel, done := provider.loopCancel, provider.loopDone
 	provider.mu.RUnlock()
@@ -271,10 +296,10 @@ func (provider *WFPDeviceProvider) Stop(ctx context.Context) error {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Join(disableErr, ctx.Err())
 		}
 	}
-	return nil
+	return disableErr
 }
 
 func (provider *WFPDeviceProvider) Close(ctx context.Context) error {

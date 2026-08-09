@@ -12,7 +12,7 @@
 #define TG_POOL_TAG 'pWgT'
 #define TG_DEVICE_NAME L"\\Device\\TachyonWFP"
 #define TG_SYMBOLIC_LINK L"\\DosDevices\\TachyonWFP"
-#define TG_HELPER_SDDL L"D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-80-1356003462-1404488631-2219046169-124586702-828318184)"
+#define TG_HELPER_SDDL L"D:P(A;;GA;;;SY)(A;;GA;;;" TACHYON_WFP_HELPER_SERVICE_SID_WIDE L")"
 #define TG_TIMER_PERIOD_MS 25u
 
 typedef enum TG_PACKET_STATE {
@@ -74,6 +74,7 @@ typedef struct TG_PENDING_PACKET {
     UCHAR remote_address[16];
     volatile LONG references;
     volatile LONG state;
+    volatile LONG terminal_state;
     BOOLEAN queued;
     BOOLEAN pending;
 } TG_PENDING_PACKET;
@@ -140,6 +141,7 @@ VOID NTAPI TgFlowDelete(UINT16 layer_id, UINT32 callout_id, UINT64 flow_context)
 BOOLEAN TgValidateHeader(const TACHYON_WFP_MESSAGE_HEADER* header, SIZE_T actual, UINT16 kind);
 NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
 NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
+VOID TgClearPolicy(TG_DEVICE_CONTEXT* context);
 NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
 NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size);
 VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct);

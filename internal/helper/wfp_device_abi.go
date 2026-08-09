@@ -1,64 +1,13 @@
 package helper
 
+//go:generate go run ./cmd/wfpabigen ../../drivers/windows/wfp/include/tachyon_wfp_abi.h wfp_abi_generated.go
+
 import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
-)
-
-const (
-	wfpDeviceMagic           uint32 = 0x46574754
-	wfpDeviceABIMajor        uint16 = 2
-	wfpDeviceABIMinor        uint16 = 0
-	wfpDeviceHeaderSize             = 32
-	wfpNegotiateRequestSize         = 64
-	wfpNegotiateResponseSize        = 104
-	wfpPolicyHeaderSize             = 64
-	wfpPolicyEntrySize              = 88
-	wfpCaptureHeaderSize            = 224
-	wfpVerdictHeaderSize            = 96
-	wfpStatisticsSize               = 104
-	wfpDefaultQueueCapacity  uint32 = 4096
-	wfpDefaultVerdictMS      uint32 = 250
-)
-
-const (
-	wfpMessageNegotiateRequest uint16 = iota + 1
-	wfpMessageNegotiateResponse
-	wfpMessagePolicy
-	wfpMessageDisablePolicy
-	wfpMessageCapture
-	wfpMessageVerdict
-	wfpMessageStatistics
-)
-
-const (
-	wfpCapFlowV4 uint64 = 1 << iota
-	wfpCapFlowV6
-	wfpCapDatagramV4
-	wfpCapDatagramV6
-	wfpCapProcessIdentity
-	wfpCapUserSID
-	wfpCapAppID
-	wfpCapInjectSend
-	wfpCapInjectReceive
-	wfpCapInjectionState
-	wfpCapBoundedQueue
-	wfpCapFailOpenTimeout
-	wfpCapPolicyGeneration
-)
-
-const wfpRequiredCapabilities = wfpCapFlowV4 | wfpCapFlowV6 | wfpCapDatagramV4 | wfpCapDatagramV6 |
-	wfpCapProcessIdentity | wfpCapUserSID | wfpCapAppID | wfpCapInjectSend | wfpCapInjectReceive |
-	wfpCapInjectionState | wfpCapBoundedQueue | wfpCapFailOpenTimeout | wfpCapPolicyGeneration
-
-const (
-	wfpVerdictTunnel uint32 = iota + 1
-	wfpVerdictPermitDirect
-	wfpVerdictDrop
-	wfpVerdictInjectToApplication
 )
 
 var (
@@ -136,7 +85,8 @@ func parseWFPHeader(data []byte, kind uint16) (wfpDeviceHeader, error) {
 	}
 	if binary.LittleEndian.Uint32(data[0:4]) != wfpDeviceMagic || binary.LittleEndian.Uint16(data[4:6]) != wfpDeviceHeaderSize ||
 		binary.LittleEndian.Uint16(data[6:8]) != wfpDeviceABIMajor || binary.LittleEndian.Uint16(data[8:10]) > wfpDeviceABIMinor ||
-		header.Kind != kind || header.TotalSize != uint32(len(data)) || header.RequestID == 0 || binary.LittleEndian.Uint32(data[28:32]) != 0 {
+		header.Kind != kind || header.Flags != 0 || header.TotalSize != uint32(len(data)) || header.RequestID == 0 ||
+		binary.LittleEndian.Uint32(data[28:32]) != 0 {
 		return wfpDeviceHeader{}, fmt.Errorf("%w: invalid header", ErrWFPDeviceProtocol)
 	}
 	return header, nil
@@ -165,12 +115,23 @@ func parseWFPNegotiate(data []byte, requestID uint64) (wfpNegotiateResponse, err
 	response.VerdictMS = binary.LittleEndian.Uint32(data[64:68])
 	response.FailPolicy = binary.LittleEndian.Uint32(data[68:72])
 	copy(response.ServiceSIDHash[:], data[72:104])
-	if response.Capabilities&wfpRequiredCapabilities != wfpRequiredCapabilities || response.MaxMessageSize != WFPMaxMessageSize ||
+	if response.Capabilities != wfpRequiredCapabilities || response.MaxMessageSize != WFPMaxMessageSize ||
 		response.QueueCapacity == 0 || response.QueueCapacity > wfpDefaultQueueCapacity || response.VerdictMS < 25 || response.VerdictMS > 1000 ||
-		response.FailPolicy != 1 || response.BuildID == ([16]byte{}) || response.ServiceSIDHash == ([32]byte{}) {
+		response.FailPolicy != 1 || response.BuildID != wfpDriverBuildID || response.ServiceSIDHash != wfpHelperServiceSIDHash {
 		return wfpNegotiateResponse{}, fmt.Errorf("%w: incompatible capabilities", ErrWFPDeviceProtocol)
 	}
 	return response, nil
+}
+
+func marshalWFPDisablePolicy(requestID uint64, policy WFPPolicy) ([]byte, error) {
+	if requestID == 0 || policy.Generation == 0 || policy.LeaseNonce == ([16]byte{}) {
+		return nil, fmt.Errorf("%w: invalid disable policy identity", ErrWFPDeviceProtocol)
+	}
+	data := make([]byte, wfpDisablePolicySize)
+	putWFPHeader(data, wfpMessageDisablePolicy, uint32(len(data)), requestID)
+	binary.LittleEndian.PutUint64(data[32:40], policy.Generation)
+	copy(data[40:56], policy.LeaseNonce[:])
+	return data, nil
 }
 
 func marshalWFPPolicy(requestID, generation uint64, nonce [16]byte, entries []wfpPolicyEntry) ([]byte, error) {
@@ -231,7 +192,7 @@ func parseWFPCapture(data []byte) (wfpCaptureFrame, error) {
 }
 
 func marshalWFPVerdict(frame wfpCaptureFrame, action uint32, payload []byte) ([]byte, error) {
-	if action < wfpVerdictTunnel || action > wfpVerdictInjectToApplication || len(payload) > int(WFPMaxMessageSize)-wfpVerdictHeaderSize {
+	if action < wfpVerdictTunnel || action > wfpVerdictDrop || len(payload) != 0 {
 		return nil, fmt.Errorf("%w: invalid verdict", ErrWFPDeviceProtocol)
 	}
 	data := make([]byte, wfpVerdictHeaderSize+len(payload))

@@ -428,6 +428,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     RtlZeroMemory(packet, sizeof(*packet));
     packet->references = 1;
     packet->state = TgPacketCaptured;
+    packet->terminal_state = TgPacketCompleted;
     packet->record = (TACHYON_WFP_CAPTURE_RECORD*)ExAllocatePool2(POOL_FLAG_NON_PAGED, record_size, TG_POOL_TAG);
     if (packet->record == NULL) {
         goto Exit;
@@ -590,7 +591,7 @@ VOID TgCompletePacket(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UIN
     }
     if (action == TachyonWfpVerdictDrop) InterlockedIncrement64((volatile LONG64*)&context->statistics.dropped);
     if (action == TachyonWfpVerdictTunnel) InterlockedIncrement64((volatile LONG64*)&context->statistics.injected);
-    InterlockedCompareExchange(&packet->state, TgPacketCompleted, TgPacketCompleting);
+    InterlockedCompareExchange(&packet->state, packet->terminal_state, TgPacketCompleting);
     TgPacketDereference(packet);
 }
 
@@ -600,7 +601,7 @@ static VOID NTAPI TgInjectComplete(VOID* context, NET_BUFFER_LIST* net_buffer_li
     UNREFERENCED_PARAMETER(dispatch_level);
     if (net_buffer_list != NULL) FwpsFreeCloneNetBufferList0(net_buffer_list, 0);
     packet->clone = NULL;
-    InterlockedCompareExchange(&packet->state, TgPacketCompleted, TgPacketCompleting);
+    InterlockedCompareExchange(&packet->state, packet->terminal_state, TgPacketCompleting);
     if (packet->flow != NULL && packet->flow->owner != NULL &&
         InterlockedDecrement(&packet->flow->owner->injection_count) == 0) {
         KeSetEvent(&packet->flow->owner->injections_drained, IO_NO_INCREMENT, FALSE);

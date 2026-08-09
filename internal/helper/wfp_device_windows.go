@@ -13,14 +13,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const (
-	ioctlWFPNegotiate     = 0x0012e400
-	ioctlWFPSetPolicy     = 0x0012e405
-	ioctlWFPDisablePolicy = 0x0012e408
-	ioctlWFPDequeue       = 0x0012e40e
-	ioctlWFPVerdict       = 0x0012e411
-)
-
 type windowsWFPTransport struct {
 	mu     sync.RWMutex
 	handle windows.Handle

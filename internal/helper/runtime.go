@@ -13,8 +13,10 @@ import (
 )
 
 var (
-	ErrInvalidCaptureContract = errors.New("capture provider contract is not an exact supported contract")
-	ErrRuntimeStopTimeout     = errors.New("helper runtime shutdown timed out")
+	ErrInvalidCaptureContract  = errors.New("capture provider contract is not an exact supported contract")
+	ErrRuntimeStopTimeout      = errors.New("helper runtime shutdown timed out")
+	ErrRuntimePipeDisconnected = errors.New("authenticated Core pipe disconnected while WFP policy was active")
+	ErrRuntimeComponentExit    = errors.New("helper runtime component exited unexpectedly")
 )
 
 type Config struct {
@@ -41,6 +43,7 @@ type Config struct {
 	FailStop func(context.Context) error
 	Provider CaptureProvider
 	Injector Injector
+	Policy   WFPPolicy
 }
 
 type Health struct {
@@ -80,6 +83,8 @@ type Runtime struct {
 	running      bool
 	providerStop providerShutdown
 	injectorStop providerShutdown
+	policyMu     sync.Mutex
+	policyActive bool
 }
 
 type providerShutdown struct {
@@ -138,28 +143,6 @@ func NewRuntime(config Config) (*Runtime, error) {
 	return runtime, nil
 }
 
-// ValidateCaptureProviderContract rejects providers that only claim the
-// required shape. The helper starts a provider only when every ABI, device,
-// IOCTL, MTU, capability, and cleanup field is an exact match.
-func ValidateCaptureProviderContract(provider CaptureProvider) error {
-	if provider == nil {
-		return fmt.Errorf("%w: provider is nil", ErrInvalidCaptureContract)
-	}
-	actual := provider.Contract()
-	if err := actual.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidCaptureContract, err)
-	}
-	expected := RequiredWFPDriverContract()
-	if actual.Version != expected.Version || actual.ABIVersion != expected.ABIVersion || actual.ContractID != expected.ContractID ||
-		actual.DevicePath != expected.DevicePath || actual.CaptureIOCTL != expected.CaptureIOCTL || actual.InjectIOCTL != expected.InjectIOCTL ||
-		actual.GetCapabilitiesIOCTL != expected.GetCapabilitiesIOCTL || actual.CancelIOCTL != expected.CancelIOCTL || actual.MaxMTU != expected.MaxMTU ||
-		actual.MaxMessageSize != expected.MaxMessageSize || actual.SupportsCancel != expected.SupportsCancel || actual.DynamicSession != expected.DynamicSession ||
-		actual.StopCleansDynamicState != expected.StopCleansDynamicState || actual.Capabilities != expected.Capabilities {
-		return fmt.Errorf("%w: provider contract differs from required contract", ErrInvalidCaptureContract)
-	}
-	return nil
-}
-
 func (runtime *Runtime) Run(ctx context.Context) (result error) {
 	runtime.runMu.Lock()
 	if runtime.running {
@@ -187,6 +170,7 @@ func (runtime *Runtime) Run(ctx context.Context) (result error) {
 	}()
 	runtime.setLifecycle("starting", "")
 	if err := ValidateCaptureProviderContract(runtime.provider); err != nil {
+		err = fmt.Errorf("%w: %v", ErrInvalidCaptureContract, err)
 		runtime.setLifecycle("failed", err.Error())
 		_ = runtime.writeDiagnostic()
 		return err
@@ -199,24 +183,121 @@ func (runtime *Runtime) Run(ctx context.Context) (result error) {
 	if err := runtime.writeDiagnostic(); err != nil {
 		return err
 	}
-	// A provider is intentionally not started when it is unavailable. This
-	// prevents a helper skeleton from ever claiming or manufacturing capture.
-	if health := runtime.provider.Health(); health.Status == "ready" && health.Verified {
-		if err := runtime.provider.Start(ctx, CaptureCallbacks{
-			OnDatagram: runtime.handleCapture,
-			OnFlowEnd:  runtime.handleFlowEnd,
-		}); err != nil {
-			runtime.setLifecycle("failed", err.Error())
-			return err
+	health := runtime.provider.Health()
+	if health.Status != "ready" || !health.Verified {
+		// Capture-only WFP milestones stay inert while the authenticated pipe
+		// may run for diagnostics. No policy is installed in this branch.
+		return runtime.client.Run(ctx)
+	}
+	policyProvider, ok := runtime.provider.(PolicyCaptureProvider)
+	if !ok || runtime.config.Policy.Generation == 0 || runtime.config.Policy.LeaseNonce == ([16]byte{}) {
+		return fmt.Errorf("%w: ready provider lacks a valid transactional policy boundary", ErrInvalidCaptureContract)
+	}
+	return runtime.runConcurrent(ctx, policyProvider)
+}
+
+type runtimeComponentResult struct {
+	name string
+	err  error
+}
+
+func (runtime *Runtime) runConcurrent(parent context.Context, provider PolicyCaptureProvider) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	results := make(chan runtimeComponentResult, 2)
+	var group sync.WaitGroup
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		results <- runtimeComponentResult{name: "provider", err: provider.Start(ctx, CaptureCallbacks{
+			OnDatagram: runtime.handleCapture, OnFlowEnd: runtime.handleFlowEnd,
+		})}
+	}()
+	go func() {
+		defer group.Done()
+		results <- runtimeComponentResult{name: "named_pipe", err: runtime.client.Run(ctx)}
+	}()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var trigger error
+	for trigger == nil {
+		select {
+		case <-parent.Done():
+			trigger = parent.Err()
+		case component := <-results:
+			if component.err == nil {
+				component.err = errors.New("component returned without cancellation")
+			}
+			trigger = errors.Join(ErrRuntimeComponentExit, fmt.Errorf("%s: %w", component.name, component.err))
+		case <-ticker.C:
+			pipe := runtime.client.Health()
+			runtime.policyMu.Lock()
+			active := runtime.policyActive
+			runtime.policyMu.Unlock()
+			if active && (!pipe.Connected || !pipe.Authenticated) {
+				trigger = ErrRuntimePipeDisconnected
+				break
+			}
+			if !active && pipe.Connected && pipe.Authenticated {
+				if err := runtime.activatePolicyTransaction(ctx, provider); err != nil {
+					trigger = err
+				}
+			}
 		}
 	}
-	err := runtime.client.Run(ctx)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		runtime.setLifecycle("failed", err.Error())
+
+	disableCtx, disableCancel := context.WithTimeout(context.Background(), runtime.providerStopDeadline(context.Background()))
+	disableErr := runtime.disablePolicyTransaction(disableCtx, provider)
+	disableCancel()
+	cancel()
+	_ = runtime.client.Close()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), runtime.providerStopDeadline(context.Background()))
+	stopErr := runtime.stopProviderWithContext(stopCtx)
+	stopCancel()
+	done := make(chan struct{})
+	go func() { group.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(runtime.providerStopDeadline(context.Background())):
+		return errors.Join(trigger, disableErr, stopErr, ErrRuntimeStopTimeout)
 	}
-	runtime.refreshHealth()
-	_ = runtime.writeDiagnostic()
-	return err
+	if errors.Is(trigger, context.Canceled) {
+		trigger = nil
+	}
+	return errors.Join(trigger, disableErr, stopErr)
+}
+
+func (runtime *Runtime) activatePolicyTransaction(ctx context.Context, provider PolicyCaptureProvider) error {
+	runtime.policyMu.Lock()
+	defer runtime.policyMu.Unlock()
+	if runtime.policyActive {
+		return nil
+	}
+	transaction, err := runtime.client.PrepareGeneration(ctx, runtime.config.Policy.Generation)
+	if err != nil {
+		return fmt.Errorf("prepare Core generation: %w", err)
+	}
+	if err := provider.ActivatePolicy(ctx, runtime.config.Policy); err != nil {
+		_ = runtime.client.AbortGeneration(ctx, transaction)
+		return fmt.Errorf("activate WFP policy: %w", err)
+	}
+	if err := runtime.client.CommitGeneration(ctx, transaction); err != nil {
+		_ = provider.DisablePolicy(ctx)
+		_ = runtime.client.AbortGeneration(ctx, transaction)
+		return fmt.Errorf("commit Core generation: %w", err)
+	}
+	runtime.policyActive = true
+	return nil
+}
+
+func (runtime *Runtime) disablePolicyTransaction(ctx context.Context, provider PolicyCaptureProvider) error {
+	runtime.policyMu.Lock()
+	defer runtime.policyMu.Unlock()
+	providerErr := provider.DisablePolicy(ctx)
+	coreErr := runtime.client.DisableGeneration(ctx, runtime.config.Policy.Generation)
+	runtime.policyActive = false
+	return errors.Join(providerErr, coreErr)
 }
 
 func (runtime *Runtime) Close() error {
@@ -278,9 +359,12 @@ func (runtime *Runtime) refreshHealth() {
 	providerHealth := runtime.provider.Health()
 	pipeHealth := runtime.clientHealth()
 	tokenSecurity := currentTokenSecurity()
+	runtime.policyMu.Lock()
+	policyActive := runtime.policyActive
+	runtime.policyMu.Unlock()
 	status, reason := "not_ready", providerHealth.Reason
-	if providerHealth.Status == "ready" && providerHealth.Verified && pipeHealth.Connected && pipeHealth.Authenticated {
-		status, reason = "ready", "capture provider and authenticated Core pipe are ready"
+	if providerHealth.Status == "ready" && providerHealth.Verified && pipeHealth.Connected && pipeHealth.Authenticated && policyActive {
+		status, reason = "ready", "capture provider, authenticated Core pipe, and policy transaction are active"
 	}
 	runtime.mu.RLock()
 	lifecycle := runtime.health.Lifecycle

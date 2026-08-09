@@ -39,13 +39,14 @@ static VOID TgDetachPendingLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET*
     context->pending_bytes -= packet->record_size;
 }
 
-static BOOLEAN TgBeginCompletionLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
+static BOOLEAN TgBeginCompletionLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, LONG terminal_state)
 {
     LONG state = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketCaptured);
     if (state != TgPacketCaptured) {
         state = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued);
         if (state != TgPacketDequeued) return FALSE;
     }
+    packet->terminal_state = terminal_state;
     TgPacketReference(packet); /* local completion path */
     TgDetachQueueLocked(context, packet);
     TgDetachPendingLocked(context, packet);
@@ -141,6 +142,21 @@ NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T i
     return STATUS_SUCCESS;
 }
 
+VOID TgClearPolicy(TG_DEVICE_CONTEXT* context)
+{
+    TG_POLICY* policy;
+    WdfSpinLockAcquire(context->lock);
+    policy = context->policy;
+    context->policy = NULL;
+    WdfSpinLockRelease(context->lock);
+    if (policy != NULL) {
+        RtlSecureZeroMemory(policy, FIELD_OFFSET(TG_POLICY, entries) +
+            (SIZE_T)policy->entry_count * sizeof(TACHYON_WFP_POLICY_ENTRY));
+        ExFreePoolWithTag(policy, TG_POOL_TAG);
+    }
+    TgFlushAll(context, TRUE);
+}
+
 BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
 {
     UINT32 index;
@@ -193,7 +209,10 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
         BOOLEAN claimed;
         WdfSpinLockAcquire(context->lock);
         claimed = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued) == TgPacketDequeued;
-        if (claimed) TgDetachPendingLocked(context, packet);
+        if (claimed) {
+            packet->terminal_state = TgPacketCompleted;
+            TgDetachPendingLocked(context, packet);
+        }
         WdfSpinLockRelease(context->lock);
         if (claimed) {
             TgPacketDereference(packet); /* pending-list/base owner */
@@ -208,7 +227,10 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
         BOOLEAN claimed;
         WdfSpinLockAcquire(context->lock);
         claimed = InterlockedCompareExchange(&packet->state, TgPacketCompleting, TgPacketDequeued) == TgPacketDequeued;
-        if (claimed) TgDetachPendingLocked(context, packet);
+        if (claimed) {
+            packet->terminal_state = TgPacketCompleted;
+            TgDetachPendingLocked(context, packet);
+        }
         WdfSpinLockRelease(context->lock);
         if (claimed) {
             TgPacketDereference(packet);
@@ -251,7 +273,7 @@ NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T in
     WdfSpinLockAcquire(context->lock);
     for (entry = context->pending_packets.Flink; entry != &context->pending_packets; entry = entry->Flink) {
         TG_PENDING_PACKET* candidate = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
-        if (TgEqualIdentity(candidate, verdict) && TgBeginCompletionLocked(context, candidate)) {
+        if (TgEqualIdentity(candidate, verdict) && TgBeginCompletionLocked(context, candidate, TgPacketCompleted)) {
             packet = candidate;
             break;
         }
@@ -277,7 +299,7 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
     while (entry != &context->pending_packets) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
         entry = entry->Flink;
-        if (packet->deadline_100ns <= now && TgBeginCompletionLocked(context, packet)) {
+        if (packet->deadline_100ns <= now && TgBeginCompletionLocked(context, packet, TgPacketCompleted)) {
             /* Move the local completion reference to the detached work list. */
             InsertTailList(&expired, &packet->pending_link);
         }
@@ -299,7 +321,7 @@ VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct)
     WdfSpinLockAcquire(context->lock);
     while (!IsListEmpty(&context->pending_packets)) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(context->pending_packets.Flink, TG_PENDING_PACKET, pending_link);
-        if (!TgBeginCompletionLocked(context, packet)) {
+        if (!TgBeginCompletionLocked(context, packet, TgPacketCancelled)) {
             TgDetachPendingLocked(context, packet);
             TgPacketDereference(packet);
             continue;

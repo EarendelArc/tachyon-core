@@ -1,0 +1,80 @@
+name: Windows WFP Driver Gate
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/wfp-driver.yml"
+      - "drivers/windows/wfp/**"
+      - "internal/helper/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/wfp-driver.yml"
+      - "drivers/windows/wfp/**"
+      - "internal/helper/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  abi-contract:
+    name: Generated ABI contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Regenerate and require a clean tree
+        run: |
+          go generate ./internal/helper
+          git diff --exit-code -- drivers/windows/wfp/include/tachyon_wfp_abi.h internal/helper/wfp_abi_generated.go
+      - name: Run helper ownership and transaction tests
+        run: go test -race ./internal/helper -count=1
+
+  wdk-build:
+    name: WDK compile and analysis (${{ matrix.platform }})
+    needs: abi-contract
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            package: x64
+          - platform: ARM64
+            package: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+      - name: Restore pinned formal WDK NuGet package
+        shell: pwsh
+        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TachyonUseNuGetWDK=true
+      - name: Compile with PREfast enabled
+        shell: pwsh
+        run: >-
+          msbuild drivers/windows/wfp/TachyonWfp.sln
+          /m /t:Build
+          /p:Configuration=Release
+          /p:Platform=${{ matrix.platform }}
+          /p:TachyonUseNuGetWDK=true
+          /p:RunCodeAnalysis=true
+          /p:EnablePREfast=true
+          /warnaserror
+      - name: Locate WDK InfVerif and validate INF
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windows.wdk.${{ matrix.package }}\10.0.28000.2526"
+          $infverif = Get-ChildItem -LiteralPath $packageRoot -Recurse -Filter infverif.exe | Select-Object -First 1
+          if ($null -eq $infverif) { throw "InfVerif was not found in pinned WDK package $packageRoot" }
+          & $infverif.FullName /w drivers/windows/wfp/tachyon-wfp.inf
+          if ($LASTEXITCODE -ne 0) { throw "InfVerif failed with exit code $LASTEXITCODE" }

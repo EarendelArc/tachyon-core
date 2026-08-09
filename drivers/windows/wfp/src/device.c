@@ -102,8 +102,8 @@ VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFIL
 VOID TgEvtFileCleanup(_In_ WDFFILEOBJECT file_object)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(WdfFileObjectGetDevice(file_object));
-    TgFlushAll(context, TRUE);
     InterlockedExchange(&context->client_open, 0);
+    TgClearPolicy(context);
 }
 
 VOID TgEvtIoDeviceControl(_In_ WDFQUEUE queue, _In_ WDFREQUEST request, _In_ SIZE_T output_size,
@@ -153,8 +153,9 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
     TACHYON_WFP_NEGOTIATE_REQUEST* input;
     TACHYON_WFP_NEGOTIATE_RESPONSE* output;
     NTSTATUS status;
-    static const UCHAR build_id[16] = {0x4f,0xbb,0x3a,0xa7,0x69,0x1d,0x41,0x02,0xa5,0x52,0x17,0x84,0x64,0x20,0x00,0x02};
-    static const UCHAR service_sid_hash[32] = {0x12,0xed,0x2d,0xe9,0xb9,0xc9,0xfa,0xe9,0x9c,0xd7,0xcd,0xb3,0xd5,0x57,0x8a,0x60,0xa8,0xf1,0xef,0xbc,0xa3,0xe5,0xcb,0x99,0xc9,0x21,0x48,0x17,0xc0,0xeb,0x27,0xdc};
+    static const UCHAR build_id[16] = TACHYON_WFP_DRIVER_BUILD_ID_INIT;
+    static const UCHAR helper_build_id[16] = TACHYON_WFP_HELPER_BUILD_ID_INIT;
+    static const UCHAR service_sid_hash[32] = TACHYON_WFP_HELPER_SERVICE_SID_SHA256_INIT;
 
     if (input_size != TACHYON_WFP_NEGOTIATE_REQUEST_SIZE || output_size < TACHYON_WFP_NEGOTIATE_RESPONSE_SIZE) {
         return STATUS_INFO_LENGTH_MISMATCH;
@@ -163,7 +164,8 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
     if (!NT_SUCCESS(status) || !TgValidateHeader(&input->header, input_size, TachyonWfpMessageNegotiateRequest)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (input->header.flags != 0 || (input->required_capabilities & ~TACHYON_WFP_REQUIRED_CAPABILITIES) != 0 ||
+    if (input->header.flags != 0 || RtlCompareMemory(input->helper_build_id, helper_build_id, sizeof(helper_build_id)) != sizeof(helper_build_id) ||
+        (input->required_capabilities & ~TACHYON_WFP_REQUIRED_CAPABILITIES) != 0 ||
         input->required_capabilities != TACHYON_WFP_REQUIRED_CAPABILITIES ||
         input->requested_queue_capacity == 0 || input->requested_queue_capacity > TACHYON_WFP_DEFAULT_QUEUE_CAPACITY ||
         input->requested_timeout_ms < 25 || input->requested_timeout_ms > 1000) {

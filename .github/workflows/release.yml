@@ -61,6 +61,40 @@ jobs:
       - name: Test
         run: go test ./...
 
+  release-policy:
+    name: Release policy and reproducibility
+    needs: verify_tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
+
+      - name: Verify release policy
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          bash -n .github/scripts/verify-release-tag.sh
+          bash -n .github/scripts/prepare-release.sh
+          bash -n .github/scripts/publish-release.sh
+          bash -n .github/scripts/test-release-policy.sh
+          bash .github/scripts/test-release-policy.sh
+
+      - name: Verify two-run thirteen-asset reproducibility
+        timeout-minutes: 2
+        run: python3 .github/scripts/test-reproducible-release.py
+
+  linux-lifecycle:
+    name: Linux installer lifecycle evidence
+    needs: verify_tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ needs.verify_tag.outputs.commit }}
+
       - name: Verify Docker installer process lifecycle
         timeout-minutes: 3
         shell: bash
@@ -145,7 +179,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
-    needs: [verify_tag, test, test-windows]
+    needs: [verify_tag, release-policy, linux-lifecycle, test, test-windows]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -257,9 +291,31 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  prepublish-gate:
+    name: Confirm all release gates
+    if: ${{ always() }}
+    needs: [verify_tag, release-policy, linux-lifecycle, test, test-windows, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every release gate
+        env:
+          VERIFY_TAG_RESULT: ${{ needs.verify_tag.result }}
+          RELEASE_POLICY_RESULT: ${{ needs.release-policy.result }}
+          LINUX_LIFECYCLE_RESULT: ${{ needs.linux-lifecycle.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          WINDOWS_RESULT: ${{ needs.test-windows.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          test "${VERIFY_TAG_RESULT}" = success
+          test "${RELEASE_POLICY_RESULT}" = success
+          test "${LINUX_LIFECYCLE_RESULT}" = success
+          test "${TEST_RESULT}" = success
+          test "${WINDOWS_RESULT}" = success
+          test "${BUILD_RESULT}" = success
+
   release:
     name: Publish GitHub Release
-    needs: [verify_tag, build]
+    needs: [verify_tag, build, prepublish-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

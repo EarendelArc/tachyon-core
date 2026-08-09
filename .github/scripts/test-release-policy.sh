@@ -9,6 +9,7 @@ verify_script="${repo_root}/.github/scripts/verify-release-tag.sh"
 prepare_script="${repo_root}/.github/scripts/prepare-release.sh"
 publish_script="${repo_root}/.github/scripts/publish-release.sh"
 workflow="${repo_root}/.github/workflows/release.yml"
+archive_script="${repo_root}/.github/scripts/deterministic_archive.py"
 testdata="${repo_root}/.github/testdata/release-metadata"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -362,7 +363,40 @@ grep -Fq 'validate-published-release.py' "${repo_root}/.github/scripts/verify-pu
 if grep -Eq 'FIXTURE|fixture|TACHYON_RELEASE_JSON' "${repo_root}/.github/scripts/verify-published-release.sh"; then
   fail "production published release verification contains a fixture bypass"
 fi
-grep -Fq 'zip -X -9' "${workflow}" || fail "release ZIP metadata is not normalized"
+for required in \
+  'python3 .github/scripts/deterministic_archive.py' \
+  '--format zip' \
+  '--source-directory build' \
+  '--output "${asset}"' \
+  '--source-date-epoch "${SOURCE_DATE_EPOCH}"' \
+  '--executable "${executable}"' \
+  '--executable "tachyonctl${executable#tachyon-core}"'; do
+  grep -Fq -- "${required}" "${workflow}" || fail "release workflow is missing deterministic archive invocation: ${required}"
+done
+for required in \
+  'format=tarfile.PAX_FORMAT' \
+  'pax_headers={}' \
+  'ARCHIVE_UID = 0' \
+  'ARCHIVE_GID = 0' \
+  'ARCHIVE_UNAME = "root"' \
+  'ARCHIVE_GNAME = "root"' \
+  'FILE_MODE = 0o644' \
+  'EXECUTABLE_MODE = 0o755' \
+  'filename=""' \
+  'compresslevel=0' \
+  'mtime=source_date_epoch' \
+  'sorted(entries, key=_sort_key)' \
+  'compression=zipfile.ZIP_STORED' \
+  'info.create_system = 3' \
+  'info.extra = b""' \
+  'info.comment = b""' \
+  'archive.comment = b""' \
+  'archive input must not be a symbolic link'; do
+  grep -Fq -- "${required}" "${archive_script}" || fail "deterministic archive contract is missing: ${required}"
+done
+if grep -Fq 'continue-on-error:' "${workflow}"; then
+  fail "release workflow must not soften a mandatory gate with continue-on-error"
+fi
 if grep -Fq 'date -u +%Y-%m-%dT%H:%M:%SZ' "${workflow}"; then
   fail "release build still embeds wall-clock time"
 fi

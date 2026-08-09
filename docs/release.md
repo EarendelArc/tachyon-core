@@ -83,6 +83,13 @@ hide flock, signal rollback, or SIGKILL recovery evidence; the final required jo
 still fails unless every independent job, Windows test, and six-platform build is
 successful.
 
+The tag-triggered Release workflow independently reruns the complete Bash release
+policy, the two-run thirteen-asset byte reproducibility fixture, and the real Linux
+installer lifecycle fixture against the verified commit. Its `prepublish-gate`
+runs with `always()` and checks every prerequisite result explicitly. Publication
+cannot start unless tag verification, policy, lifecycle, Linux and Windows tests,
+and all six builds report `success`.
+
 The remote tag gate accepts only a real annotated tag object whose peeled commit
 matches the verified checkout. A correctly targeted lightweight tag is still rejected.
 

@@ -68,6 +68,11 @@ CI 将 release policy、Linux 安装器生命周期证据、普通 Go test 与 G
 因此发布策略失败不会遮蔽 flock、信号回滚或 SIGKILL 恢复证据；最终 required job 仍要求
 所有独立 job、Windows 测试及六平台构建全部成功。
 
+Tag 触发的 Release workflow 还会针对已验证 commit 独立重跑完整 Bash release policy、
+两轮十三资产逐字节可重现 fixture，以及真实 Linux 安装器生命周期 fixture。
+`prepublish-gate` 使用 `always()` 并显式检查每个前置结果；只有 tag 验证、policy、lifecycle、
+Linux/Windows 测试和六平台构建全部为 `success`，发布 job 才能启动。
+
 远端 tag 门禁只接受 peeled commit 与已验证 checkout 一致的真正 annotated tag object；
 即使 lightweight tag 正确指向目标 commit，也仍会被拒绝。
 

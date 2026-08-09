@@ -255,10 +255,98 @@ func TestReleaseRequiresWindowsRouteSecurityIntegrations(t *testing.T) {
 	}
 
 	release := workflows[1].content
-	for _, required := range []string{"test-windows:", "Test full Windows suite", "needs: [verify_tag, test, test-windows]"} {
+	for _, required := range []string{
+		"test-windows:",
+		"Test full Windows suite",
+		"needs: [verify_tag, release-policy, linux-lifecycle, test, test-windows]",
+	} {
 		if !strings.Contains(release, required) {
 			t.Fatalf("Release workflow is missing Windows route security requirement %q", required)
 		}
+	}
+}
+
+func TestReleaseRequiresPolicyReproducibilityLifecycleAndPrepublishAggregate(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	required := []string{
+		"release-policy:",
+		"name: Release policy and reproducibility",
+		"bash .github/scripts/test-release-policy.sh",
+		"name: Verify two-run thirteen-asset reproducibility",
+		"python3 .github/scripts/test-reproducible-release.py",
+		"linux-lifecycle:",
+		"name: Linux installer lifecycle evidence",
+		"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh",
+		"prepublish-gate:",
+		"if: ${{ always() }}",
+		"needs: [verify_tag, release-policy, linux-lifecycle, test, test-windows, build]",
+		"RELEASE_POLICY_RESULT: ${{ needs.release-policy.result }}",
+		"LINUX_LIFECYCLE_RESULT: ${{ needs.linux-lifecycle.result }}",
+		`test "${RELEASE_POLICY_RESULT}" = success`,
+		`test "${LINUX_LIFECYCLE_RESULT}" = success`,
+		"needs: [verify_tag, build, prepublish-gate]",
+	}
+	for _, text := range required {
+		if !strings.Contains(workflow, text) {
+			t.Fatalf("Release workflow is missing mandatory gate contract %q", text)
+		}
+	}
+	for text, want := range map[string]int{
+		"bash .github/scripts/test-release-policy.sh":                                                 1,
+		"python3 .github/scripts/test-reproducible-release.py":                                        1,
+		"timeout --signal=TERM --kill-after=10s 150s bash scripts/test-docker-installer-lifecycle.sh": 1,
+	} {
+		if count := strings.Count(workflow, text); count != want {
+			t.Fatalf("Release workflow contains mandatory command %q %d times, want %d", text, count, want)
+		}
+	}
+
+	archive := readRepoFile(t, ".github", "scripts", "deterministic_archive.py")
+	for _, text := range []string{
+		"format=tarfile.PAX_FORMAT",
+		"pax_headers={}",
+		"ARCHIVE_UID = 0",
+		"ARCHIVE_GID = 0",
+		`ARCHIVE_UNAME = "root"`,
+		`ARCHIVE_GNAME = "root"`,
+		"FILE_MODE = 0o644",
+		"EXECUTABLE_MODE = 0o755",
+		`filename=""`,
+		"compresslevel=0",
+		"mtime=source_date_epoch",
+		"sorted(entries, key=_sort_key)",
+		"compression=zipfile.ZIP_STORED",
+		"info.create_system = 3",
+		`info.extra = b""`,
+		`info.comment = b""`,
+		`archive.comment = b""`,
+		"archive input must not be a symbolic link",
+	} {
+		if !strings.Contains(archive, text) {
+			t.Fatalf("deterministic archive production contract is missing %q", text)
+		}
+	}
+	if strings.Contains(workflow, "zip -X -9") {
+		t.Fatal("Release workflow regressed to host ZIP tooling")
+	}
+	if strings.Contains(workflow, "continue-on-error:") {
+		t.Fatal("Release workflow softens a mandatory gate with continue-on-error")
+	}
+
+	bashPolicy := readRepoFile(t, ".github", "scripts", "test-release-policy.sh")
+	for _, text := range []string{
+		"release workflow is missing deterministic archive invocation",
+		"deterministic archive contract is missing",
+		"compression=zipfile.ZIP_STORED",
+		"archive input must not be a symbolic link",
+		"must not soften a mandatory gate with continue-on-error",
+	} {
+		if !strings.Contains(bashPolicy, text) {
+			t.Fatalf("Bash release policy contract is missing %q", text)
+		}
+	}
+	if strings.Contains(bashPolicy, "grep -Fq 'zip -X -9'") {
+		t.Fatal("Bash release policy still asserts the retired host ZIP command")
 	}
 }
 

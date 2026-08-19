@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"math/rand"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -178,6 +179,147 @@ func TestWFPPerHandleNegotiationModel(t *testing.T) {
 	}
 	if !first.authorize("NEGOTIATE") || !first.authorize("SET_POLICY") || second.authorize("DEQUEUE") {
 		t.Fatal("negotiation state leaked across file handles")
+	}
+}
+
+type modelSessionGenerationGate struct {
+	mu          sync.Mutex
+	condition   *sync.Cond
+	next        uint64
+	active      uint64
+	ownerOpen   bool
+	outstanding int
+}
+
+type modelGenerationSession struct {
+	gate       *modelSessionGenerationGate
+	generation uint64
+	negotiated bool
+	closing    bool
+}
+
+func newModelSessionGenerationGate() *modelSessionGenerationGate {
+	gate := &modelSessionGenerationGate{}
+	gate.condition = sync.NewCond(&gate.mu)
+	return gate
+}
+
+func (gate *modelSessionGenerationGate) open() *modelGenerationSession {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.ownerOpen {
+		return nil
+	}
+	gate.next++
+	gate.ownerOpen = true
+	return &modelGenerationSession{gate: gate, generation: gate.next}
+}
+
+func (session *modelGenerationSession) negotiate() bool {
+	gate := session.gate
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if session.closing || !gate.ownerOpen {
+		return false
+	}
+	session.negotiated = true
+	gate.active = session.generation
+	return true
+}
+
+func (session *modelGenerationSession) acquire() bool {
+	gate := session.gate
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if session.closing || !session.negotiated || gate.active != session.generation {
+		return false
+	}
+	gate.outstanding++
+	return true
+}
+
+func (session *modelGenerationSession) commit() bool {
+	gate := session.gate
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return !session.closing && session.negotiated && gate.active == session.generation
+}
+
+func (session *modelGenerationSession) release() {
+	gate := session.gate
+	gate.mu.Lock()
+	gate.outstanding--
+	gate.condition.Broadcast()
+	gate.mu.Unlock()
+}
+
+func (session *modelGenerationSession) cleanup(revoked chan<- struct{}) {
+	gate := session.gate
+	gate.mu.Lock()
+	session.closing = true
+	session.negotiated = false
+	if gate.active == session.generation {
+		gate.active = 0
+	}
+	close(revoked)
+	for gate.outstanding != 0 {
+		gate.condition.Wait()
+	}
+	gate.ownerOpen = false
+	gate.mu.Unlock()
+}
+
+func TestWFPCleanupRevokesBeforeDrainAndIsolatesSuccessor(t *testing.T) {
+	gate := newModelSessionGenerationGate()
+	first := gate.open()
+	if first == nil || !first.negotiate() || !first.acquire() {
+		t.Fatal("failed to establish first modeled session")
+	}
+	revoked := make(chan struct{})
+	cleaned := make(chan struct{})
+	go func() {
+		first.cleanup(revoked)
+		close(cleaned)
+	}()
+	<-revoked
+	if first.commit() {
+		t.Fatal("revoked session committed while cleanup waited for its rundown reference")
+	}
+	if successor := gate.open(); successor != nil {
+		t.Fatal("successor opened before the revoked session drained")
+	}
+	select {
+	case <-cleaned:
+		t.Fatal("cleanup did not wait for the outstanding operation")
+	default:
+	}
+	first.release()
+	<-cleaned
+	second := gate.open()
+	if second == nil || second.generation == first.generation || !second.negotiate() || !second.acquire() || !second.commit() {
+		t.Fatal("successor did not receive an isolated active generation")
+	}
+	second.release()
+	if first.acquire() {
+		t.Fatal("old pending I/O reacquired the successor session")
+	}
+}
+
+type modelPrivateStatistics struct {
+	captured, permitted, dropped, injected int64
+	selfInjected, queueOverflow            int64
+	verdictTimeout, rejectedFrames         int64
+}
+
+func TestWFPPrivateStatisticsModelRequiresEightByteAlignment(t *testing.T) {
+	typeInfo := reflect.TypeOf(modelPrivateStatistics{})
+	if typeInfo.Align() < 8 {
+		t.Fatalf("private statistics alignment = %d", typeInfo.Align())
+	}
+	for index := 0; index < typeInfo.NumField(); index++ {
+		if field := typeInfo.Field(index); field.Offset%8 != 0 {
+			t.Fatalf("counter %s offset = %d", field.Name, field.Offset)
+		}
 	}
 }
 

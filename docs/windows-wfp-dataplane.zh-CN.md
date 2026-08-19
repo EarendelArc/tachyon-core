@@ -34,6 +34,10 @@ SID 的散列。
 协商状态按 file handle 隔离，并作为 policy、dequeue、verdict 与 statistics
 操作的门禁。verdict deadline 使用单调 interrupt time；策略热替换会 fail-open
 清空被替换 generation 的 pending packet。
+每个已协商 file 都持有唯一 session generation 与 rundown reference。cleanup
+先撤销 generation，再等待同步操作并取消排队的 dequeue；策略清理结束前不会
+接纳继任会话。内核私有 statistics counter 显式按 8 字节对齐，packed ABI
+statistics 只作为普通输出快照写入，不作为 Interlocked 目标。
 
 ## Helper 事务
 

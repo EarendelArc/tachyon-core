@@ -29,8 +29,28 @@ typedef enum TG_PACKET_STATE {
 typedef struct TG_DEVICE_CONTEXT TG_DEVICE_CONTEXT;
 
 typedef struct TG_FILE_CONTEXT {
+    EX_RUNDOWN_REF io_rundown;
     volatile LONG negotiated;
+    volatile LONG closing;
+    UINT64 generation;
 } TG_FILE_CONTEXT;
+
+typedef struct TG_SESSION_TOKEN {
+    TG_FILE_CONTEXT* file_context;
+    WDFFILEOBJECT file_object;
+    UINT64 generation;
+} TG_SESSION_TOKEN;
+
+typedef struct DECLSPEC_ALIGN(8) TG_STATISTICS_COUNTERS {
+    volatile LONG64 captured;
+    volatile LONG64 permitted;
+    volatile LONG64 dropped;
+    volatile LONG64 injected;
+    volatile LONG64 self_injected;
+    volatile LONG64 queue_overflow;
+    volatile LONG64 verdict_timeout;
+    volatile LONG64 rejected_frames;
+} TG_STATISTICS_COUNTERS;
 
 typedef struct TG_POLICY {
     UINT64 generation;
@@ -121,8 +141,26 @@ struct TG_DEVICE_CONTEXT {
     volatile LONG client_open;
     volatile LONG stopping;
     volatile LONG stopped;
-    TACHYON_WFP_STATISTICS statistics;
+    UINT64 next_session_generation;
+    volatile LONG64 active_session_generation;
+    WDFFILEOBJECT session_file;
+    TG_STATISTICS_COUNTERS statistics;
 };
+
+#if defined(_AMD64_) || defined(_M_AMD64) || defined(_ARM64_) || defined(_M_ARM64)
+_Static_assert(__alignof(TG_STATISTICS_COUNTERS) >= 8, "private statistics alignment");
+_Static_assert(__alignof(TG_DEVICE_CONTEXT) >= 8, "device context alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, captured) & 7) == 0, "captured counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, permitted) & 7) == 0, "permitted counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, dropped) & 7) == 0, "dropped counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, injected) & 7) == 0, "injected counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, self_injected) & 7) == 0, "self-injected counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, queue_overflow) & 7) == 0, "overflow counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, verdict_timeout) & 7) == 0, "timeout counter alignment");
+_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, rejected_frames) & 7) == 0, "rejected counter alignment");
+_Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, active_session_generation) & 7) == 0, "active session alignment");
+_Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics) & 7) == 0, "embedded statistics alignment");
+#endif
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_DEVICE_CONTEXT, TgGetDeviceContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_FILE_CONTEXT, TgGetFileContext)
@@ -149,11 +187,19 @@ NTSTATUS NTAPI TgNotify(FWPS_CALLOUT_NOTIFY_TYPE, const GUID*, const FWPS_FILTER
 VOID NTAPI TgFlowDelete(UINT16 layer_id, UINT32 callout_id, UINT64 flow_context);
 
 BOOLEAN TgValidateHeader(const TACHYON_WFP_MESSAGE_HEADER* header, SIZE_T actual, UINT16 kind);
-NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
-NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
+BOOLEAN TgAcquireRequestSession(TG_DEVICE_CONTEXT* context, WDFREQUEST request, BOOLEAN require_negotiated,
+                                TG_SESSION_TOKEN* token);
+VOID TgReleaseRequestSession(TG_SESSION_TOKEN* token);
+BOOLEAN TgSessionIsActiveLocked(const TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* token);
+NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                     const VOID* input, SIZE_T input_size);
+NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                         const VOID* input, SIZE_T input_size);
 VOID TgClearPolicy(TG_DEVICE_CONTEXT* context);
-NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
-NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size);
+NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                        const VOID* input, SIZE_T input_size);
+NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                           WDFREQUEST request, SIZE_T output_size);
 VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct);
 VOID TgFlushGeneration(TG_DEVICE_CONTEXT* context, UINT64 generation, BOOLEAN permit_direct);
 VOID TgServiceCaptureWaiter(TG_DEVICE_CONTEXT* context);

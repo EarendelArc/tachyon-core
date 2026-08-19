@@ -92,7 +92,7 @@ func TestWFPHandleNegotiationAndTimerAreOrderIndependent(t *testing.T) {
 	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
 	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))
 	driver := readWFPDriverSource(t, filepath.Join("src", "driver.c"))
-	for _, required := range []string{"TG_FILE_CONTEXT", "TgGetFileContext", "TgIoctlRequiresNegotiation", "TgRequestIsNegotiated",
+	for _, required := range []string{"TG_FILE_CONTEXT", "TgGetFileContext", "TgIoctlRequiresNegotiation", "TgAcquireRequestSession",
 		"IOCTL_TACHYON_WFP_SET_POLICY", "IOCTL_TACHYON_WFP_DEQUEUE", "IOCTL_TACHYON_WFP_VERDICT"} {
 		if !strings.Contains(header+device, required) {
 			t.Fatalf("per-handle negotiation contract missing %q", required)
@@ -101,6 +101,86 @@ func TestWFPHandleNegotiationAndTimerAreOrderIndependent(t *testing.T) {
 	if strings.Contains(cFunctionBody(t, device, "static NTSTATUS TgNegotiate("), "WdfTimerStart") ||
 		!strings.Contains(driver, "WdfTimerStart") {
 		t.Fatal("timeout timer lifetime still depends on negotiation IOCTL ordering")
+	}
+}
+
+func TestWFPFileCleanupRevokesAndDrainsOneSession(t *testing.T) {
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))
+	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))
+	cleanup := cFunctionBody(t, device, "VOID TgEvtFileCleanup(")
+	revoke := strings.Index(cleanup, "active_session_generation, 0")
+	wait := strings.Index(cleanup, "ExWaitForRundownProtectionRelease")
+	clear := strings.Index(cleanup, "TgClearPolicy")
+	reopen := strings.Index(cleanup, "client_open = 0")
+	if revoke < 0 || wait < 0 || clear < 0 || reopen < 0 || !(revoke < wait && wait < clear && clear < reopen) {
+		t.Fatal("cleanup does not revoke, drain, clear, then admit a successor")
+	}
+	for _, required := range []string{"EX_RUNDOWN_REF io_rundown", "UINT64 generation", "session_file",
+		"ExAcquireRundownProtection", "ExReleaseRundownProtection", "TgSessionIsActiveLocked"} {
+		if !strings.Contains(header+device, required) {
+			t.Fatalf("session lifetime contract missing %q", required)
+		}
+	}
+	for _, signature := range []string{"NTSTATUS TgSetPolicy(", "NTSTATUS TgDisablePolicy(",
+		"NTSTATUS TgCopyNextCapture(", "NTSTATUS TgApplyVerdict("} {
+		if !strings.Contains(cFunctionBody(t, queue, signature), "TgSessionIsActiveLocked") {
+			t.Fatalf("%s does not revalidate the active session at its commit point", signature)
+		}
+	}
+	copyBody := cFunctionBody(t, queue, "NTSTATUS TgCopyNextCapture(")
+	forward := strings.Index(copyBody, "WdfRequestForwardToIoQueue")
+	if forward < 0 {
+		t.Fatal("DEQUEUE does not forward an empty capture request")
+	}
+	packetEmpty := strings.LastIndex(copyBody[:forward], "if (packet == NULL)")
+	if packetEmpty < 0 ||
+		strings.Contains(copyBody[packetEmpty:forward], "WdfSpinLockRelease") ||
+		!strings.Contains(copyBody[forward:], "WdfSpinLockRelease(context->lock)") {
+		t.Fatal("DEQUEUE forward is not serialized with cleanup revocation")
+	}
+	dispatch := cFunctionBody(t, device, "VOID TgEvtIoDeviceControl(")
+	pending := strings.Index(dispatch, "if (status == STATUS_PENDING)")
+	if pending < 0 || !strings.Contains(dispatch[pending:], "TgReleaseRequestSession(&session)") {
+		t.Fatal("pending DEQUEUE holds rundown across its manual-queue lifetime")
+	}
+	service := cFunctionBody(t, queue, "VOID TgServiceCaptureWaiter(")
+	if !strings.Contains(service, "TgAcquireRequestSession(context, request, TRUE, &session)") {
+		t.Fatal("a serviced pending DEQUEUE does not reacquire and revalidate its session")
+	}
+}
+
+func TestWFPStatisticsAtomicsUseAlignedPrivateStorage(t *testing.T) {
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))
+	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))
+	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
+	for _, required := range []string{"DECLSPEC_ALIGN(8) TG_STATISTICS_COUNTERS", "defined(_AMD64_)",
+		"defined(_ARM64_)", "_Static_assert(__alignof(TG_STATISTICS_COUNTERS) >= 8",
+		"FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics)"} {
+		if !strings.Contains(header, required) {
+			t.Fatalf("private statistics alignment contract missing %q", required)
+		}
+	}
+	if strings.Contains(header, "TACHYON_WFP_STATISTICS statistics;") {
+		t.Fatal("packed ABI statistics remain embedded as atomic storage")
+	}
+	allSource := device + queue + wfp
+	if strings.Contains(allSource, "(volatile LONG64*)&context->statistics") ||
+		strings.Contains(allSource, "InterlockedIncrement64(&output->") {
+		t.Fatal("an Interlocked operation still targets packed ABI storage")
+	}
+	for _, required := range []string{"RtlZeroMemory(output, sizeof(*output))",
+		"output->captured = (UINT64)InterlockedCompareExchange64(&context->statistics.captured"} {
+		if !strings.Contains(device, required) {
+			t.Fatalf("statistics snapshot contract missing %q", required)
+		}
+	}
+	readStatistics := cFunctionBody(t, device, "static NTSTATUS TgReadStatistics(")
+	validate := strings.Index(readStatistics, "TgSessionIsActiveLocked")
+	write := strings.Index(readStatistics, "RtlZeroMemory(output")
+	if validate < 0 || write < 0 || validate > write {
+		t.Fatal("statistics output is written before the active session is revalidated")
 	}
 }
 

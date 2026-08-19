@@ -445,7 +445,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     classify_out->actionType = FWP_ACTION_PERMIT;
     if (context == NULL || flow == NULL || nbl == NULL || metadata == NULL || values == NULL ||
         InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
-        InterlockedCompareExchange(&context->client_open, 0, 0) == 0 ||
+        InterlockedCompareExchange64(&context->active_session_generation, 0, 0) == 0 ||
         (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE) == 0 ||
         !TgFlowTryReference(flow)) goto Exit;
     flow_referenced = TRUE;
@@ -453,7 +453,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     injection_state = FwpsQueryPacketInjectionState0(family == AF_INET ? context->injection_v4 : context->injection_v6,
                                                       nbl, &injection_context);
     if (injection_state == FWPS_PACKET_INJECTED_BY_SELF || injection_state == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) {
-        InterlockedIncrement64((volatile LONG64*)&context->statistics.self_injected);
+        InterlockedIncrement64(&context->statistics.self_injected);
         goto Exit;
     }
     direction_index = family == AF_INET ? FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION : FWPS_FIELD_DATAGRAM_DATA_V6_DIRECTION;
@@ -539,7 +539,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
         context->pending_bytes > context->resident_byte_capacity - record_size) {
         if (context->pending_count >= context->queue_capacity || record_size > context->resident_byte_capacity ||
             context->pending_bytes > context->resident_byte_capacity - record_size) {
-            ++context->statistics.queue_overflow;
+            InterlockedIncrement64(&context->statistics.queue_overflow);
         }
         WdfSpinLockRelease(context->lock);
         goto Exit;
@@ -580,7 +580,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     context->queue_bytes += record_size;
     ++context->pending_count;
     context->pending_bytes += record_size;
-    ++context->statistics.captured;
+    InterlockedIncrement64(&context->statistics.captured);
     WdfSpinLockRelease(context->lock);
     classify_out->actionType = FWP_ACTION_BLOCK;
     classify_out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
@@ -643,14 +643,14 @@ VOID TgCompletePacket(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UIN
                                                packet->address_family, packet->compartment_id,
                                                packet->clone, TgInjectComplete, packet);
         if (NT_SUCCESS(status)) {
-            InterlockedIncrement64((volatile LONG64*)&context->statistics.permitted);
+            InterlockedIncrement64(&context->statistics.permitted);
             return;
         }
         if (InterlockedDecrement(&context->injection_count) == 0) KeSetEvent(&context->injections_drained, IO_NO_INCREMENT, FALSE);
-        InterlockedIncrement64((volatile LONG64*)&context->statistics.dropped);
+        InterlockedIncrement64(&context->statistics.dropped);
     }
-    if (action == TachyonWfpVerdictDrop) InterlockedIncrement64((volatile LONG64*)&context->statistics.dropped);
-    if (action == TachyonWfpVerdictTunnel) InterlockedIncrement64((volatile LONG64*)&context->statistics.injected);
+    if (action == TachyonWfpVerdictDrop) InterlockedIncrement64(&context->statistics.dropped);
+    if (action == TachyonWfpVerdictTunnel) InterlockedIncrement64(&context->statistics.injected);
     InterlockedCompareExchange(&packet->state, packet->terminal_state, TgPacketCompleting);
     TgPacketDereference(packet);
 }

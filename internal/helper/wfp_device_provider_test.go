@@ -312,8 +312,12 @@ func TestWFPDriverHeaderIsCanonicalAndRestrictsDeviceACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	cleanup := string(deviceSource)
-	closeIndex, clearIndex := strings.Index(cleanup, "InterlockedExchange(&context->client_open, 0)"), strings.Index(cleanup, "TgClearPolicy(context)")
-	if closeIndex < 0 || clearIndex < 0 || closeIndex > clearIndex {
-		t.Fatal("file cleanup does not stop capture before clearing policy")
+	revokeIndex := strings.Index(cleanup, "InterlockedExchange64(&context->active_session_generation, 0)")
+	waitIndex := strings.Index(cleanup, "ExWaitForRundownProtectionRelease(&file_context->io_rundown)")
+	clearIndex := strings.Index(cleanup, "TgClearPolicy(context)")
+	reopenIndex := strings.Index(cleanup, "context->client_open = 0")
+	if revokeIndex < 0 || waitIndex < 0 || clearIndex < 0 || reopenIndex < 0 ||
+		!(revokeIndex < waitIndex && waitIndex < clearIndex && clearIndex < reopenIndex) {
+		t.Fatal("file cleanup must revoke, drain, clear, then admit a successor")
 	}
 }

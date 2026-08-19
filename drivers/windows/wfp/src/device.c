@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tachyon_wfp.h"
 
-static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T input_size, SIZE_T output_size);
-static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size);
+static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                            WDFREQUEST request, SIZE_T input_size, SIZE_T output_size);
+static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                                 WDFREQUEST request, SIZE_T output_size);
 static BOOLEAN TgIoctlRequiresNegotiation(ULONG ioctl);
-static BOOLEAN TgRequestIsNegotiated(WDFREQUEST request);
 
 NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_out)
 {
@@ -58,12 +59,6 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
     InitializeListHead(&context->capture_queue);
     InitializeListHead(&context->pending_packets);
     InitializeListHead(&context->flows);
-    context->statistics.header.magic = TACHYON_WFP_ABI_MAGIC;
-    context->statistics.header.header_size = TACHYON_WFP_HEADER_SIZE;
-    context->statistics.header.abi_major = TACHYON_WFP_ABI_MAJOR;
-    context->statistics.header.abi_minor = TACHYON_WFP_ABI_MINOR;
-    context->statistics.header.kind = TachyonWfpMessageStatistics;
-    context->statistics.header.total_size = TACHYON_WFP_STATISTICS_SIZE;
     status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &context->lock);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -94,9 +89,22 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
 VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFILEOBJECT file_object)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(device);
-    InterlockedExchange(&TgGetFileContext(file_object)->negotiated, 0);
-    if (InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
-        InterlockedCompareExchange(&context->client_open, 1, 0) != 0) {
+    TG_FILE_CONTEXT* file_context = TgGetFileContext(file_object);
+    BOOLEAN accepted = FALSE;
+    RtlZeroMemory(file_context, sizeof(*file_context));
+    ExInitializeRundownProtection(&file_context->io_rundown);
+    WdfSpinLockAcquire(context->lock);
+    if (InterlockedCompareExchange(&context->stopping, 0, 0) == 0 && context->client_open == 0) {
+        ++context->next_session_generation;
+        if (context->next_session_generation == 0) ++context->next_session_generation;
+        file_context->generation = context->next_session_generation;
+        context->session_file = file_object;
+        InterlockedExchange64(&context->active_session_generation, 0);
+        context->client_open = 1;
+        accepted = TRUE;
+    }
+    WdfSpinLockRelease(context->lock);
+    if (!accepted) {
         WdfRequestComplete(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -106,25 +114,39 @@ VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFIL
 VOID TgEvtFileCleanup(_In_ WDFFILEOBJECT file_object)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(WdfFileObjectGetDevice(file_object));
-    InterlockedExchange(&TgGetFileContext(file_object)->negotiated, 0);
-    InterlockedExchange(&context->client_open, 0);
+    TG_FILE_CONTEXT* file_context = TgGetFileContext(file_object);
+    InterlockedExchange(&file_context->closing, 1);
+    InterlockedExchange(&file_context->negotiated, 0);
+    WdfSpinLockAcquire(context->lock);
+    if (context->session_file == file_object) {
+        InterlockedExchange64(&context->active_session_generation, 0);
+    }
+    WdfSpinLockRelease(context->lock);
+    ExWaitForRundownProtectionRelease(&file_context->io_rundown);
     TgClearPolicy(context);
+    WdfSpinLockAcquire(context->lock);
+    if (context->session_file == file_object) {
+        context->session_file = NULL;
+        context->client_open = 0;
+    }
+    WdfSpinLockRelease(context->lock);
 }
 
 VOID TgEvtIoDeviceControl(_In_ WDFQUEUE queue, _In_ WDFREQUEST request, _In_ SIZE_T output_size,
                           _In_ SIZE_T input_size, _In_ ULONG ioctl)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(WdfIoQueueGetDevice(queue));
+    TG_SESSION_TOKEN session;
     VOID* input = NULL;
     NTSTATUS status;
 
-    if (TgIoctlRequiresNegotiation(ioctl) && !TgRequestIsNegotiated(request)) {
+    if (!TgAcquireRequestSession(context, request, TgIoctlRequiresNegotiation(ioctl), &session)) {
         WdfRequestComplete(request, STATUS_INVALID_DEVICE_STATE);
         return;
     }
     switch (ioctl) {
     case IOCTL_TACHYON_WFP_NEGOTIATE:
-        status = TgNegotiate(context, request, input_size, output_size);
+        status = TgNegotiate(context, &session, request, input_size, output_size);
         break;
     case IOCTL_TACHYON_WFP_SET_POLICY:
     case IOCTL_TACHYON_WFP_DISABLE_POLICY:
@@ -134,35 +156,36 @@ VOID TgEvtIoDeviceControl(_In_ WDFQUEUE queue, _In_ WDFREQUEST request, _In_ SIZ
             break;
         }
         if (ioctl == IOCTL_TACHYON_WFP_SET_POLICY) {
-            status = TgSetPolicy(context, input, input_size);
+            status = TgSetPolicy(context, &session, input, input_size);
         } else if (ioctl == IOCTL_TACHYON_WFP_DISABLE_POLICY) {
-            status = TgDisablePolicy(context, input, input_size);
+            status = TgDisablePolicy(context, &session, input, input_size);
         } else {
-            status = TgApplyVerdict(context, input, input_size);
+            status = TgApplyVerdict(context, &session, input, input_size);
         }
         break;
     case IOCTL_TACHYON_WFP_DEQUEUE:
-        status = TgCopyNextCapture(context, request, output_size);
+        status = TgCopyNextCapture(context, &session, request, output_size);
         if (status == STATUS_PENDING) {
+            TgReleaseRequestSession(&session);
             return;
         }
         break;
     case IOCTL_TACHYON_WFP_STATISTICS:
-        status = TgReadStatistics(context, request, output_size);
+        status = TgReadStatistics(context, &session, request, output_size);
         break;
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }
+    TgReleaseRequestSession(&session);
     WdfRequestComplete(request, status);
 }
 
-static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T input_size, SIZE_T output_size)
+static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                            WDFREQUEST request, SIZE_T input_size, SIZE_T output_size)
 {
     TACHYON_WFP_NEGOTIATE_REQUEST* input;
     TACHYON_WFP_NEGOTIATE_RESPONSE* output;
-    WDFFILEOBJECT file_object;
-    TG_FILE_CONTEXT* file_context;
     NTSTATUS status;
     static const UCHAR build_id[16] = TACHYON_WFP_DRIVER_BUILD_ID_INIT;
     static const UCHAR helper_build_id[16] = TACHYON_WFP_HELPER_BUILD_ID_INIT;
@@ -182,17 +205,12 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
         input->requested_timeout_ms < 25 || input->requested_timeout_ms > 1000) {
         return STATUS_REVISION_MISMATCH;
     }
-    file_object = WdfRequestGetFileObject(request);
-    if (file_object == NULL) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-    file_context = TgGetFileContext(file_object);
-    if (InterlockedCompareExchange(&file_context->negotiated, -1, 0) != 0) {
+    if (InterlockedCompareExchange(&session->file_context->negotiated, -1, 0) != 0) {
         return STATUS_INVALID_DEVICE_STATE;
     }
     status = WdfRequestRetrieveOutputBuffer(request, sizeof(*output), (VOID**)&output, NULL);
     if (!NT_SUCCESS(status)) {
-        InterlockedExchange(&file_context->negotiated, 0);
+        InterlockedExchange(&session->file_context->negotiated, 0);
         return status;
     }
     RtlZeroMemory(output, sizeof(*output));
@@ -211,11 +229,19 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
     output->fail_policy = TachyonWfpFailOpenDirect;
     RtlCopyMemory(output->service_sid_hash, service_sid_hash, sizeof(service_sid_hash));
     WdfSpinLockAcquire(context->lock);
+    if (context->session_file != session->file_object || context->client_open == 0 ||
+        session->file_context->generation != session->generation ||
+        InterlockedCompareExchange(&session->file_context->closing, 0, 0) != 0) {
+        WdfSpinLockRelease(context->lock);
+        InterlockedExchange(&session->file_context->negotiated, 0);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     context->queue_capacity = input->requested_queue_capacity;
     context->verdict_timeout_ms = input->requested_timeout_ms;
+    InterlockedExchange(&session->file_context->negotiated, 1);
+    InterlockedExchange64(&context->active_session_generation, (LONG64)session->generation);
     WdfSpinLockRelease(context->lock);
     WdfRequestSetInformation(request, sizeof(*output));
-    InterlockedExchange(&file_context->negotiated, 1);
     return STATUS_SUCCESS;
 }
 
@@ -233,13 +259,49 @@ static BOOLEAN TgIoctlRequiresNegotiation(ULONG ioctl)
     }
 }
 
-static BOOLEAN TgRequestIsNegotiated(WDFREQUEST request)
+BOOLEAN TgAcquireRequestSession(TG_DEVICE_CONTEXT* context, WDFREQUEST request, BOOLEAN require_negotiated,
+                                TG_SESSION_TOKEN* token)
 {
     WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
-    return file_object != NULL && InterlockedCompareExchange(&TgGetFileContext(file_object)->negotiated, 0, 0) == 1;
+    TG_FILE_CONTEXT* file_context;
+    BOOLEAN valid;
+    RtlZeroMemory(token, sizeof(*token));
+    if (file_object == NULL) return FALSE;
+    file_context = TgGetFileContext(file_object);
+    if (!ExAcquireRundownProtection(&file_context->io_rundown)) return FALSE;
+    token->file_context = file_context;
+    token->file_object = file_object;
+    token->generation = file_context->generation;
+    WdfSpinLockAcquire(context->lock);
+    valid = context->client_open != 0 && context->session_file == file_object &&
+            token->generation != 0 && file_context->generation == token->generation &&
+            InterlockedCompareExchange(&file_context->closing, 0, 0) == 0 &&
+            (!require_negotiated || TgSessionIsActiveLocked(context, token));
+    WdfSpinLockRelease(context->lock);
+    if (!valid) TgReleaseRequestSession(token);
+    return valid;
 }
 
-static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size)
+VOID TgReleaseRequestSession(TG_SESSION_TOKEN* token)
+{
+    if (token->file_context != NULL) {
+        ExReleaseRundownProtection(&token->file_context->io_rundown);
+        RtlZeroMemory(token, sizeof(*token));
+    }
+}
+
+BOOLEAN TgSessionIsActiveLocked(const TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* token)
+{
+    return token != NULL && token->file_context != NULL && token->generation != 0 &&
+           context->client_open != 0 && context->session_file == token->file_object &&
+           context->active_session_generation == (LONG64)token->generation &&
+           token->file_context->generation == token->generation &&
+           InterlockedCompareExchange(&token->file_context->closing, 0, 0) == 0 &&
+           InterlockedCompareExchange(&token->file_context->negotiated, 0, 0) == 1;
+}
+
+static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                                 WDFREQUEST request, SIZE_T output_size)
 {
     TACHYON_WFP_STATISTICS* output;
     NTSTATUS status;
@@ -251,10 +313,28 @@ static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, WDFREQUEST request,
         return status;
     }
     WdfSpinLockAcquire(context->lock);
-    context->statistics.queue_depth = context->queue_depth;
-    context->statistics.pending_verdicts = context->pending_count;
-    context->statistics.header.request_id = ++context->next_request_id;
-    RtlCopyMemory(output, &context->statistics, sizeof(*output));
+    if (!TgSessionIsActiveLocked(context, session)) {
+        WdfSpinLockRelease(context->lock);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    RtlZeroMemory(output, sizeof(*output));
+    output->header.magic = TACHYON_WFP_ABI_MAGIC;
+    output->header.header_size = TACHYON_WFP_HEADER_SIZE;
+    output->header.abi_major = TACHYON_WFP_ABI_MAJOR;
+    output->header.abi_minor = TACHYON_WFP_ABI_MINOR;
+    output->header.kind = TachyonWfpMessageStatistics;
+    output->header.total_size = TACHYON_WFP_STATISTICS_SIZE;
+    output->header.request_id = ++context->next_request_id;
+    output->captured = (UINT64)InterlockedCompareExchange64(&context->statistics.captured, 0, 0);
+    output->permitted = (UINT64)InterlockedCompareExchange64(&context->statistics.permitted, 0, 0);
+    output->dropped = (UINT64)InterlockedCompareExchange64(&context->statistics.dropped, 0, 0);
+    output->injected = (UINT64)InterlockedCompareExchange64(&context->statistics.injected, 0, 0);
+    output->self_injected = (UINT64)InterlockedCompareExchange64(&context->statistics.self_injected, 0, 0);
+    output->queue_overflow = (UINT64)InterlockedCompareExchange64(&context->statistics.queue_overflow, 0, 0);
+    output->verdict_timeout = (UINT64)InterlockedCompareExchange64(&context->statistics.verdict_timeout, 0, 0);
+    output->rejected_frames = (UINT64)InterlockedCompareExchange64(&context->statistics.rejected_frames, 0, 0);
+    output->queue_depth = context->queue_depth;
+    output->pending_verdicts = context->pending_count;
     WdfSpinLockRelease(context->lock);
     WdfRequestSetInformation(request, sizeof(*output));
     return STATUS_SUCCESS;

@@ -62,7 +62,8 @@ static VOID TgReleasePendingOwnerAndComplete(TG_DEVICE_CONTEXT* context, TG_PEND
     TgCompletePacket(context, packet, action); /* consumes local completion reference */
 }
 
-NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size)
+NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                     const VOID* input, SIZE_T input_size)
 {
     const TACHYON_WFP_POLICY_HEADER* header = (const TACHYON_WFP_POLICY_HEADER*)input;
     const TACHYON_WFP_POLICY_ENTRY* entries;
@@ -108,6 +109,12 @@ NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input
     RtlCopyMemory(policy->entries, entries, entries_size);
 
     WdfSpinLockAcquire(context->lock);
+    if (!TgSessionIsActiveLocked(context, session)) {
+        WdfSpinLockRelease(context->lock);
+        RtlSecureZeroMemory(policy, allocation_size);
+        ExFreePoolWithTag(policy, TG_POOL_TAG);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     if (context->policy != NULL && header->generation <= context->policy->generation) {
         WdfSpinLockRelease(context->lock);
         RtlSecureZeroMemory(policy, allocation_size);
@@ -125,7 +132,8 @@ NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input
     return STATUS_SUCCESS;
 }
 
-NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size)
+NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                         const VOID* input, SIZE_T input_size)
 {
     const TACHYON_WFP_DISABLE_POLICY* disable = (const TACHYON_WFP_DISABLE_POLICY*)input;
     TG_POLICY* policy;
@@ -133,6 +141,10 @@ NTSTATUS TgDisablePolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T i
         return STATUS_INVALID_PARAMETER;
     }
     WdfSpinLockAcquire(context->lock);
+    if (!TgSessionIsActiveLocked(context, session)) {
+        WdfSpinLockRelease(context->lock);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     policy = context->policy;
     if (policy == NULL || disable->generation != policy->generation ||
         RtlCompareMemory(disable->lease_nonce, policy->lease_nonce, 16) != 16) {
@@ -187,12 +199,17 @@ BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
     return matched;
 }
 
-NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size)
+NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                           WDFREQUEST request, SIZE_T output_size)
 {
     TG_PENDING_PACKET* packet = NULL;
     VOID* output;
     NTSTATUS status;
     WdfSpinLockAcquire(context->lock);
+    if (!TgSessionIsActiveLocked(context, session)) {
+        WdfSpinLockRelease(context->lock);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     if (!IsListEmpty(&context->capture_queue)) {
         PLIST_ENTRY entry = RemoveHeadList(&context->capture_queue);
         packet = CONTAINING_RECORD(entry, TG_PENDING_PACKET, queue_link);
@@ -206,11 +223,12 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
             TgPacketReference(packet); /* protects copy against timeout/verdict/flush */
         }
     }
-    WdfSpinLockRelease(context->lock);
     if (packet == NULL) {
         status = WdfRequestForwardToIoQueue(request, context->dequeue_queue);
+        WdfSpinLockRelease(context->lock);
         return NT_SUCCESS(status) ? STATUS_PENDING : status;
     }
+    WdfSpinLockRelease(context->lock);
     if (output_size < packet->record_size) {
         BOOLEAN claimed;
         WdfSpinLockAcquire(context->lock);
@@ -255,16 +273,23 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_
 VOID TgServiceCaptureWaiter(TG_DEVICE_CONTEXT* context)
 {
     WDFREQUEST request;
+    TG_SESSION_TOKEN session;
     NTSTATUS status = WdfIoQueueRetrieveNextRequest(context->dequeue_queue, &request);
     if (NT_SUCCESS(status)) {
-        status = TgCopyNextCapture(context, request, (SIZE_T)TACHYON_WFP_MAX_MESSAGE_SIZE);
+        if (!TgAcquireRequestSession(context, request, TRUE, &session)) {
+            WdfRequestComplete(request, STATUS_INVALID_DEVICE_STATE);
+            return;
+        }
+        status = TgCopyNextCapture(context, &session, request, (SIZE_T)TACHYON_WFP_MAX_MESSAGE_SIZE);
+        TgReleaseRequestSession(&session);
         if (status != STATUS_PENDING) {
             WdfRequestComplete(request, status);
         }
     }
 }
 
-NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size)
+NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,
+                        const VOID* input, SIZE_T input_size)
 {
     const TACHYON_WFP_VERDICT* verdict = (const TACHYON_WFP_VERDICT*)input;
     TG_PENDING_PACKET* packet = NULL;
@@ -273,10 +298,19 @@ NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T in
         verdict->payload_size != input_size - TACHYON_WFP_VERDICT_HEADER_SIZE || verdict->payload_size != 0 ||
         verdict->reserved != 0 || verdict->reason != 0 ||
         verdict->action < TachyonWfpVerdictTunnel || verdict->action > TachyonWfpVerdictDrop) {
-        InterlockedIncrement64((volatile LONG64*)&context->statistics.rejected_frames);
+        BOOLEAN active;
+        WdfSpinLockAcquire(context->lock);
+        active = TgSessionIsActiveLocked(context, session);
+        if (active) InterlockedIncrement64(&context->statistics.rejected_frames);
+        WdfSpinLockRelease(context->lock);
+        if (!active) return STATUS_INVALID_DEVICE_STATE;
         return STATUS_INVALID_PARAMETER;
     }
     WdfSpinLockAcquire(context->lock);
+    if (!TgSessionIsActiveLocked(context, session)) {
+        WdfSpinLockRelease(context->lock);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     for (entry = context->pending_packets.Flink; entry != &context->pending_packets; entry = entry->Flink) {
         TG_PENDING_PACKET* candidate = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
         if (TgEqualIdentity(candidate, verdict) && TgBeginCompletionLocked(context, candidate, TgPacketCompleted)) {
@@ -286,7 +320,7 @@ NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T in
     }
     WdfSpinLockRelease(context->lock);
     if (packet == NULL) {
-        InterlockedIncrement64((volatile LONG64*)&context->statistics.rejected_frames);
+        InterlockedIncrement64(&context->statistics.rejected_frames);
         return STATUS_NOT_FOUND;
     }
     TgReleasePendingOwnerAndComplete(context, packet, verdict->action);
@@ -314,7 +348,7 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
     while (!IsListEmpty(&expired)) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(RemoveHeadList(&expired), TG_PENDING_PACKET, pending_link);
         InitializeListHead(&packet->pending_link);
-        InterlockedIncrement64((volatile LONG64*)&context->statistics.verdict_timeout);
+        InterlockedIncrement64(&context->statistics.verdict_timeout);
         TgReleasePendingOwnerAndComplete(context, packet, TachyonWfpVerdictPermitDirect);
     }
 }

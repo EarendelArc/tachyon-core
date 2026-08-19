@@ -312,8 +312,12 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 		"platform: ARM64",
 		"/warnaserror",
 		"/p:EnablePREfast=true",
+		"inf-verify:",
+		"needs: wdk-build",
+		"/p:Platform=x64",
 		"Run host WDK InfVerif and validate INF",
-		`c\bin\10.0.28000.0\x64\infverif.exe`,
+		`microsoft.windows.wdk.x64\10.0.28000.2526`,
+		`c\tools\10.0.28000.0\x64\infverif.exe`,
 		"Test-Path -LiteralPath $infverif -PathType Leaf",
 		"& $infverif /w drivers/windows/wfp/tachyon-wfp.inf",
 	} {
@@ -321,7 +325,20 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 			t.Fatalf("WFP workflow gate missing %q", required)
 		}
 	}
-	for _, required := range []string{"DefaultDestDir=13", `ServiceBinary=%13%\tachyon-wfp.sys`} {
+	if strings.Contains(workflow, "matrix.package") || strings.Contains(workflow, `c\bin\10.0.28000.0\x64\infverif.exe`) {
+		t.Fatal("InfVerif still resolves a target-architecture or non-tool executable")
+	}
+	for _, required := range []string{
+		"DefaultDestDir=13",
+		`ServiceBinary=%13%\tachyon-wfp.sys`,
+		"[DefaultInstall.NTamd64.Wdf]",
+		"[DefaultInstall.NTarm64.Wdf]",
+		"KmdfService=TachyonWFP,TachyonWFP_Wdf",
+		"[TachyonWFP_Wdf]",
+		"KmdfLibraryVersion=1.15",
+		"ServiceType=1",
+		"StartType=3",
+	} {
 		if !strings.Contains(inf, required) {
 			t.Fatalf("isolated WFP INF contract missing %q", required)
 		}

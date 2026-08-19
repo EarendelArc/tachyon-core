@@ -23,6 +23,12 @@ AddService=TachyonWFP,0x00000002,TachyonWFP_Service
 [DefaultInstall.NTarm64.Services]
 AddService=TachyonWFP,0x00000002,TachyonWFP_Service
 
+[DefaultInstall.NTamd64.Wdf]
+KmdfService=TachyonWFP,TachyonWFP_Wdf
+
+[DefaultInstall.NTarm64.Wdf]
+KmdfService=TachyonWFP,TachyonWFP_Wdf
+
 [DriverCopy]
 tachyon-wfp.sys
 
@@ -34,6 +40,9 @@ StartType=3
 ErrorControl=1
 ServiceBinary=%13%\tachyon-wfp.sys
 LoadOrderGroup=PNP_TDI
+
+[TachyonWFP_Wdf]
+KmdfLibraryVersion=1.15
 
 [SourceDisksNames]
 1=%DiskName%,,,

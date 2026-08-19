@@ -47,9 +47,7 @@ jobs:
       matrix:
         include:
           - platform: x64
-            package: x64
           - platform: ARM64
-            package: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
@@ -71,11 +69,26 @@ jobs:
           /p:RunCodeAnalysis=true
           /p:EnablePREfast=true
           /warnaserror
+
+  inf-verify:
+    name: WDK InfVerif
+    needs: wdk-build
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+      - name: Restore pinned host WDK NuGet package
+        shell: pwsh
+        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=x64 /p:TachyonUseNuGetWDK=true
       - name: Run host WDK InfVerif and validate INF
         shell: pwsh
         run: |
-          $packageRoot = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windows.wdk.${{ matrix.package }}\10.0.28000.2526"
-          $infverif = Join-Path $packageRoot "c\bin\10.0.28000.0\x64\infverif.exe"
+          $packageRoot = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526"
+          $infverif = Join-Path $packageRoot "c\tools\10.0.28000.0\x64\infverif.exe"
           if (-not (Test-Path -LiteralPath $infverif -PathType Leaf)) { throw "Host InfVerif was not found in pinned WDK package $packageRoot" }
           & $infverif /w drivers/windows/wfp/tachyon-wfp.inf
           if ($LASTEXITCODE -ne 0) { throw "InfVerif failed with exit code $LASTEXITCODE" }

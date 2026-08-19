@@ -55,6 +55,7 @@
     <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\abi_contract.c" />
     <ClCompile Include="src\driver.c" />
     <ClCompile Include="src\device.c" />
     <ClCompile Include="src\queue.c" />

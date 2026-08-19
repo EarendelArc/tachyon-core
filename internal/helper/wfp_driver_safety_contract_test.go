@@ -155,6 +155,66 @@ func TestWFPProjectLeavesWDKOwnedMacrosToTheToolchain(t *testing.T) {
 	}
 }
 
+func TestWFPABISeparatesKernelTypesFromUserCRTAndExpandsCompilerContracts(t *testing.T) {
+	abi := readWFPDriverSource(t, filepath.Join("include", "tachyon_wfp_abi.h"))
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	fixture := readWFPDriverSource(t, filepath.Join("src", "abi_contract.c"))
+	project := readWFPDriverSource(t, "TachyonWfp.vcxproj")
+
+	kernelStart := strings.Index(abi, "#if defined(_KERNEL_MODE)")
+	if kernelStart < 0 {
+		t.Fatal("ABI header has no kernel type branch")
+	}
+	userStart := strings.Index(abi[kernelStart:], "#else")
+	if userStart < 0 {
+		t.Fatal("ABI header kernel type branch has no user-mode alternative")
+	}
+	userStart += kernelStart
+	kernelBranch := abi[kernelStart:userStart]
+	for _, crtHeader := range []string{"<stdint.h>", "<stddef.h>", "<stdalign.h>", "<vcruntime.h>"} {
+		if strings.Contains(kernelBranch, crtHeader) {
+			t.Fatalf("kernel ABI branch includes user-mode CRT header %s", crtHeader)
+		}
+	}
+	for _, required := range []string{
+		"typedef UINT8 TACHYON_WFP_UINT8",
+		"typedef UINT16 TACHYON_WFP_UINT16",
+		"typedef UINT32 TACHYON_WFP_UINT32",
+		"typedef UINT64 TACHYON_WFP_UINT64",
+		"#include <stddef.h>",
+		"#include <stdint.h>",
+		"typedef uint8_t TACHYON_WFP_UINT8",
+		"TACHYON_WFP_STATIC_ASSERT(condition, message) static_assert",
+		"TACHYON_WFP_JOIN(tachyon_wfp_static_assert_, __COUNTER__)",
+		"TACHYON_WFP_STATIC_ASSERT(condition, message) _Static_assert",
+		"TACHYON_WFP_ALIGNOF(type) TYPE_ALIGNMENT(type)",
+		"TACHYON_WFP_ALIGNOF(type) alignof(type)",
+		"TACHYON_WFP_ALIGNOF(type) __alignof__(type)",
+	} {
+		if !strings.Contains(abi, required) {
+			t.Fatalf("portable ABI compiler contract missing %q", required)
+		}
+	}
+	if strings.Contains(abi, "\n_Static_assert(") || strings.Contains(header, "\n_Static_assert(") ||
+		strings.Contains(header, "__alignof(") {
+		t.Fatal("driver headers bypass the portable static-assert/alignof contract")
+	}
+	for _, required := range []string{
+		"defined(_VCRUNTIME_H)",
+		"defined(_INC_STDINT)",
+		"TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_UINT64) == 8",
+		"TACHYON_WFP_ALIGNOF(TACHYON_WFP_UINT64)",
+		"TACHYON_WFP_OFFSET_OF(TACHYON_WFP_CAPTURE_RECORD, payload)",
+	} {
+		if !strings.Contains(fixture, required) {
+			t.Fatalf("kernel ABI compile fixture missing %q", required)
+		}
+	}
+	if !strings.Contains(project, `<ClCompile Include="src\abi_contract.c" />`) {
+		t.Fatal("kernel ABI compile fixture is not part of the WDK x64/ARM64 project")
+	}
+}
+
 func TestWFPClassifyChecksActionWriteBeforeAnyDecisionWrite(t *testing.T) {
 	source := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
 	for _, signature := range []string{"static VOID TgClassifyFlow(", "static VOID TgClassifyDatagram("} {
@@ -261,7 +321,7 @@ func TestWFPStatisticsAtomicsUseAlignedPrivateStorage(t *testing.T) {
 	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))
 	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
 	for _, required := range []string{"DECLSPEC_ALIGN(8) TG_STATISTICS_COUNTERS", "defined(_AMD64_)",
-		"defined(_ARM64_)", "_Static_assert(__alignof(TG_STATISTICS_COUNTERS) >= 8",
+		"defined(_ARM64_)", "TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_ALIGNOF(TG_STATISTICS_COUNTERS) >= 8",
 		"FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics)"} {
 		if !strings.Contains(header, required) {
 			t.Fatalf("private statistics alignment contract missing %q", required)
@@ -297,9 +357,9 @@ func TestWFPHashOutputWidthAndFlowIDTruncationAreExplicit(t *testing.T) {
 		"#define TG_FLOW_ID_SIZE 16u",
 		"#define TG_SHA256_DIGEST_SIZE 32u",
 		"typedef UCHAR TG_SHA256_DIGEST[TG_SHA256_DIGEST_SIZE]",
-		"_Static_assert(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE",
-		"_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE",
-		"_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u",
+		"TACHYON_WFP_STATIC_ASSERT(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE",
+		"TACHYON_WFP_STATIC_ASSERT(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE",
+		"TACHYON_WFP_STATIC_ASSERT(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u",
 		"TG_SHA256_DIGEST* output",
 	} {
 		if !strings.Contains(header, required) {

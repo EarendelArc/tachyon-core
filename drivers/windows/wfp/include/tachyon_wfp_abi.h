@@ -4,7 +4,48 @@
 // This header is shared by the kernel driver and the privileged Helper only.
 // Every multi-byte integer is little-endian and every wire structure is packed.
 
+#if defined(_KERNEL_MODE)
+typedef UINT8 TACHYON_WFP_UINT8;
+typedef UINT16 TACHYON_WFP_UINT16;
+typedef UINT32 TACHYON_WFP_UINT32;
+typedef UINT64 TACHYON_WFP_UINT64;
+#ifndef UINT64_C
+#define UINT64_C(value) value##ULL
+#endif
+#define TACHYON_WFP_OFFSET_OF(type, member) FIELD_OFFSET(type, member)
+#else
+#include <stddef.h>
 #include <stdint.h>
+typedef uint8_t TACHYON_WFP_UINT8;
+typedef uint16_t TACHYON_WFP_UINT16;
+typedef uint32_t TACHYON_WFP_UINT32;
+typedef uint64_t TACHYON_WFP_UINT64;
+#define TACHYON_WFP_OFFSET_OF(type, member) offsetof(type, member)
+#endif
+
+#define TACHYON_WFP_JOIN_INNER(left, right) left##right
+#define TACHYON_WFP_JOIN(left, right) TACHYON_WFP_JOIN_INNER(left, right)
+
+#if defined(__cplusplus)
+#define TACHYON_WFP_STATIC_ASSERT(condition, message) static_assert((condition), message)
+#elif defined(_MSC_VER)
+#define TACHYON_WFP_STATIC_ASSERT(condition, message) \
+    typedef char TACHYON_WFP_JOIN(tachyon_wfp_static_assert_, __COUNTER__)[(condition) ? 1 : -1]
+#else
+#define TACHYON_WFP_STATIC_ASSERT(condition, message) _Static_assert((condition), message)
+#endif
+
+#if defined(_KERNEL_MODE)
+#define TACHYON_WFP_ALIGNOF(type) TYPE_ALIGNMENT(type)
+#elif defined(__cplusplus)
+#define TACHYON_WFP_ALIGNOF(type) alignof(type)
+#elif defined(_MSC_VER)
+#define TACHYON_WFP_ALIGNOF(type) __alignof(type)
+#elif defined(__clang__) || defined(__GNUC__)
+#define TACHYON_WFP_ALIGNOF(type) __alignof__(type)
+#else
+#define TACHYON_WFP_ALIGNOF(type) _Alignof(type)
+#endif
 
 #define TACHYON_WFP_ABI_MAGIC 0x46574754u /* "TGWF" */
 #define TACHYON_WFP_ABI_MAJOR 2u
@@ -91,112 +132,112 @@ enum TACHYON_WFP_POLICY_FLAGS {
 #pragma pack(push, 1)
 
 typedef struct TACHYON_WFP_MESSAGE_HEADER {
-    uint32_t magic;
-    uint16_t header_size;
-    uint16_t abi_major;
-    uint16_t abi_minor;
-    uint16_t kind;
-    uint32_t flags;
-    uint32_t total_size;
-    uint64_t request_id;
-    uint32_t reserved;
+    TACHYON_WFP_UINT32 magic;
+    TACHYON_WFP_UINT16 header_size;
+    TACHYON_WFP_UINT16 abi_major;
+    TACHYON_WFP_UINT16 abi_minor;
+    TACHYON_WFP_UINT16 kind;
+    TACHYON_WFP_UINT32 flags;
+    TACHYON_WFP_UINT32 total_size;
+    TACHYON_WFP_UINT64 request_id;
+    TACHYON_WFP_UINT32 reserved;
 } TACHYON_WFP_MESSAGE_HEADER;
 
 typedef struct TACHYON_WFP_NEGOTIATE_REQUEST {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint8_t helper_build_id[16];
-    uint64_t required_capabilities;
-    uint32_t requested_queue_capacity;
-    uint32_t requested_timeout_ms;
+    TACHYON_WFP_UINT8 helper_build_id[16];
+    TACHYON_WFP_UINT64 required_capabilities;
+    TACHYON_WFP_UINT32 requested_queue_capacity;
+    TACHYON_WFP_UINT32 requested_timeout_ms;
 } TACHYON_WFP_NEGOTIATE_REQUEST;
 
 typedef struct TACHYON_WFP_NEGOTIATE_RESPONSE {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint8_t driver_build_id[16];
-    uint64_t capabilities;
-    uint32_t max_message_size;
-    uint32_t queue_capacity;
-    uint32_t verdict_timeout_ms;
-    uint32_t fail_policy;
-    uint8_t service_sid_hash[32];
+    TACHYON_WFP_UINT8 driver_build_id[16];
+    TACHYON_WFP_UINT64 capabilities;
+    TACHYON_WFP_UINT32 max_message_size;
+    TACHYON_WFP_UINT32 queue_capacity;
+    TACHYON_WFP_UINT32 verdict_timeout_ms;
+    TACHYON_WFP_UINT32 fail_policy;
+    TACHYON_WFP_UINT8 service_sid_hash[32];
 } TACHYON_WFP_NEGOTIATE_RESPONSE;
 
 typedef struct TACHYON_WFP_POLICY_HEADER {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint64_t generation;
-    uint8_t lease_nonce[16];
-    uint32_t entry_count;
-    uint32_t policy_flags;
+    TACHYON_WFP_UINT64 generation;
+    TACHYON_WFP_UINT8 lease_nonce[16];
+    TACHYON_WFP_UINT32 entry_count;
+    TACHYON_WFP_UINT32 policy_flags;
 } TACHYON_WFP_POLICY_HEADER;
 
 typedef struct TACHYON_WFP_POLICY_ENTRY {
-    uint64_t process_id;
-    uint64_t process_start_key;
-    uint8_t app_id_hash[32];
+    TACHYON_WFP_UINT64 process_id;
+    TACHYON_WFP_UINT64 process_start_key;
+    TACHYON_WFP_UINT8 app_id_hash[32];
     /* SHA-256 of the exact self-relative security descriptor bytes from ALE_USER_ID. */
-    uint8_t user_security_descriptor_hash[32];
-    uint32_t match_flags;
-    uint32_t reserved;
+    TACHYON_WFP_UINT8 user_security_descriptor_hash[32];
+    TACHYON_WFP_UINT32 match_flags;
+    TACHYON_WFP_UINT32 reserved;
 } TACHYON_WFP_POLICY_ENTRY;
 
 typedef struct TACHYON_WFP_DISABLE_POLICY {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint64_t generation;
-    uint8_t lease_nonce[16];
-    uint64_t last_sequence;
+    TACHYON_WFP_UINT64 generation;
+    TACHYON_WFP_UINT8 lease_nonce[16];
+    TACHYON_WFP_UINT64 last_sequence;
 } TACHYON_WFP_DISABLE_POLICY;
 
 typedef struct TACHYON_WFP_CAPTURE_RECORD {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint8_t flow_id[16];
-    uint64_t generation;
-    uint8_t lease_nonce[16];
-    uint64_t sequence;
-    uint64_t process_id;
-    uint64_t process_start_key;
-    uint8_t app_id_hash[32];
-    uint8_t user_security_descriptor_hash[32];
-    uint16_t address_family;
-    uint8_t direction;
-    uint8_t protocol;
-    uint32_t injection_state;
-    uint32_t compartment_id;
-    uint32_t interface_index;
-    uint32_t sub_interface_index;
-    uint8_t local_address[16];
-    uint8_t remote_address[16];
-    uint16_t local_port;
-    uint16_t remote_port;
-    uint32_t payload_size;
-    uint32_t reserved;
-    uint8_t payload[1];
+    TACHYON_WFP_UINT8 flow_id[16];
+    TACHYON_WFP_UINT64 generation;
+    TACHYON_WFP_UINT8 lease_nonce[16];
+    TACHYON_WFP_UINT64 sequence;
+    TACHYON_WFP_UINT64 process_id;
+    TACHYON_WFP_UINT64 process_start_key;
+    TACHYON_WFP_UINT8 app_id_hash[32];
+    TACHYON_WFP_UINT8 user_security_descriptor_hash[32];
+    TACHYON_WFP_UINT16 address_family;
+    TACHYON_WFP_UINT8 direction;
+    TACHYON_WFP_UINT8 protocol;
+    TACHYON_WFP_UINT32 injection_state;
+    TACHYON_WFP_UINT32 compartment_id;
+    TACHYON_WFP_UINT32 interface_index;
+    TACHYON_WFP_UINT32 sub_interface_index;
+    TACHYON_WFP_UINT8 local_address[16];
+    TACHYON_WFP_UINT8 remote_address[16];
+    TACHYON_WFP_UINT16 local_port;
+    TACHYON_WFP_UINT16 remote_port;
+    TACHYON_WFP_UINT32 payload_size;
+    TACHYON_WFP_UINT32 reserved;
+    TACHYON_WFP_UINT8 payload[1];
 } TACHYON_WFP_CAPTURE_RECORD;
 
 typedef struct TACHYON_WFP_VERDICT {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint8_t flow_id[16];
-    uint64_t generation;
-    uint8_t lease_nonce[16];
-    uint64_t sequence;
-    uint32_t action;
-    uint32_t reason;
-    uint32_t payload_size;
-    uint32_t reserved;
-    uint8_t payload[1];
+    TACHYON_WFP_UINT8 flow_id[16];
+    TACHYON_WFP_UINT64 generation;
+    TACHYON_WFP_UINT8 lease_nonce[16];
+    TACHYON_WFP_UINT64 sequence;
+    TACHYON_WFP_UINT32 action;
+    TACHYON_WFP_UINT32 reason;
+    TACHYON_WFP_UINT32 payload_size;
+    TACHYON_WFP_UINT32 reserved;
+    TACHYON_WFP_UINT8 payload[1];
 } TACHYON_WFP_VERDICT;
 
 typedef struct TACHYON_WFP_STATISTICS {
     TACHYON_WFP_MESSAGE_HEADER header;
-    uint64_t captured;
-    uint64_t permitted;
-    uint64_t dropped;
-    uint64_t injected;
-    uint64_t self_injected;
-    uint64_t queue_overflow;
-    uint64_t verdict_timeout;
-    uint64_t rejected_frames;
-    uint32_t queue_depth;
-    uint32_t pending_verdicts;
+    TACHYON_WFP_UINT64 captured;
+    TACHYON_WFP_UINT64 permitted;
+    TACHYON_WFP_UINT64 dropped;
+    TACHYON_WFP_UINT64 injected;
+    TACHYON_WFP_UINT64 self_injected;
+    TACHYON_WFP_UINT64 queue_overflow;
+    TACHYON_WFP_UINT64 verdict_timeout;
+    TACHYON_WFP_UINT64 rejected_frames;
+    TACHYON_WFP_UINT32 queue_depth;
+    TACHYON_WFP_UINT32 pending_verdicts;
 } TACHYON_WFP_STATISTICS;
 
 #pragma pack(pop)
@@ -227,28 +268,14 @@ typedef struct TACHYON_WFP_STATISTICS {
     CTL_CODE(FILE_DEVICE_NETWORK, 0x905, METHOD_BUFFERED, FILE_READ_DATA)
 #endif
 
-#if defined(__cplusplus)
-static_assert(sizeof(TACHYON_WFP_MESSAGE_HEADER) == TACHYON_WFP_HEADER_SIZE, "ABI header size");
-static_assert(sizeof(TACHYON_WFP_NEGOTIATE_REQUEST) == TACHYON_WFP_NEGOTIATE_REQUEST_SIZE, "negotiate request size");
-static_assert(sizeof(TACHYON_WFP_NEGOTIATE_RESPONSE) == TACHYON_WFP_NEGOTIATE_RESPONSE_SIZE, "negotiate response size");
-static_assert(sizeof(TACHYON_WFP_POLICY_HEADER) == TACHYON_WFP_POLICY_HEADER_SIZE, "policy header size");
-static_assert(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE, "policy entry size");
-static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
-static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
-static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
-static_assert(sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u, "capture flow ID width");
-static_assert(sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u, "verdict flow ID width");
-static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
-#else
-_Static_assert(sizeof(TACHYON_WFP_MESSAGE_HEADER) == TACHYON_WFP_HEADER_SIZE, "ABI header size");
-_Static_assert(sizeof(TACHYON_WFP_NEGOTIATE_REQUEST) == TACHYON_WFP_NEGOTIATE_REQUEST_SIZE, "negotiate request size");
-_Static_assert(sizeof(TACHYON_WFP_NEGOTIATE_RESPONSE) == TACHYON_WFP_NEGOTIATE_RESPONSE_SIZE, "negotiate response size");
-_Static_assert(sizeof(TACHYON_WFP_POLICY_HEADER) == TACHYON_WFP_POLICY_HEADER_SIZE, "policy header size");
-_Static_assert(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE, "policy entry size");
-_Static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
-_Static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
-_Static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
-_Static_assert(sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u, "capture flow ID width");
-_Static_assert(sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u, "verdict flow ID width");
-_Static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
-#endif
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_MESSAGE_HEADER) == TACHYON_WFP_HEADER_SIZE, "ABI header size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_NEGOTIATE_REQUEST) == TACHYON_WFP_NEGOTIATE_REQUEST_SIZE, "negotiate request size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_NEGOTIATE_RESPONSE) == TACHYON_WFP_NEGOTIATE_RESPONSE_SIZE, "negotiate response size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_POLICY_HEADER) == TACHYON_WFP_POLICY_HEADER_SIZE, "policy header size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE, "policy entry size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
+TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_OFFSET_OF(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
+TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_OFFSET_OF(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
+TACHYON_WFP_STATIC_ASSERT(sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u, "capture flow ID width");
+TACHYON_WFP_STATIC_ASSERT(sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u, "verdict flow ID width");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");

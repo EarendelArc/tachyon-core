@@ -289,7 +289,7 @@ func TestWFPDriverHeaderIsCanonicalAndRestrictsDeviceACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(header)
-	for _, required := range []string{"_Static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload)",
+	for _, required := range []string{"TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_OFFSET_OF(TACHYON_WFP_CAPTURE_RECORD, payload)",
 		"TACHYON_WFP_HELPER_SERVICE_SID_ASCII", "TACHYON_WFP_DRIVER_BUILD_ID_INIT", "IOCTL_TACHYON_WFP_NEGOTIATE"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("driver ABI missing %q", required)

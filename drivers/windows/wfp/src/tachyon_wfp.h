@@ -165,25 +165,25 @@ struct TG_DEVICE_CONTEXT {
 };
 
 #if defined(_AMD64_) || defined(_M_AMD64) || defined(_ARM64_) || defined(_M_ARM64)
-_Static_assert(__alignof(TG_STATISTICS_COUNTERS) >= 8, "private statistics alignment");
-_Static_assert(__alignof(TG_DEVICE_CONTEXT) >= 8, "device context alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, captured) & 7) == 0, "captured counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, permitted) & 7) == 0, "permitted counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, dropped) & 7) == 0, "dropped counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, injected) & 7) == 0, "injected counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, self_injected) & 7) == 0, "self-injected counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, queue_overflow) & 7) == 0, "overflow counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, verdict_timeout) & 7) == 0, "timeout counter alignment");
-_Static_assert((FIELD_OFFSET(TG_STATISTICS_COUNTERS, rejected_frames) & 7) == 0, "rejected counter alignment");
-_Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, active_session_generation) & 7) == 0, "active session alignment");
-_Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics) & 7) == 0, "embedded statistics alignment");
+TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_ALIGNOF(TG_STATISTICS_COUNTERS) >= 8, "private statistics alignment");
+TACHYON_WFP_STATIC_ASSERT(TACHYON_WFP_ALIGNOF(TG_DEVICE_CONTEXT) >= 8, "device context alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, captured) & 7) == 0, "captured counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, permitted) & 7) == 0, "permitted counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, dropped) & 7) == 0, "dropped counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, injected) & 7) == 0, "injected counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, self_injected) & 7) == 0, "self-injected counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, queue_overflow) & 7) == 0, "overflow counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, verdict_timeout) & 7) == 0, "timeout counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_STATISTICS_COUNTERS, rejected_frames) & 7) == 0, "rejected counter alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_DEVICE_CONTEXT, active_session_generation) & 7) == 0, "active session alignment");
+TACHYON_WFP_STATIC_ASSERT((FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics) & 7) == 0, "embedded statistics alignment");
 #endif
 
-_Static_assert(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE, "SHA-256 digest width");
-_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE, "flow ID width");
-_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u, "flow lease nonce width");
-_Static_assert(TG_FLOW_ID_SIZE < TG_SHA256_DIGEST_SIZE, "flow ID is a truncated digest");
-_Static_assert(TG_MAX_CONTROL_DATA_SIZE <= TACHYON_WFP_MAX_MESSAGE_SIZE, "control data cap");
+TACHYON_WFP_STATIC_ASSERT(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE, "SHA-256 digest width");
+TACHYON_WFP_STATIC_ASSERT(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE, "flow ID width");
+TACHYON_WFP_STATIC_ASSERT(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u, "flow lease nonce width");
+TACHYON_WFP_STATIC_ASSERT(TG_FLOW_ID_SIZE < TG_SHA256_DIGEST_SIZE, "flow ID is a truncated digest");
+TACHYON_WFP_STATIC_ASSERT(TG_MAX_CONTROL_DATA_SIZE <= TACHYON_WFP_MAX_MESSAGE_SIZE, "control data cap");
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_DEVICE_CONTEXT, TgGetDeviceContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_FILE_CONTEXT, TgGetFileContext)

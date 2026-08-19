@@ -305,13 +305,15 @@ NTSTATUS NTAPI TgNotify(FWPS_CALLOUT_NOTIFY_TYPE type, const GUID* filter_key, c
     return STATUS_SUCCESS;
 }
 
-BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length, UCHAR output[32])
+BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length,
+                    TG_SHA256_DIGEST* output)
 {
     if (bytes == NULL || length == 0 || context->sha256 == NULL) {
-        RtlZeroMemory(output, 32);
+        RtlZeroMemory(*output, sizeof(*output));
         return FALSE;
     }
-    return NT_SUCCESS(BCryptHash(context->sha256, NULL, 0, (PUCHAR)bytes, length, output, 32));
+    return NT_SUCCESS(BCryptHash(context->sha256, NULL, 0, (PUCHAR)bytes, length,
+                                 *output, (ULONG)sizeof(*output)));
 }
 
 static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* values,
@@ -328,10 +330,12 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     UINT16 target_layer;
     UINT32 target_callout;
     UCHAR flow_seed[40];
+    TG_SHA256_DIGEST flow_digest;
     NTSTATUS status;
     PEPROCESS process;
 
     UNREFERENCED_PARAMETER(filter);
+    RtlZeroMemory(flow_digest, sizeof(flow_digest));
     if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) goto Exit;
     classify_out->actionType = FWP_ACTION_PERMIT;
     if (context == NULL ||
@@ -371,8 +375,8 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     app_id = values->incomingValue[app_index].value.byteBlob;
     user_id = values->incomingValue[user_index].value.sd;
     if (app_id == NULL || user_id == NULL ||
-        !TgHashBytes(context, app_id->data, app_id->size, candidate.app_id_hash) ||
-        !TgHashBytes(context, user_id->data, user_id->size, candidate.user_security_descriptor_hash) ||
+        !TgHashBytes(context, app_id->data, app_id->size, &candidate.app_id_hash) ||
+        !TgHashBytes(context, user_id->data, user_id->size, &candidate.user_security_descriptor_hash) ||
         !TgPolicyMatches(context, &candidate)) goto Exit;
     RtlZeroMemory(flow_seed, sizeof(flow_seed));
     RtlCopyMemory(flow_seed, &candidate.flow_handle, sizeof(candidate.flow_handle));
@@ -380,7 +384,9 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     RtlCopyMemory(flow_seed + 16, &candidate.generation, sizeof(candidate.generation));
     RtlCopyMemory(flow_seed + 24, &candidate.process_id, sizeof(candidate.process_id));
     RtlCopyMemory(flow_seed + 32, &candidate.process_start_key, sizeof(candidate.process_start_key));
-    if (!TgHashBytes(context, flow_seed, sizeof(flow_seed), candidate.flow_id)) goto Exit;
+    if (!TgHashBytes(context, flow_seed, sizeof(flow_seed), &flow_digest)) goto Exit;
+    RtlCopyMemory(candidate.flow_id, flow_digest, sizeof(candidate.flow_id));
+    RtlSecureZeroMemory(flow_digest, sizeof(flow_digest));
     flow = (TG_FLOW_CONTEXT*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*flow), TG_POOL_TAG);
     if (flow == NULL) goto Exit;
     RtlCopyMemory(flow, &candidate, sizeof(*flow));
@@ -400,6 +406,7 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     }
     TgFlowDereference(flow);
 Exit:
+    RtlSecureZeroMemory(flow_digest, sizeof(flow_digest));
     TgReleaseControlContext(context);
 }
 

@@ -184,6 +184,69 @@ func TestWFPStatisticsAtomicsUseAlignedPrivateStorage(t *testing.T) {
 	}
 }
 
+func TestWFPHashOutputWidthAndFlowIDTruncationAreExplicit(t *testing.T) {
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	abi := readWFPDriverSource(t, filepath.Join("include", "tachyon_wfp_abi.h"))
+	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
+	for _, required := range []string{
+		"#define TG_FLOW_ID_SIZE 16u",
+		"#define TG_SHA256_DIGEST_SIZE 32u",
+		"typedef UCHAR TG_SHA256_DIGEST[TG_SHA256_DIGEST_SIZE]",
+		"_Static_assert(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE",
+		"_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE",
+		"_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u",
+		"TG_SHA256_DIGEST* output",
+	} {
+		if !strings.Contains(header, required) {
+			t.Fatalf("typed SHA-256/flow layout contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u",
+		"sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u",
+	} {
+		if !strings.Contains(abi, required) {
+			t.Fatalf("packed ABI flow ID width contract missing %q", required)
+		}
+	}
+
+	hashBody := cFunctionBody(t, wfp, "BOOLEAN TgHashBytes(")
+	if !strings.Contains(hashBody, "RtlZeroMemory(*output, sizeof(*output))") ||
+		!strings.Contains(hashBody, "*output, (ULONG)sizeof(*output)") {
+		t.Fatal("TgHashBytes does not derive its 32-byte output width from the typed digest")
+	}
+
+	var calls []string
+	for _, line := range strings.Split(wfp, "\n") {
+		if strings.Contains(line, "TgHashBytes(") && !strings.Contains(line, "BOOLEAN TgHashBytes(") {
+			calls = append(calls, strings.TrimSpace(line))
+			if strings.Contains(line, "flow_id") || strings.Contains(line, "lease_nonce") {
+				t.Fatalf("TgHashBytes targets a narrow or leased field directly: %s", strings.TrimSpace(line))
+			}
+		}
+	}
+	if len(calls) != 3 {
+		t.Fatalf("expected to audit exactly 3 TgHashBytes calls, found %d: %v", len(calls), calls)
+	}
+	for _, target := range []string{"&candidate.app_id_hash", "&candidate.user_security_descriptor_hash", "&flow_digest"} {
+		if !strings.Contains(strings.Join(calls, "\n"), target) {
+			t.Fatalf("typed SHA-256 call target missing %q", target)
+		}
+	}
+
+	classify := cFunctionBody(t, wfp, "static VOID TgClassifyFlow(")
+	leaseCopy := strings.Index(classify, "RtlCopyMemory(candidate.lease_nonce, context->policy->lease_nonce, 16)")
+	hash := strings.Index(classify, "TgHashBytes(context, flow_seed, sizeof(flow_seed), &flow_digest)")
+	truncate := strings.Index(classify, "RtlCopyMemory(candidate.flow_id, flow_digest, sizeof(candidate.flow_id))")
+	wipe := strings.Index(classify, "RtlSecureZeroMemory(flow_digest, sizeof(flow_digest))")
+	if leaseCopy < 0 || hash < 0 || truncate < 0 || wipe < 0 || !(leaseCopy < hash && hash < truncate && truncate < wipe) {
+		t.Fatal("flow digest truncation or lease isolation ordering is not explicit")
+	}
+	if strings.Count(classify, "RtlSecureZeroMemory(flow_digest, sizeof(flow_digest))") < 2 {
+		t.Fatal("temporary flow digest is not securely cleared on both success and exit paths")
+	}
+}
+
 func TestWFPDatagramCaptureRevalidatesSessionAndPolicyAtQueueCommit(t *testing.T) {
 	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
 	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))

@@ -17,6 +17,10 @@
 #define TG_STOP_RETRY_COUNT 500u
 #define TG_STOP_RETRY_DELAY_MS 10u
 #define TG_STOP_DRAIN_TIMEOUT_MS 5000u
+#define TG_FLOW_ID_SIZE 16u
+#define TG_SHA256_DIGEST_SIZE 32u
+
+typedef UCHAR TG_SHA256_DIGEST[TG_SHA256_DIGEST_SIZE];
 
 typedef enum TG_PACKET_STATE {
     TgPacketCaptured = 1,
@@ -75,7 +79,7 @@ typedef struct TG_FLOW_CONTEXT {
     UINT64 generation;
     UINT64 process_id;
     UINT64 process_start_key;
-    UCHAR flow_id[16];
+    UCHAR flow_id[TG_FLOW_ID_SIZE];
     UCHAR lease_nonce[16];
     UCHAR app_id_hash[32];
     UCHAR user_security_descriptor_hash[32];
@@ -169,6 +173,11 @@ _Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, active_session_generation) & 7) 
 _Static_assert((FIELD_OFFSET(TG_DEVICE_CONTEXT, statistics) & 7) == 0, "embedded statistics alignment");
 #endif
 
+_Static_assert(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE, "SHA-256 digest width");
+_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE, "flow ID width");
+_Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u, "flow lease nonce width");
+_Static_assert(TG_FLOW_ID_SIZE < TG_SHA256_DIGEST_SIZE, "flow ID is a truncated digest");
+
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_DEVICE_CONTEXT, TgGetDeviceContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_FILE_CONTEXT, TgGetFileContext)
 
@@ -218,7 +227,8 @@ VOID TgFlowDereference(TG_FLOW_CONTEXT* flow);
 TG_DEVICE_CONTEXT* TgAcquireControlContext(VOID);
 VOID TgReleaseControlContext(TG_DEVICE_CONTEXT* context);
 
-BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length, UCHAR output[32]);
+BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length,
+                    TG_SHA256_DIGEST* output);
 BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow);
 BOOLEAN TgCaptureSnapshot(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow,
                           TG_CAPTURE_SNAPSHOT* snapshot);

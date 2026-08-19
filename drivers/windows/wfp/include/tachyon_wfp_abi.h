@@ -236,6 +236,8 @@ static_assert(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE,
 static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
 static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
 static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
+static_assert(sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u, "capture flow ID width");
+static_assert(sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u, "verdict flow ID width");
 static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
 #else
 _Static_assert(sizeof(TACHYON_WFP_MESSAGE_HEADER) == TACHYON_WFP_HEADER_SIZE, "ABI header size");
@@ -246,5 +248,7 @@ _Static_assert(sizeof(TACHYON_WFP_POLICY_ENTRY) == TACHYON_WFP_POLICY_ENTRY_SIZE
 _Static_assert(sizeof(TACHYON_WFP_DISABLE_POLICY) == TACHYON_WFP_DISABLE_POLICY_SIZE, "disable size");
 _Static_assert(offsetof(TACHYON_WFP_CAPTURE_RECORD, payload) == TACHYON_WFP_CAPTURE_HEADER_SIZE, "capture header size");
 _Static_assert(offsetof(TACHYON_WFP_VERDICT, payload) == TACHYON_WFP_VERDICT_HEADER_SIZE, "verdict header size");
+_Static_assert(sizeof(((TACHYON_WFP_CAPTURE_RECORD*)0)->flow_id) == 16u, "capture flow ID width");
+_Static_assert(sizeof(((TACHYON_WFP_VERDICT*)0)->flow_id) == 16u, "verdict flow ID width");
 _Static_assert(sizeof(TACHYON_WFP_STATISTICS) == TACHYON_WFP_STATISTICS_SIZE, "statistics size");
 #endif

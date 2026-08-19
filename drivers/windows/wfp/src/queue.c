@@ -29,7 +29,8 @@ static VOID TgDetachQueueLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* p
     InitializeListHead(&packet->queue_link);
     packet->queued = FALSE;
     --context->queue_depth;
-    context->queue_bytes -= packet->record_size;
+    NT_ASSERT(context->queue_bytes >= packet->resident_bytes);
+    context->queue_bytes -= packet->resident_bytes;
 }
 
 static VOID TgDetachPendingLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
@@ -39,7 +40,8 @@ static VOID TgDetachPendingLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET*
     InitializeListHead(&packet->pending_link);
     packet->pending = FALSE;
     --context->pending_count;
-    context->pending_bytes -= packet->record_size;
+    NT_ASSERT(context->pending_bytes >= packet->resident_bytes);
+    context->pending_bytes -= packet->resident_bytes;
 }
 
 static BOOLEAN TgBeginCompletionLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, LONG terminal_state)
@@ -254,7 +256,8 @@ NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* s
         InitializeListHead(&packet->queue_link);
         packet->queued = FALSE;
         --context->queue_depth;
-        context->queue_bytes -= packet->record_size;
+        NT_ASSERT(context->queue_bytes >= packet->resident_bytes);
+        context->queue_bytes -= packet->resident_bytes;
         if (InterlockedCompareExchange(&packet->state, TgPacketDequeued, TgPacketCaptured) != TgPacketCaptured) {
             packet = NULL;
         } else {

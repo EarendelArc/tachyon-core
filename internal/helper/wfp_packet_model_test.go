@@ -506,6 +506,120 @@ func TestWFPIPv4AndRawSendModel(t *testing.T) {
 	}
 }
 
+type rawCloneOwnershipModel struct {
+	netBuffers    int
+	retreatLength uint32
+	retreatActive bool
+	advances      int
+	frees         int
+}
+
+func (model *rawCloneOwnershipModel) retreat(length uint32, succeeds bool) bool {
+	if model.netBuffers != 1 || length == 0 || !succeeds {
+		return false
+	}
+	model.retreatLength = length
+	model.retreatActive = true
+	return true
+}
+
+func (model *rawCloneOwnershipModel) release() {
+	if model.frees != 0 {
+		return
+	}
+	if model.retreatActive {
+		model.advances++
+		model.retreatLength = 0
+		model.retreatActive = false
+	}
+	model.frees++
+}
+
+func TestWFPRawCloneModelBalancesRetreatAcrossEveryReleasePath(t *testing.T) {
+	for _, path := range []string{"early failure", "synchronous injection failure", "async completion", "flush", "cancel"} {
+		t.Run(path, func(t *testing.T) {
+			model := &rawCloneOwnershipModel{netBuffers: 1}
+			if !model.retreat(20, true) {
+				t.Fatal("valid single-NB retreat failed")
+			}
+			model.release()
+			model.release() // callback followed by final packet dereference must be idempotent
+			if model.advances != 1 || model.frees != 1 || model.retreatActive || model.retreatLength != 0 {
+				t.Fatalf("advances=%d frees=%d active=%v length=%d", model.advances, model.frees, model.retreatActive, model.retreatLength)
+			}
+		})
+	}
+	for name, fixture := range map[string]struct {
+		model    *rawCloneOwnershipModel
+		succeeds bool
+	}{
+		"retreat failure": {model: &rawCloneOwnershipModel{netBuffers: 1}, succeeds: false},
+		"multi NB":        {model: &rawCloneOwnershipModel{netBuffers: 2}, succeeds: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if fixture.model.retreat(20, fixture.succeeds) {
+				t.Fatal("invalid retreat recorded active state")
+			}
+			fixture.model.release()
+			if fixture.model.advances != 0 || fixture.model.frees != 1 || fixture.model.retreatActive || fixture.model.retreatLength != 0 {
+				t.Fatalf("advances=%d frees=%d active=%v length=%d", fixture.model.advances, fixture.model.frees,
+					fixture.model.retreatActive, fixture.model.retreatLength)
+			}
+		})
+	}
+}
+
+func modelResidentAdmission(current, record, control, controlLimit, capacity uint64) (uint64, uint64, bool) {
+	if control > controlLimit || record > ^uint64(0)-control {
+		return current, 0, false
+	}
+	packet := record + control
+	if packet > capacity || current > ^uint64(0)-packet {
+		return current, packet, false
+	}
+	next := current + packet
+	if next > capacity {
+		return current, packet, false
+	}
+	return next, packet, true
+}
+
+func TestWFPResidentBudgetModelIncludesControlDataAndRejectsOverflow(t *testing.T) {
+	const controlLimit = uint64(4096)
+	const capacity = uint64(8 * 1024 * 1024)
+	next, packet, ok := modelResidentAdmission(1024, 224+1200, 256, controlLimit, capacity)
+	if !ok || packet != 1680 || next != 2704 {
+		t.Fatalf("admission next=%d packet=%d ok=%v", next, packet, ok)
+	}
+	if released := next - packet; released != 1024 {
+		t.Fatalf("resident release restored %d, want 1024", released)
+	}
+	for name, fixture := range map[string]struct {
+		current uint64
+		record  uint64
+		control uint64
+	}{
+		"single controlData cap":   {0, 224, controlLimit + 1},
+		"packet addition overflow": {0, ^uint64(0) - 3, 4},
+		"queue addition overflow":  {^uint64(0) - 100, 224, 0},
+		"aggregate resident cap":   {capacity - 100, 224, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, admitted := modelResidentAdmission(fixture.current, fixture.record, fixture.control, controlLimit, capacity); admitted {
+				t.Fatal("unsafe resident allocation admitted")
+			}
+		})
+	}
+	current := uint64(0)
+	for range 512 {
+		next, _, ok := modelResidentAdmission(current, 224, 64*1024, controlLimit, capacity)
+		if ok {
+			t.Fatal("64 KiB controlData bypassed the per-packet cap")
+		}
+		current = next
+	}
+}
+
 func TestWFPPolicyReplacementModelFlushesOnlyOldGeneration(t *testing.T) {
 	pending := []uint64{7, 8, 7, 9}
 	oldGeneration := uint64(7)

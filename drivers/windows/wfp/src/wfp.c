@@ -20,6 +20,7 @@ static NTSTATUS TgRegisterRuntimeCallout(TG_DEVICE_CONTEXT* context, const GUID*
 static NTSTATUS TgAddEngineCalloutAndFilter(HANDLE engine, const GUID* key, const GUID* layer,
                                             FWP_ACTION_TYPE action);
 static VOID NTAPI TgInjectComplete(VOID* context, NET_BUFFER_LIST* net_buffer_list, BOOLEAN dispatch_level);
+static VOID TgReleasePacketClone(TG_PENDING_PACKET* packet);
 static VOID TgFreePendingPacket(TG_PENDING_PACKET* packet);
 static VOID TgCloseFlow(TG_FLOW_CONTEXT* flow);
 static NTSTATUS TgRemoveAllFlowContexts(TG_DEVICE_CONTEXT* context);
@@ -437,6 +438,10 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     NET_BUFFER* clone_buffer;
     TG_PENDING_PACKET* packet = NULL;
     SIZE_T record_size;
+    SIZE_T control_data_size;
+    SIZE_T resident_bytes;
+    SIZE_T queue_bytes_after;
+    SIZE_T pending_bytes_after;
     ULONG payload_size;
     UCHAR* payload;
     UCHAR* contiguous;
@@ -452,6 +457,8 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     TG_CAPTURE_SNAPSHOT capture_snapshot;
 
     RtlZeroMemory(&capture_snapshot, sizeof(capture_snapshot));
+    control_data_size = 0;
+    resident_bytes = 0;
     if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) goto Exit;
     classify_out->actionType = FWP_ACTION_PERMIT;
     if (context == NULL || flow == NULL || nbl == NULL || metadata == NULL || values == NULL ||
@@ -475,13 +482,15 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     payload_size = NET_BUFFER_DATA_LENGTH(net_buffer);
     if (payload_size == 0 || payload_size > TACHYON_WFP_MAX_PAYLOAD_SIZE ||
         payload_size > TACHYON_WFP_MAX_MESSAGE_SIZE - TACHYON_WFP_CAPTURE_HEADER_SIZE) goto Exit;
-    record_size = TACHYON_WFP_CAPTURE_HEADER_SIZE + payload_size;
+    status = RtlSizeTAdd(TACHYON_WFP_CAPTURE_HEADER_SIZE, (SIZE_T)payload_size, &record_size);
+    if (!NT_SUCCESS(status)) goto Exit;
     packet = (TG_PENDING_PACKET*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*packet), TG_POOL_TAG);
     if (packet == NULL) goto Exit;
     RtlZeroMemory(packet, sizeof(*packet));
     packet->references = 1;
     packet->state = TgPacketCaptured;
     packet->terminal_state = TgPacketCompleted;
+    packet->record_size = record_size;
     packet->record = (TACHYON_WFP_CAPTURE_RECORD*)ExAllocatePool2(POOL_FLAG_NON_PAGED, record_size, TG_POOL_TAG);
     if (packet->record == NULL) {
         goto Exit;
@@ -493,26 +502,41 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     }
     if ((metadata->currentMetadataValues & FWPS_METADATA_FIELD_IP_HEADER_SIZE) != 0 && metadata->ipHeaderSize > 0) {
         clone_buffer = NET_BUFFER_LIST_FIRST_NB(packet->clone);
+        /* Raw transport injection accepts exactly one NET_BUFFER per NBL. */
         if (clone_buffer == NULL || NET_BUFFER_NEXT_NB(clone_buffer) != NULL) goto Exit;
         ndis_status = NdisRetreatNetBufferDataStart(clone_buffer, metadata->ipHeaderSize, 0, NULL);
         if (ndis_status != NDIS_STATUS_SUCCESS) goto Exit;
-        packet->raw_send = TRUE;
+        packet->clone_retreated_buffer = clone_buffer;
+        packet->clone_retreat_length = metadata->ipHeaderSize;
+        packet->clone_retreat_active = TRUE;
     }
-    if (!packet->raw_send &&
+    if (!packet->clone_retreat_active &&
         (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) != 0) {
         if (metadata->controlData == NULL || metadata->controlDataLength == 0 ||
-            metadata->controlDataLength > TACHYON_WFP_MAX_MESSAGE_SIZE) goto Exit;
+            metadata->controlDataLength > TG_MAX_CONTROL_DATA_SIZE) {
+            InterlockedIncrement64(&context->statistics.queue_overflow);
+            goto Exit;
+        }
+        control_data_size = (SIZE_T)metadata->controlDataLength;
+    }
+    status = RtlSizeTAdd(record_size, control_data_size, &resident_bytes);
+    if (!NT_SUCCESS(status) || resident_bytes > context->resident_byte_capacity) {
+        InterlockedIncrement64(&context->statistics.queue_overflow);
+        goto Exit;
+    }
+    packet->control_data_size = control_data_size;
+    packet->resident_bytes = resident_bytes;
+    if (control_data_size != 0) {
         packet->send_params.controlData = (WSACMSGHDR*)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, metadata->controlDataLength, TG_POOL_TAG);
+            POOL_FLAG_NON_PAGED, control_data_size, TG_POOL_TAG);
         if (packet->send_params.controlData == NULL) goto Exit;
-        packet->send_params.controlDataLength = metadata->controlDataLength;
-        RtlCopyMemory(packet->send_params.controlData, metadata->controlData, metadata->controlDataLength);
+        packet->send_params.controlDataLength = (ULONG)control_data_size;
+        RtlCopyMemory(packet->send_params.controlData, metadata->controlData, control_data_size);
     }
     InitializeListHead(&packet->queue_link);
     InitializeListHead(&packet->pending_link);
     packet->flow = flow;
     flow_referenced = FALSE;
-    packet->record_size = record_size;
     packet->address_family = family;
     packet->direction = TachyonWfpDirectionOutbound;
     packet->compartment_id = (metadata->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) != 0 ? metadata->compartmentId : UNSPECIFIED_COMPARTMENT_ID;
@@ -550,8 +574,11 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
         WdfSpinLockRelease(context->lock);
         goto Exit;
     }
-    if (context->pending_count >= context->queue_capacity || record_size > context->resident_byte_capacity ||
-        context->pending_bytes > context->resident_byte_capacity - record_size) {
+    if (context->pending_count >= context->queue_capacity ||
+        !NT_SUCCESS(RtlSizeTAdd(context->queue_bytes, packet->resident_bytes, &queue_bytes_after)) ||
+        !NT_SUCCESS(RtlSizeTAdd(context->pending_bytes, packet->resident_bytes, &pending_bytes_after)) ||
+        queue_bytes_after > context->resident_byte_capacity ||
+        pending_bytes_after > context->resident_byte_capacity) {
         InterlockedIncrement64(&context->statistics.queue_overflow);
         WdfSpinLockRelease(context->lock);
         goto Exit;
@@ -589,9 +616,9 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     packet->queued = TRUE;
     packet->pending = TRUE;
     ++context->queue_depth;
-    context->queue_bytes += record_size;
+    context->queue_bytes = queue_bytes_after;
     ++context->pending_count;
-    context->pending_bytes += record_size;
+    context->pending_bytes = pending_bytes_after;
     InterlockedIncrement64(&context->statistics.captured);
     packet = NULL; /* pending/queue lists now own the base reference */
     WdfSpinLockRelease(context->lock);
@@ -652,7 +679,7 @@ VOID TgCompletePacket(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UIN
     if (action == TachyonWfpVerdictPermitDirect && packet->clone != NULL && injection != NULL) {
         if (InterlockedIncrement(&context->injection_count) == 1) KeClearEvent(&context->injections_drained);
         status = FwpsInjectTransportSendAsync0(injection, (HANDLE)packet, packet->endpoint_handle, 0,
-                                               packet->raw_send ? NULL : &packet->send_params,
+                                               packet->clone_retreat_active ? NULL : &packet->send_params,
                                                packet->address_family, packet->compartment_id,
                                                packet->clone, TgInjectComplete, packet);
         if (NT_SUCCESS(status)) {
@@ -672,14 +699,38 @@ static VOID NTAPI TgInjectComplete(VOID* context, NET_BUFFER_LIST* net_buffer_li
 {
     TG_PENDING_PACKET* packet = (TG_PENDING_PACKET*)context;
     UNREFERENCED_PARAMETER(dispatch_level);
-    if (net_buffer_list != NULL) FwpsFreeCloneNetBufferList0(net_buffer_list, 0);
-    packet->clone = NULL;
+    NT_ASSERT(net_buffer_list == NULL || net_buffer_list == packet->clone);
+    TgReleasePacketClone(packet);
     InterlockedCompareExchange(&packet->state, packet->terminal_state, TgPacketCompleting);
     if (packet->flow != NULL && packet->flow->owner != NULL &&
         InterlockedDecrement(&packet->flow->owner->injection_count) == 0) {
         KeSetEvent(&packet->flow->owner->injections_drained, IO_NO_INCREMENT, FALSE);
     }
     TgPacketDereference(packet);
+}
+
+static VOID TgReleasePacketClone(TG_PENDING_PACKET* packet)
+{
+    NET_BUFFER_LIST* clone;
+    if (packet == NULL) return;
+    clone = packet->clone;
+    if (clone == NULL) {
+        NT_ASSERT(!packet->clone_retreat_active);
+        return;
+    }
+    if (packet->clone_retreat_active) {
+        NT_ASSERT(packet->clone_retreated_buffer != NULL);
+        NT_ASSERT(packet->clone_retreat_length != 0);
+        if (packet->clone_retreated_buffer != NULL && packet->clone_retreat_length != 0) {
+            NdisAdvanceNetBufferDataStart(packet->clone_retreated_buffer,
+                                          packet->clone_retreat_length, TRUE, NULL);
+        }
+        packet->clone_retreated_buffer = NULL;
+        packet->clone_retreat_length = 0;
+        packet->clone_retreat_active = FALSE;
+    }
+    FwpsFreeCloneNetBufferList0(clone, 0);
+    packet->clone = NULL;
 }
 
 VOID TgPacketReference(TG_PENDING_PACKET* packet)
@@ -699,16 +750,17 @@ VOID TgPacketDereference(TG_PENDING_PACKET* packet)
 static VOID TgFreePendingPacket(TG_PENDING_PACKET* packet)
 {
     if (packet == NULL) return;
-    if (packet->clone != NULL) FwpsFreeCloneNetBufferList0(packet->clone, 0);
+    TgReleasePacketClone(packet);
     if (packet->record != NULL) {
         RtlSecureZeroMemory(packet->record, packet->record_size);
         ExFreePoolWithTag(packet->record, TG_POOL_TAG);
     }
     if (packet->send_params.controlData != NULL) {
-        RtlSecureZeroMemory(packet->send_params.controlData, packet->send_params.controlDataLength);
+        RtlSecureZeroMemory(packet->send_params.controlData, packet->control_data_size);
         ExFreePoolWithTag(packet->send_params.controlData, TG_POOL_TAG);
         packet->send_params.controlData = NULL;
         packet->send_params.controlDataLength = 0;
+        packet->control_data_size = 0;
     }
     if (packet->flow != NULL) {
         TgFlowDereference(packet->flow);

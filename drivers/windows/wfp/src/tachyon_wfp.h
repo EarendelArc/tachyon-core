@@ -2,6 +2,7 @@
 #pragma once
 
 #include <ntddk.h>
+#include <ntintsafe.h>
 #include <wdf.h>
 #include <fwpsk.h>
 #include <fwpmk.h>
@@ -17,6 +18,7 @@
 #define TG_STOP_RETRY_COUNT 500u
 #define TG_STOP_RETRY_DELAY_MS 10u
 #define TG_STOP_DRAIN_TIMEOUT_MS 5000u
+#define TG_MAX_CONTROL_DATA_SIZE 4096u
 #define TG_FLOW_ID_SIZE 16u
 #define TG_SHA256_DIGEST_SIZE 32u
 
@@ -97,7 +99,11 @@ typedef struct TG_PENDING_PACKET {
     LIST_ENTRY pending_link;
     TACHYON_WFP_CAPTURE_RECORD* record;
     SIZE_T record_size;
+    SIZE_T control_data_size;
+    SIZE_T resident_bytes;
     NET_BUFFER_LIST* clone;
+    NET_BUFFER* clone_retreated_buffer;
+    ULONG clone_retreat_length;
     TG_FLOW_CONTEXT* flow;
     UINT64 request_id;
     UINT64 sequence;
@@ -115,7 +121,7 @@ typedef struct TG_PENDING_PACKET {
     volatile LONG terminal_state;
     BOOLEAN queued;
     BOOLEAN pending;
-    BOOLEAN raw_send;
+    BOOLEAN clone_retreat_active;
 } TG_PENDING_PACKET;
 
 struct TG_DEVICE_CONTEXT {
@@ -177,6 +183,7 @@ _Static_assert(sizeof(TG_SHA256_DIGEST) == TG_SHA256_DIGEST_SIZE, "SHA-256 diges
 _Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->flow_id) == TG_FLOW_ID_SIZE, "flow ID width");
 _Static_assert(sizeof(((TG_FLOW_CONTEXT*)0)->lease_nonce) == 16u, "flow lease nonce width");
 _Static_assert(TG_FLOW_ID_SIZE < TG_SHA256_DIGEST_SIZE, "flow ID is a truncated digest");
+_Static_assert(TG_MAX_CONTROL_DATA_SIZE <= TACHYON_WFP_MAX_MESSAGE_SIZE, "control data cap");
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_DEVICE_CONTEXT, TgGetDeviceContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_FILE_CONTEXT, TgGetFileContext)

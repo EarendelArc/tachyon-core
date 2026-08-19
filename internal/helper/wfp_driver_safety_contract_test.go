@@ -307,12 +307,66 @@ func TestWFPDatagramCaptureRevalidatesSessionAndPolicyAtQueueCommit(t *testing.T
 }
 
 func TestWFPWireAndRawInjectionContracts(t *testing.T) {
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
 	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
+	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))
 	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))
 	for _, required := range []string{"RtlUlongByteSwap", "FWPS_METADATA_FIELD_IP_HEADER_SIZE", "NdisRetreatNetBufferDataStart",
-		"packet->raw_send ? NULL : &packet->send_params", "KeQueryInterruptTimePrecise"} {
+		"packet->clone_retreat_active ? NULL : &packet->send_params", "KeQueryInterruptTimePrecise"} {
 		if !strings.Contains(wfp+device, required) {
 			t.Fatalf("wire/raw/clock contract missing %q", required)
+		}
+	}
+	for _, required := range []string{"TG_MAX_CONTROL_DATA_SIZE 4096u", "SIZE_T control_data_size",
+		"SIZE_T resident_bytes", "NET_BUFFER* clone_retreated_buffer", "ULONG clone_retreat_length",
+		"BOOLEAN clone_retreat_active"} {
+		if !strings.Contains(header, required) {
+			t.Fatalf("packet retreat/resident contract missing %q", required)
+		}
+	}
+
+	classify := cFunctionBody(t, wfp, "static VOID TgClassifyDatagram(")
+	singleNB := strings.Index(classify, "NET_BUFFER_NEXT_NB(clone_buffer) != NULL")
+	retreat := strings.Index(classify, "NdisRetreatNetBufferDataStart")
+	retreatSucceeded := strings.Index(classify, "if (ndis_status != NDIS_STATUS_SUCCESS) goto Exit")
+	recordState := strings.Index(classify, "packet->clone_retreated_buffer = clone_buffer")
+	if singleNB < 0 || retreat < 0 || retreatSucceeded < 0 || recordState < 0 ||
+		!(singleNB < retreat && retreat < retreatSucceeded && retreatSucceeded < recordState) {
+		t.Fatal("raw clone does not reject multi-NB input and record state only after retreat succeeds")
+	}
+	for _, required := range []string{
+		"RtlSizeTAdd(record_size, control_data_size, &resident_bytes)",
+		"RtlSizeTAdd(context->queue_bytes, packet->resident_bytes, &queue_bytes_after)",
+		"RtlSizeTAdd(context->pending_bytes, packet->resident_bytes, &pending_bytes_after)",
+		"packet->record->header.total_size = (UINT32)record_size",
+		"context->queue_bytes = queue_bytes_after",
+		"context->pending_bytes = pending_bytes_after",
+	} {
+		if !strings.Contains(classify, required) {
+			t.Fatalf("resident budget/wire separation missing %q", required)
+		}
+	}
+	if strings.Contains(queue, "bytes -= packet->record_size") ||
+		strings.Count(queue, "bytes -= packet->resident_bytes") != 3 {
+		t.Fatal("queue or pending release accounting omits controlData resident bytes")
+	}
+
+	release := cFunctionBody(t, wfp, "static VOID TgReleasePacketClone(")
+	advance := strings.Index(release, "NdisAdvanceNetBufferDataStart")
+	free := strings.Index(release, "FwpsFreeCloneNetBufferList0")
+	if advance < 0 || free < 0 || advance > free ||
+		!strings.Contains(release, "packet->clone_retreated_buffer = NULL") ||
+		!strings.Contains(release, "packet->clone_retreat_length = 0") ||
+		!strings.Contains(release, "packet->clone_retreat_active = FALSE") {
+		t.Fatal("clone release does not advance an active retreat exactly before free")
+	}
+	if strings.Count(wfp, "NdisAdvanceNetBufferDataStart(") != 1 ||
+		strings.Count(wfp, "FwpsFreeCloneNetBufferList0(") != 1 {
+		t.Fatal("clone advance/free bypasses the unified retreat-aware release path")
+	}
+	for _, signature := range []string{"static VOID NTAPI TgInjectComplete(", "static VOID TgFreePendingPacket("} {
+		if !strings.Contains(cFunctionBody(t, wfp, signature), "TgReleasePacketClone(packet)") {
+			t.Fatalf("%s bypasses unified clone release", signature)
 		}
 	}
 	if strings.Contains(device, "KeQuerySystemTime") {

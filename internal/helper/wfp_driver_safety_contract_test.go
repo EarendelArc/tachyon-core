@@ -269,8 +269,20 @@ func TestWFPWDKCompileTypesAndVersionedCallbacks(t *testing.T) {
 		t.Fatal("WFP runtime registration mixes classify context or a non-FN0 API version")
 	}
 	management := cFunctionBody(t, wfp, "static NTSTATUS TgAddEngineCalloutAndFilter(")
-	if !strings.Contains(management, "UINT32 id;") || strings.Contains(management, "UINT64 id;") {
-		t.Fatal("FwpmCalloutAdd0 local ID must be UINT32")
+	for _, required := range []string{
+		"UINT32 callout_id;",
+		"UINT64 filter_id;",
+		"FwpmCalloutAdd0(engine, &callout, NULL, &callout_id)",
+		"FwpmFilterAdd0(engine, &filter, NULL, &filter_id)",
+	} {
+		if !strings.Contains(management, required) {
+			t.Fatalf("management callout/filter ID contract missing %q", required)
+		}
+	}
+	injectComplete := cFunctionBody(t, wfp, "static VOID NTAPI TgInjectComplete(")
+	if !strings.Contains(injectComplete, "NT_ASSERT(net_buffer_list == NULL || net_buffer_list == packet->clone)") ||
+		!strings.Contains(injectComplete, "UNREFERENCED_PARAMETER(net_buffer_list)") {
+		t.Fatal("Release injection completion does not explicitly consume its debug-only NBL parameter")
 	}
 }
 

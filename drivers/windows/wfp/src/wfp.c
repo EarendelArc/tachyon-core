@@ -273,13 +273,14 @@ static NTSTATUS TgAddEngineCalloutAndFilter(HANDLE engine, const GUID* key, cons
     FWPM_CALLOUT0 callout;
     FWPM_FILTER0 filter;
     FWPM_FILTER_CONDITION0 condition;
-    UINT32 id;
+    UINT32 callout_id;
+    UINT64 filter_id;
     NTSTATUS status;
     RtlZeroMemory(&callout, sizeof(callout));
     callout.calloutKey = *key;
     callout.displayData.name = L"Tachyon WFP callout";
     callout.applicableLayer = *layer;
-    status = FwpmCalloutAdd0(engine, &callout, NULL, &id);
+    status = FwpmCalloutAdd0(engine, &callout, NULL, &callout_id);
     if (!NT_SUCCESS(status)) return status;
     RtlZeroMemory(&condition, sizeof(condition));
     condition.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
@@ -295,7 +296,7 @@ static NTSTATUS TgAddEngineCalloutAndFilter(HANDLE engine, const GUID* key, cons
     filter.filterCondition = &condition;
     filter.action.type = action;
     filter.action.calloutKey = *key;
-    return FwpmFilterAdd0(engine, &filter, NULL, &id);
+    return FwpmFilterAdd0(engine, &filter, NULL, &filter_id);
 }
 
 NTSTATUS NTAPI TgNotify(FWPS_CALLOUT_NOTIFY_TYPE type, const GUID* filter_key, const FWPS_FILTER0* filter)
@@ -700,6 +701,7 @@ static VOID NTAPI TgInjectComplete(VOID* context, NET_BUFFER_LIST* net_buffer_li
     TG_PENDING_PACKET* packet = (TG_PENDING_PACKET*)context;
     UNREFERENCED_PARAMETER(dispatch_level);
     NT_ASSERT(net_buffer_list == NULL || net_buffer_list == packet->clone);
+    UNREFERENCED_PARAMETER(net_buffer_list);
     TgReleasePacketClone(packet);
     InterlockedCompareExchange(&packet->state, packet->terminal_state, TgPacketCompleting);
     if (packet->flow != NULL && packet->flow->owner != NULL &&

@@ -1,11 +1,18 @@
 package helper
 
 import (
+	"encoding/xml"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type msbuildElement struct {
+	XMLName xml.Name
+	Value   string `xml:",chardata"`
+}
 
 func readWFPDriverSource(t *testing.T, name string) string {
 	t.Helper()
@@ -48,6 +55,104 @@ func cFunctionBody(t *testing.T, source, signature string) string {
 	}
 	t.Fatalf("unterminated body for C function %q", signature)
 	return ""
+}
+
+func TestWFPProjectLeavesWDKOwnedMacrosToTheToolchain(t *testing.T) {
+	projectRoot := filepath.Join("..", "..", "drivers", "windows", "wfp")
+	wdkOwned := map[string]bool{
+		"_KERNEL_MODE":  true,
+		"_WIN32_WINNT":  true,
+		"WINVER":        true,
+		"WINNT":         true,
+		"NTDDI_VERSION": true,
+		"_AMD64_":       true,
+		"AMD64":         true,
+		"_ARM64_":       true,
+		"ARM64":         true,
+	}
+	required := map[string]bool{
+		"POOL_NX_OPTIN=1":            false,
+		"NDIS630=1":                  false,
+		"%(PreprocessorDefinitions)": false,
+	}
+	foundProject := false
+	err := filepath.WalkDir(projectRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		extension := strings.ToLower(filepath.Ext(path))
+		if extension != ".vcxproj" && extension != ".props" && extension != ".targets" {
+			return nil
+		}
+		foundProject = true
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		decoder := xml.NewDecoder(strings.NewReader(string(data)))
+		for {
+			token, tokenErr := decoder.Token()
+			if tokenErr != nil {
+				if tokenErr == io.EOF {
+					break
+				}
+				return tokenErr
+			}
+			start, ok := token.(xml.StartElement)
+			if !ok || (start.Name.Local != "PreprocessorDefinitions" && start.Name.Local != "AdditionalOptions") {
+				continue
+			}
+			var element msbuildElement
+			if decodeErr := decoder.DecodeElement(&element, &start); decodeErr != nil {
+				return decodeErr
+			}
+			if start.Name.Local == "AdditionalOptions" {
+				upper := strings.ToUpper(element.Value)
+				for macro := range wdkOwned {
+					if strings.Contains(upper, "/D"+macro) || strings.Contains(upper, "-D"+macro) {
+						t.Errorf("%s injects WDK-owned macro %s through AdditionalOptions", path, macro)
+					}
+				}
+				continue
+			}
+			seen := make(map[string]bool)
+			for _, definition := range strings.Split(element.Value, ";") {
+				definition = strings.TrimSpace(definition)
+				if definition == "" {
+					continue
+				}
+				name := definition
+				if equals := strings.IndexByte(name, '='); equals >= 0 {
+					name = name[:equals]
+				}
+				if wdkOwned[name] {
+					t.Errorf("%s explicitly defines WDK-owned macro %s", path, name)
+				}
+				if seen[name] {
+					t.Errorf("%s repeats preprocessor macro %s", path, name)
+				}
+				seen[name] = true
+				if _, ok := required[definition]; ok {
+					required[definition] = true
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !foundProject {
+		t.Fatal("no WFP MSBuild project files found")
+	}
+	for definition, found := range required {
+		if !found {
+			t.Errorf("WFP project definition missing %q", definition)
+		}
+	}
 }
 
 func TestWFPClassifyChecksActionWriteBeforeAnyDecisionWrite(t *testing.T) {

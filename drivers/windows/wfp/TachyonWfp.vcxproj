@@ -68,9 +68,11 @@
   <ItemGroup><Inf Include="tachyon-wfp.inf" /></ItemGroup>
   <ItemGroup Condition="'$(TachyonUseNuGetWDK)'=='true' and '$(Platform)'=='x64'">
     <PackageReference Include="Microsoft.Windows.WDK.x64" Version="10.0.28000.2526" GeneratePathProperty="true" />
+    <PackageReference Include="Microsoft.Windows.SDK.CPP.x64" Version="[10.0.28000.1721]" />
   </ItemGroup>
   <ItemGroup Condition="'$(TachyonUseNuGetWDK)'=='true' and '$(Platform)'=='ARM64'">
     <PackageReference Include="Microsoft.Windows.WDK.ARM64" Version="10.0.28000.2526" GeneratePathProperty="true" />
+    <PackageReference Include="Microsoft.Windows.SDK.CPP.ARM64" Version="[10.0.28000.1721]" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

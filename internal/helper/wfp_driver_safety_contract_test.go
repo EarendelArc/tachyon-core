@@ -187,9 +187,9 @@ func TestWFPABISeparatesKernelTypesFromUserCRTAndExpandsCompilerContracts(t *tes
 		"TACHYON_WFP_STATIC_ASSERT(condition, message) static_assert",
 		"TACHYON_WFP_JOIN(tachyon_wfp_static_assert_, __COUNTER__)",
 		"TACHYON_WFP_STATIC_ASSERT(condition, message) _Static_assert",
-		"TACHYON_WFP_ALIGNOF(type) TYPE_ALIGNMENT(type)",
-		"TACHYON_WFP_ALIGNOF(type) alignof(type)",
 		"TACHYON_WFP_ALIGNOF(type) __alignof__(type)",
+		"TACHYON_WFP_ALIGNOF(type) __alignof(type)",
+		"TACHYON_WFP_ALIGNOF(type) alignof(type)",
 	} {
 		if !strings.Contains(abi, required) {
 			t.Fatalf("portable ABI compiler contract missing %q", required)
@@ -212,6 +212,92 @@ func TestWFPABISeparatesKernelTypesFromUserCRTAndExpandsCompilerContracts(t *tes
 	}
 	if !strings.Contains(project, `<ClCompile Include="src\abi_contract.c" />`) {
 		t.Fatal("kernel ABI compile fixture is not part of the WDK x64/ARM64 project")
+	}
+}
+
+func TestWFPWDKCompileTypesAndVersionedCallbacks(t *testing.T) {
+	abi := readWFPDriverSource(t, filepath.Join("include", "tachyon_wfp_abi.h"))
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	fixture := readWFPDriverSource(t, filepath.Join("src", "abi_contract.c"))
+	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))
+	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
+
+	msvc := strings.Index(abi, "#if defined(_MSC_VER)\n#define TACHYON_WFP_ALIGNOF(type) __alignof(type)")
+	cpp := strings.Index(abi, "#elif defined(__cplusplus)\n#define TACHYON_WFP_ALIGNOF(type) alignof(type)")
+	if msvc < 0 || cpp < 0 || msvc > cpp || strings.Contains(abi, "TYPE_ALIGNMENT(type)") {
+		t.Fatal("MSVC alignof contract must use __alignof before the portable C++ branch")
+	}
+	if !strings.Contains(header, "#include <ntifs.h>") || strings.Contains(header, "#include <ntddk.h>") ||
+		!strings.Contains(fixture, "#include <ntifs.h>") || strings.Contains(fixture, "#include <ntddk.h>") {
+		t.Fatal("kernel translation units must use ntifs.h as their single compatible NT main header")
+	}
+	if strings.Contains(header+wfp, "extern PsLookupProcessByProcessId") {
+		t.Fatal("PsLookupProcessByProcessId must be declared by ntifs.h")
+	}
+	for _, required := range []string{
+		"PWDFDEVICE_INIT init;",
+		"WdfDeviceCreate(&init, &attributes, device_out)",
+		"EVT_WDF_DEVICE_FILE_CREATE TgEvtFileCreate;",
+	} {
+		if !strings.Contains(header+device, required) {
+			t.Fatalf("WDK/WDF type contract missing %q", required)
+		}
+	}
+	if strings.Contains(device, "WDFDEVICE_INIT* init") || strings.Contains(header, "EVT_WDF_FILE_CREATE") {
+		t.Fatal("legacy WDF pointer or callback type remains")
+	}
+
+	for _, callback := range []string{"TgClassifyFlowV4", "TgClassifyFlowV6", "TgClassifyDatagramV4", "TgClassifyDatagramV6"} {
+		declaration := "VOID NTAPI " + callback + "(const FWPS_INCOMING_VALUES0*, const FWPS_INCOMING_METADATA_VALUES0*, VOID*, const FWPS_FILTER0*, UINT64, FWPS_CLASSIFY_OUT0*);"
+		if !strings.Contains(header, declaration) {
+			t.Fatalf("%s is not declared with the six-parameter FN0 signature", callback)
+		}
+	}
+	for _, required := range []string{
+		"FWPS_CALLOUT_CLASSIFY_FN0 classify",
+		"FWPS_CALLOUT0 callout",
+		"FwpsCalloutRegister0",
+		"VOID* layer_data, const FWPS_FILTER0* filter",
+	} {
+		if !strings.Contains(wfp, required) {
+			t.Fatalf("FWPS_CALLOUT0 registration chain missing %q", required)
+		}
+	}
+	if strings.Contains(header+wfp, "classify_context") || strings.Contains(header+wfp, "classifyContext") ||
+		strings.Contains(header+wfp, "FWPS_CALLOUT_CLASSIFY_FN1") || strings.Contains(header+wfp, "FWPS_CALLOUT_CLASSIFY_FN2") ||
+		strings.Contains(header+wfp, "FwpsCalloutRegister1") || strings.Contains(header+wfp, "FwpsCalloutRegister2") {
+		t.Fatal("WFP runtime registration mixes classify context or a non-FN0 API version")
+	}
+	management := cFunctionBody(t, wfp, "static NTSTATUS TgAddEngineCalloutAndFilter(")
+	if !strings.Contains(management, "UINT32 id;") || strings.Contains(management, "UINT64 id;") {
+		t.Fatal("FwpmCalloutAdd0 local ID must be UINT32")
+	}
+}
+
+func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
+	project := readWFPDriverSource(t, "TachyonWfp.vcxproj")
+	workflowData, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "wfp-driver.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(workflowData)
+	for _, required := range []string{
+		`<PackageReference Include="Microsoft.Windows.SDK.CPP.x64" Version="[10.0.28000.1721]" />`,
+		`<PackageReference Include="Microsoft.Windows.SDK.CPP.ARM64" Version="[10.0.28000.1721]" />`,
+		"<TreatWarningAsError>true</TreatWarningAsError>",
+		"<EnablePREfast>true</EnablePREfast>",
+	} {
+		if !strings.Contains(project, required) {
+			t.Fatalf("reproducible WDK project contract missing %q", required)
+		}
+	}
+	if strings.Contains(project, "<NoWarn>") || strings.Contains(project, "<WarningsNotAsErrors>") {
+		t.Fatal("project hides NuGet or compiler warnings")
+	}
+	for _, required := range []string{"platform: x64", "platform: ARM64", "/warnaserror", "/p:EnablePREfast=true", "Locate WDK InfVerif and validate INF"} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("WFP workflow gate missing %q", required)
+		}
 	}
 }
 

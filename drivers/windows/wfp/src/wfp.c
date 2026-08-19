@@ -273,7 +273,7 @@ static NTSTATUS TgAddEngineCalloutAndFilter(HANDLE engine, const GUID* key, cons
     FWPM_CALLOUT0 callout;
     FWPM_FILTER0 filter;
     FWPM_FILTER_CONDITION0 condition;
-    UINT64 id;
+    UINT32 id;
     NTSTATUS status;
     RtlZeroMemory(&callout, sizeof(callout));
     callout.calloutKey = *key;
@@ -412,18 +412,18 @@ Exit:
 }
 
 VOID NTAPI TgClassifyFlowV4(const FWPS_INCOMING_VALUES0* values, const FWPS_INCOMING_METADATA_VALUES0* metadata,
-                            VOID* layer_data, const VOID* classify_context, const FWPS_FILTER0* filter,
+                            VOID* layer_data, const FWPS_FILTER0* filter,
                             UINT64 flow_context, FWPS_CLASSIFY_OUT0* classify_out)
 {
-    UNREFERENCED_PARAMETER(layer_data); UNREFERENCED_PARAMETER(classify_context); UNREFERENCED_PARAMETER(flow_context);
+    UNREFERENCED_PARAMETER(layer_data); UNREFERENCED_PARAMETER(flow_context);
     TgClassifyFlow(AF_INET, values, metadata, filter, classify_out);
 }
 
 VOID NTAPI TgClassifyFlowV6(const FWPS_INCOMING_VALUES0* values, const FWPS_INCOMING_METADATA_VALUES0* metadata,
-                            VOID* layer_data, const VOID* classify_context, const FWPS_FILTER0* filter,
+                            VOID* layer_data, const FWPS_FILTER0* filter,
                             UINT64 flow_context, FWPS_CLASSIFY_OUT0* classify_out)
 {
-    UNREFERENCED_PARAMETER(layer_data); UNREFERENCED_PARAMETER(classify_context); UNREFERENCED_PARAMETER(flow_context);
+    UNREFERENCED_PARAMETER(layer_data); UNREFERENCED_PARAMETER(flow_context);
     TgClassifyFlow(AF_INET6, values, metadata, filter, classify_out);
 }
 
@@ -634,18 +634,18 @@ Exit:
 }
 
 VOID NTAPI TgClassifyDatagramV4(const FWPS_INCOMING_VALUES0* values, const FWPS_INCOMING_METADATA_VALUES0* metadata,
-                                VOID* layer_data, const VOID* classify_context, const FWPS_FILTER0* filter,
+                                VOID* layer_data, const FWPS_FILTER0* filter,
                                 UINT64 flow_context, FWPS_CLASSIFY_OUT0* classify_out)
 {
-    UNREFERENCED_PARAMETER(classify_context); UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(filter);
     TgClassifyDatagram(AF_INET, values, metadata, layer_data, flow_context, classify_out);
 }
 
 VOID NTAPI TgClassifyDatagramV6(const FWPS_INCOMING_VALUES0* values, const FWPS_INCOMING_METADATA_VALUES0* metadata,
-                                VOID* layer_data, const VOID* classify_context, const FWPS_FILTER0* filter,
+                                VOID* layer_data, const FWPS_FILTER0* filter,
                                 UINT64 flow_context, FWPS_CLASSIFY_OUT0* classify_out)
 {
-    UNREFERENCED_PARAMETER(classify_context); UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(filter);
     TgClassifyDatagram(AF_INET6, values, metadata, layer_data, flow_context, classify_out);
 }
 

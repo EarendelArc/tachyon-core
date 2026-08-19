@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <ntddk.h>
+#include <ntifs.h>
 
 #include "../include/tachyon_wfp_abi.h"
 

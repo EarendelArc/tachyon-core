@@ -35,12 +35,10 @@ typedef uint64_t TACHYON_WFP_UINT64;
 #define TACHYON_WFP_STATIC_ASSERT(condition, message) _Static_assert((condition), message)
 #endif
 
-#if defined(_KERNEL_MODE)
-#define TACHYON_WFP_ALIGNOF(type) TYPE_ALIGNMENT(type)
+#if defined(_MSC_VER)
+#define TACHYON_WFP_ALIGNOF(type) __alignof(type)
 #elif defined(__cplusplus)
 #define TACHYON_WFP_ALIGNOF(type) alignof(type)
-#elif defined(_MSC_VER)
-#define TACHYON_WFP_ALIGNOF(type) __alignof(type)
 #elif defined(__clang__) || defined(__GNUC__)
 #define TACHYON_WFP_ALIGNOF(type) __alignof__(type)
 #else

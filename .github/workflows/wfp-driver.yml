@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - feature/windows-wfp-dataplane
     paths:
       - ".github/workflows/wfp-driver.yml"
       - "drivers/windows/wfp/**"

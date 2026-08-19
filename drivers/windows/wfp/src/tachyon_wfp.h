@@ -14,6 +14,9 @@
 #define TG_SYMBOLIC_LINK L"\\DosDevices\\TachyonWFP"
 #define TG_HELPER_SDDL L"D:P(A;;GA;;;SY)(A;;GA;;;" TACHYON_WFP_HELPER_SERVICE_SID_WIDE L")"
 #define TG_TIMER_PERIOD_MS 25u
+#define TG_STOP_RETRY_COUNT 500u
+#define TG_STOP_RETRY_DELAY_MS 10u
+#define TG_STOP_DRAIN_TIMEOUT_MS 5000u
 
 typedef enum TG_PACKET_STATE {
     TgPacketCaptured = 1,
@@ -24,6 +27,10 @@ typedef enum TG_PACKET_STATE {
 } TG_PACKET_STATE;
 
 typedef struct TG_DEVICE_CONTEXT TG_DEVICE_CONTEXT;
+
+typedef struct TG_FILE_CONTEXT {
+    volatile LONG negotiated;
+} TG_FILE_CONTEXT;
 
 typedef struct TG_POLICY {
     UINT64 generation;
@@ -44,7 +51,7 @@ typedef struct TG_FLOW_CONTEXT {
     UCHAR flow_id[16];
     UCHAR lease_nonce[16];
     UCHAR app_id_hash[32];
-    UCHAR user_sid_hash[32];
+    UCHAR user_security_descriptor_hash[32];
     ADDRESS_FAMILY address_family;
     UINT8 direction;
     volatile LONG references;
@@ -77,6 +84,7 @@ typedef struct TG_PENDING_PACKET {
     volatile LONG terminal_state;
     BOOLEAN queued;
     BOOLEAN pending;
+    BOOLEAN raw_send;
 } TG_PENDING_PACKET;
 
 struct TG_DEVICE_CONTEXT {
@@ -112,10 +120,12 @@ struct TG_DEVICE_CONTEXT {
     volatile LONG injection_count;
     volatile LONG client_open;
     volatile LONG stopping;
+    volatile LONG stopped;
     TACHYON_WFP_STATISTICS statistics;
 };
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_DEVICE_CONTEXT, TgGetDeviceContext)
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TG_FILE_CONTEXT, TgGetFileContext)
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_UNLOAD TgEvtDriverUnload;
@@ -145,6 +155,7 @@ VOID TgClearPolicy(TG_DEVICE_CONTEXT* context);
 NTSTATUS TgApplyVerdict(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input_size);
 NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size);
 VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct);
+VOID TgFlushGeneration(TG_DEVICE_CONTEXT* context, UINT64 generation, BOOLEAN permit_direct);
 VOID TgServiceCaptureWaiter(TG_DEVICE_CONTEXT* context);
 VOID TgCompletePacket(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UINT32 action);
 VOID TgPacketReference(TG_PENDING_PACKET* packet);
@@ -156,4 +167,5 @@ VOID TgReleaseControlContext(TG_DEVICE_CONTEXT* context);
 
 BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length, UCHAR output[32]);
 BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow);
-UINT64 TgNow100ns(VOID);
+UINT64 TgInterruptTime100ns(VOID);
+DECLSPEC_NORETURN VOID TgFailStopUnload(NTSTATUS status);

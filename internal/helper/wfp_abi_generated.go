@@ -32,19 +32,19 @@ const (
 	wfpVerdictPermitDirect uint32 = 0x2
 	wfpVerdictTunnel       uint32 = 0x1
 
-	wfpCapAppID             uint64 = 0x40
-	wfpCapBoundedQueue      uint64 = 0x200
-	wfpCapDatagramV4        uint64 = 0x4
-	wfpCapDatagramV6        uint64 = 0x8
-	wfpCapFailOpenTimeout   uint64 = 0x400
-	wfpCapFlowV4            uint64 = 0x1
-	wfpCapFlowV6            uint64 = 0x2
-	wfpCapInjectionState    uint64 = 0x100
-	wfpCapInjectSend        uint64 = 0x80
-	wfpCapPolicyGeneration  uint64 = 0x800
-	wfpCapProcessIdentity   uint64 = 0x10
-	wfpCapUserSID           uint64 = 0x20
-	wfpRequiredCapabilities uint64 = 0xfff
+	wfpCapAppID                  uint64 = 0x40
+	wfpCapBoundedQueue           uint64 = 0x200
+	wfpCapDatagramV4             uint64 = 0x4
+	wfpCapDatagramV6             uint64 = 0x8
+	wfpCapFailOpenTimeout        uint64 = 0x400
+	wfpCapFlowV4                 uint64 = 0x1
+	wfpCapFlowV6                 uint64 = 0x2
+	wfpCapInjectionState         uint64 = 0x100
+	wfpCapInjectSend             uint64 = 0x80
+	wfpCapPolicyGeneration       uint64 = 0x800
+	wfpCapProcessIdentity        uint64 = 0x10
+	wfpCapUserSecurityDescriptor uint64 = 0x20
+	wfpRequiredCapabilities      uint64 = 0xfff
 
 	ioctlWFPDequeue       uint32 = 0x12640e
 	ioctlWFPDisablePolicy uint32 = 0x12a408

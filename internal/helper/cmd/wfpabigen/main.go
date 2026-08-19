@@ -75,7 +75,7 @@ func main() {
 	capNames := map[string]string{
 		"TACHYON_WFP_CAP_FLOW_V4": "wfpCapFlowV4", "TACHYON_WFP_CAP_FLOW_V6": "wfpCapFlowV6",
 		"TACHYON_WFP_CAP_DATAGRAM_V4": "wfpCapDatagramV4", "TACHYON_WFP_CAP_DATAGRAM_V6": "wfpCapDatagramV6",
-		"TACHYON_WFP_CAP_PROCESS_IDENTITY": "wfpCapProcessIdentity", "TACHYON_WFP_CAP_USER_SID": "wfpCapUserSID",
+		"TACHYON_WFP_CAP_PROCESS_IDENTITY": "wfpCapProcessIdentity", "TACHYON_WFP_CAP_USER_SECURITY_DESCRIPTOR": "wfpCapUserSecurityDescriptor",
 		"TACHYON_WFP_CAP_APP_ID": "wfpCapAppID", "TACHYON_WFP_CAP_INJECT_SEND": "wfpCapInjectSend",
 		"TACHYON_WFP_CAP_INJECTION_STATE": "wfpCapInjectionState", "TACHYON_WFP_CAP_BOUNDED_QUEUE": "wfpCapBoundedQueue",
 		"TACHYON_WFP_CAP_FAIL_OPEN_TIMEOUT": "wfpCapFailOpenTimeout", "TACHYON_WFP_CAP_POLICY_GENERATION": "wfpCapPolicyGeneration",

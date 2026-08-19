@@ -35,6 +35,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver_object, _In_ PUNICODE_STRING reg
         WdfObjectDelete(device);
         return status;
     }
+    WdfTimerStart(TgGetDeviceContext(device)->timer, WDF_REL_TIMEOUT_IN_MS(TG_TIMER_PERIOD_MS));
     WdfControlFinishInitializing(device);
     return STATUS_SUCCESS;
 }
@@ -44,7 +45,15 @@ VOID TgEvtDriverUnload(_In_ WDFDRIVER driver)
     UNREFERENCED_PARAMETER(driver);
     if (TgControlDevice != NULL) {
         NTSTATUS status = TgWfpStop(TgGetDeviceContext(TgControlDevice));
-        NT_ASSERT(NT_SUCCESS(status));
+        if (!NT_SUCCESS(status)) {
+            TgFailStopUnload(status);
+        }
         TgControlDevice = NULL;
     }
+}
+
+DECLSPEC_NORETURN VOID TgFailStopUnload(NTSTATUS status)
+{
+    KeBugCheckEx(DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS,
+                 (ULONG_PTR)TgControlDevice, (ULONG_PTR)status, 0, 0);
 }

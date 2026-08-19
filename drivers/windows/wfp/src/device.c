@@ -3,6 +3,8 @@
 
 static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T input_size, SIZE_T output_size);
 static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size);
+static BOOLEAN TgIoctlRequiresNegotiation(ULONG ioctl);
+static BOOLEAN TgRequestIsNegotiated(WDFREQUEST request);
 
 NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_out)
 {
@@ -11,6 +13,7 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
     DECLARE_CONST_UNICODE_STRING(symbolic_link, TG_SYMBOLIC_LINK);
     WDFDEVICE_INIT* init;
     WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES file_attributes;
     WDF_FILEOBJECT_CONFIG file_config;
     WDF_IO_QUEUE_CONFIG queue_config;
     WDF_IO_QUEUE_CONFIG manual_config;
@@ -26,7 +29,8 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
     WdfDeviceInitSetCharacteristics(init, FILE_DEVICE_SECURE_OPEN, FALSE);
     WdfDeviceInitSetIoType(init, WdfDeviceIoDirect);
     WDF_FILEOBJECT_CONFIG_INIT(&file_config, TgEvtFileCreate, WDF_NO_EVENT_CALLBACK, TgEvtFileCleanup);
-    WdfDeviceInitSetFileObjectConfig(init, &file_config, WDF_NO_OBJECT_ATTRIBUTES);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&file_attributes, TG_FILE_CONTEXT);
+    WdfDeviceInitSetFileObjectConfig(init, &file_config, &file_attributes);
     status = WdfDeviceInitAssignName(init, &device_name);
     if (!NT_SUCCESS(status)) {
         WdfDeviceInitFree(init);
@@ -90,7 +94,7 @@ NTSTATUS TgCreateControlDevice(_In_ WDFDRIVER driver, _Out_ WDFDEVICE* device_ou
 VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFILEOBJECT file_object)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(device);
-    UNREFERENCED_PARAMETER(file_object);
+    InterlockedExchange(&TgGetFileContext(file_object)->negotiated, 0);
     if (InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
         InterlockedCompareExchange(&context->client_open, 1, 0) != 0) {
         WdfRequestComplete(request, STATUS_DEVICE_BUSY);
@@ -102,6 +106,7 @@ VOID TgEvtFileCreate(_In_ WDFDEVICE device, _In_ WDFREQUEST request, _In_ WDFFIL
 VOID TgEvtFileCleanup(_In_ WDFFILEOBJECT file_object)
 {
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext(WdfFileObjectGetDevice(file_object));
+    InterlockedExchange(&TgGetFileContext(file_object)->negotiated, 0);
     InterlockedExchange(&context->client_open, 0);
     TgClearPolicy(context);
 }
@@ -113,6 +118,10 @@ VOID TgEvtIoDeviceControl(_In_ WDFQUEUE queue, _In_ WDFREQUEST request, _In_ SIZ
     VOID* input = NULL;
     NTSTATUS status;
 
+    if (TgIoctlRequiresNegotiation(ioctl) && !TgRequestIsNegotiated(request)) {
+        WdfRequestComplete(request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
     switch (ioctl) {
     case IOCTL_TACHYON_WFP_NEGOTIATE:
         status = TgNegotiate(context, request, input_size, output_size);
@@ -152,6 +161,8 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
 {
     TACHYON_WFP_NEGOTIATE_REQUEST* input;
     TACHYON_WFP_NEGOTIATE_RESPONSE* output;
+    WDFFILEOBJECT file_object;
+    TG_FILE_CONTEXT* file_context;
     NTSTATUS status;
     static const UCHAR build_id[16] = TACHYON_WFP_DRIVER_BUILD_ID_INIT;
     static const UCHAR helper_build_id[16] = TACHYON_WFP_HELPER_BUILD_ID_INIT;
@@ -171,8 +182,17 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
         input->requested_timeout_ms < 25 || input->requested_timeout_ms > 1000) {
         return STATUS_REVISION_MISMATCH;
     }
+    file_object = WdfRequestGetFileObject(request);
+    if (file_object == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    file_context = TgGetFileContext(file_object);
+    if (InterlockedCompareExchange(&file_context->negotiated, -1, 0) != 0) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     status = WdfRequestRetrieveOutputBuffer(request, sizeof(*output), (VOID**)&output, NULL);
     if (!NT_SUCCESS(status)) {
+        InterlockedExchange(&file_context->negotiated, 0);
         return status;
     }
     RtlZeroMemory(output, sizeof(*output));
@@ -195,8 +215,28 @@ static NTSTATUS TgNegotiate(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE
     context->verdict_timeout_ms = input->requested_timeout_ms;
     WdfSpinLockRelease(context->lock);
     WdfRequestSetInformation(request, sizeof(*output));
-    WdfTimerStart(context->timer, WDF_REL_TIMEOUT_IN_MS(TG_TIMER_PERIOD_MS));
+    InterlockedExchange(&file_context->negotiated, 1);
     return STATUS_SUCCESS;
+}
+
+static BOOLEAN TgIoctlRequiresNegotiation(ULONG ioctl)
+{
+    switch (ioctl) {
+    case IOCTL_TACHYON_WFP_SET_POLICY:
+    case IOCTL_TACHYON_WFP_DISABLE_POLICY:
+    case IOCTL_TACHYON_WFP_DEQUEUE:
+    case IOCTL_TACHYON_WFP_VERDICT:
+    case IOCTL_TACHYON_WFP_STATISTICS:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOLEAN TgRequestIsNegotiated(WDFREQUEST request)
+{
+    WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
+    return file_object != NULL && InterlockedCompareExchange(&TgGetFileContext(file_object)->negotiated, 0, 0) == 1;
 }
 
 static NTSTATUS TgReadStatistics(TG_DEVICE_CONTEXT* context, WDFREQUEST request, SIZE_T output_size)
@@ -229,9 +269,8 @@ BOOLEAN TgValidateHeader(const TACHYON_WFP_MESSAGE_HEADER* header, SIZE_T actual
            header->request_id != 0 && header->reserved == 0;
 }
 
-UINT64 TgNow100ns(VOID)
+UINT64 TgInterruptTime100ns(VOID)
 {
-    LARGE_INTEGER value;
-    KeQuerySystemTimePrecise(&value);
-    return (UINT64)value.QuadPart;
+    ULONG64 qpc_timestamp;
+    return KeQueryInterruptTimePrecise(&qpc_timestamp);
 }

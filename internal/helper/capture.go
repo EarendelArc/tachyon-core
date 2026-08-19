@@ -27,18 +27,18 @@ type CaptureCapabilities struct {
 }
 
 type FlowIdentity struct {
-	FlowID          [16]byte
-	Generation      uint64
-	LeaseNonce      [16]byte
-	PID             uint32
-	ProcessStartKey uint64
-	AppIDHash       [32]byte
-	UserSIDHash     [32]byte
-	Direction       uint8
-	ProcessStart    time.Time
-	Local           netip.AddrPort
-	Remote          netip.AddrPort
-	Protocol        uint8
+	FlowID                     [16]byte
+	Generation                 uint64
+	LeaseNonce                 [16]byte
+	PID                        uint32
+	ProcessStartKey            uint64
+	AppIDHash                  [32]byte
+	UserSecurityDescriptorHash [32]byte
+	Direction                  uint8
+	ProcessStart               time.Time
+	Local                      netip.AddrPort
+	Remote                     netip.AddrPort
+	Protocol                   uint8
 }
 
 type CapturedDatagram struct {

@@ -7,7 +7,8 @@ Prism 也不得启用它。Go 测试或 WDK 编译成功都不能单独证明内
 
 接收方向重注入尚未实现。因此规范 ABI 不声明 `INJECT_RECEIVE`，Go provider
 的回程注入固定返回 `ErrCaptureUnavailable`，健康状态绝不会报告 `ready`。
-没有激活策略时，所有 classify 路径都保持 `FWP_ACTION_PERMIT`。
+没有激活策略时，classify 只有在 WFP 授予 `FWPS_RIGHT_ACTION_WRITE` 后才写入
+`FWP_ACTION_PERMIT`；否则必须原样保留上游决策。
 
 ## 所有权模型
 
@@ -26,6 +27,13 @@ Verifier 或 checked-kernel 虚拟机测试。
 出现差异。C 头同时定义固定 driver/helper build-id、规范 UTF-8 Helper Service
 SID 及其 SHA-256、能力位、结构体与 IOCTL。C 构建通过 `_Static_assert` 校验
 packed 布局。
+ABI 2.0 中的 `user_security_descriptor_hash` 是对 WFP 通过 `ALE_USER_ID`
+提供的 self-relative security descriptor 原始字节计算 SHA-256，并不是规范化
+SID 的散列。
+
+协商状态按 file handle 隔离，并作为 policy、dequeue、verdict 与 statistics
+操作的门禁。verdict deadline 使用单调 interrupt time；策略热替换会 fail-open
+清空被替换 generation 的 pending packet。
 
 ## Helper 事务
 

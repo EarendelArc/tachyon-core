@@ -9,7 +9,8 @@ compile does not establish kernel runtime safety.
 Receive injection is not implemented. The canonical ABI therefore does not
 declare `INJECT_RECEIVE`, the Go provider returns `ErrCaptureUnavailable` from
 delivery injection, and provider health never reports `ready`. Without an
-active policy, every classify path keeps `FWP_ACTION_PERMIT`.
+active policy, a classify path sets `FWP_ACTION_PERMIT` only when WFP grants
+`FWPS_RIGHT_ACTION_WRITE`; otherwise it preserves the upstream decision.
 
 ## Ownership model
 
@@ -30,6 +31,13 @@ Driver Verifier or a checked-kernel VM.
 dirty result. The header also owns the fixed driver/helper build IDs, canonical
 UTF-8 Helper Service SID, its SHA-256 value, capabilities, structures, and
 IOCTL definitions. C11 `_Static_assert` validates packed sizes in C builds.
+The ABI 2.0 identity field named `user_security_descriptor_hash` is SHA-256 of
+the exact self-relative security descriptor bytes supplied by WFP as
+`ALE_USER_ID`; it is not a normalized SID hash.
+
+Negotiation is tracked per file handle and gates all policy, dequeue, verdict,
+and statistics operations. Verdict deadlines use monotonic interrupt time.
+Policy replacement fails open pending packets from the replaced generation.
 
 ## Helper transaction
 

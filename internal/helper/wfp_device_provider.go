@@ -20,14 +20,14 @@ type wfpDeviceTransport interface {
 }
 
 type WFPProcessPolicy struct {
-	ProcessID    uint64
-	ProcessStart uint64
-	AppIDHash    [32]byte
-	UserSIDHash  [32]byte
-	MatchPID     bool
-	MatchStart   bool
-	MatchAppID   bool
-	MatchUserSID bool
+	ProcessID                   uint64
+	ProcessStart                uint64
+	AppIDHash                   [32]byte
+	UserSecurityDescriptorHash  [32]byte
+	MatchPID                    bool
+	MatchStart                  bool
+	MatchAppID                  bool
+	MatchUserSecurityDescriptor bool
 }
 
 type WFPPolicy struct {
@@ -107,7 +107,8 @@ func (provider *WFPDeviceProvider) ActivatePolicy(ctx context.Context, policy WF
 	}
 	entries := make([]wfpPolicyEntry, len(policy.Processes))
 	for index, process := range policy.Processes {
-		entry := wfpPolicyEntry{ProcessID: process.ProcessID, ProcessStart: process.ProcessStart, AppIDHash: process.AppIDHash, UserSIDHash: process.UserSIDHash}
+		entry := wfpPolicyEntry{ProcessID: process.ProcessID, ProcessStart: process.ProcessStart, AppIDHash: process.AppIDHash,
+			UserSecurityDescriptorHash: process.UserSecurityDescriptorHash}
 		if process.MatchPID {
 			entry.MatchFlags |= 1 << 0
 		}
@@ -117,7 +118,7 @@ func (provider *WFPDeviceProvider) ActivatePolicy(ctx context.Context, policy WF
 		if process.MatchAppID {
 			entry.MatchFlags |= 1 << 2
 		}
-		if process.MatchUserSID {
+		if process.MatchUserSecurityDescriptor {
 			entry.MatchFlags |= 1 << 3
 		}
 		entries[index] = entry
@@ -247,7 +248,8 @@ func (provider *WFPDeviceProvider) acceptCapture(ctx context.Context, frame wfpC
 	identity := FlowIdentity{
 		FlowID: frame.FlowID, Generation: frame.Generation, LeaseNonce: frame.LeaseNonce,
 		PID: uint32(frame.ProcessID), ProcessStartKey: frame.ProcessStart, AppIDHash: frame.AppIDHash,
-		UserSIDHash: frame.UserSIDHash, Direction: frame.Direction, Local: local, Remote: remote, Protocol: frame.Protocol,
+		UserSecurityDescriptorHash: frame.UserSecurityDescriptorHash, Direction: frame.Direction,
+		Local: local, Remote: remote, Protocol: frame.Protocol,
 	}
 	if callbacks.OnDatagram == nil {
 		return provider.writeVerdict(ctx, frame, wfpVerdictPermitDirect, nil)

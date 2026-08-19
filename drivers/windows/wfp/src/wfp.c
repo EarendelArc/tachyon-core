@@ -24,6 +24,7 @@ static VOID TgFreePendingPacket(TG_PENDING_PACKET* packet);
 static VOID TgCloseFlow(TG_FLOW_CONTEXT* flow);
 static NTSTATUS TgRemoveAllFlowContexts(TG_DEVICE_CONTEXT* context);
 static NTSTATUS TgUnregisterCalloutBlocking(UINT32* callout_id);
+static NTSTATUS TgWaitForDrain(KEVENT* event);
 
 TG_DEVICE_CONTEXT* TgAcquireControlContext(VOID)
 {
@@ -77,6 +78,7 @@ NTSTATUS TgWfpStart(_Inout_ TG_DEVICE_CONTEXT* context)
     FWPM_SESSION0 session;
     FWPM_SUBLAYER0 sublayer;
     NTSTATUS status;
+    NTSTATUS cleanup_status;
 
     status = BCryptOpenAlgorithmProvider(&context->sha256, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_PROV_DISPATCH);
     if (!NT_SUCCESS(status)) {
@@ -127,45 +129,58 @@ NTSTATUS TgWfpStart(_Inout_ TG_DEVICE_CONTEXT* context)
 Abort:
     FwpmTransactionAbort0(context->engine_handle);
 Exit:
-    TgWfpStop(context);
+    cleanup_status = TgWfpStop(context);
+    if (!NT_SUCCESS(cleanup_status)) {
+        TgFailStopUnload(cleanup_status);
+    }
     return status;
 }
 
 NTSTATUS TgWfpStop(_Inout_ TG_DEVICE_CONTEXT* context)
 {
     TG_POLICY* policy;
-    NTSTATUS status = STATUS_SUCCESS;
     NTSTATUS current;
-    if (InterlockedExchange(&context->stopping, 1) != 0) return STATUS_SUCCESS;
+    if (InterlockedCompareExchange(&context->stopped, 0, 0) != 0) return STATUS_SUCCESS;
+    if (InterlockedCompareExchange(&context->stopping, 1, 0) != 0) return STATUS_DEVICE_BUSY;
 
-    /* Closing the dynamic engine session removes filters before callbacks are drained. */
+    /* The dynamic session must close before runtime callouts can be drained. */
     if (context->engine_handle != NULL) {
         current = FwpmEngineClose0(context->engine_handle);
-        if (!NT_SUCCESS(current)) status = current;
+        if (!NT_SUCCESS(current)) return current;
         context->engine_handle = NULL;
     }
 
     InterlockedCompareExchangePointer((PVOID volatile*)&TgControlContext, NULL, context);
     ExWaitForRundownProtectionRelease(&context->callback_rundown);
-    current = TgRemoveAllFlowContexts(context);
-    if (!NT_SUCCESS(current) && NT_SUCCESS(status)) status = current;
-
     if (context->timer != NULL) WdfTimerStop(context->timer, TRUE);
     TgFlushAll(context, TRUE);
-    KeWaitForSingleObject(&context->flows_drained, Executive, KernelMode, FALSE, NULL);
-    KeWaitForSingleObject(&context->injections_drained, Executive, KernelMode, FALSE, NULL);
+    current = TgWaitForDrain(&context->injections_drained);
+    if (!NT_SUCCESS(current)) return current;
+    current = TgRemoveAllFlowContexts(context);
+    if (!NT_SUCCESS(current)) return current;
+    current = TgWaitForDrain(&context->flows_drained);
+    if (!NT_SUCCESS(current)) return current;
 
     current = TgUnregisterCalloutBlocking(&context->callout_datagram_v6);
-    if (!NT_SUCCESS(current) && NT_SUCCESS(status)) status = current;
+    if (!NT_SUCCESS(current)) return current;
     current = TgUnregisterCalloutBlocking(&context->callout_datagram_v4);
-    if (!NT_SUCCESS(current) && NT_SUCCESS(status)) status = current;
+    if (!NT_SUCCESS(current)) return current;
     current = TgUnregisterCalloutBlocking(&context->callout_flow_v6);
-    if (!NT_SUCCESS(current) && NT_SUCCESS(status)) status = current;
+    if (!NT_SUCCESS(current)) return current;
     current = TgUnregisterCalloutBlocking(&context->callout_flow_v4);
-    if (!NT_SUCCESS(current) && NT_SUCCESS(status)) status = current;
-    if (context->injection_v6 != NULL) FwpsInjectionHandleDestroy0(context->injection_v6);
-    if (context->injection_v4 != NULL) FwpsInjectionHandleDestroy0(context->injection_v4);
-    if (context->sha256 != NULL) BCryptCloseAlgorithmProvider(context->sha256, 0);
+    if (!NT_SUCCESS(current)) return current;
+    if (context->injection_v6 != NULL) {
+        FwpsInjectionHandleDestroy0(context->injection_v6);
+        context->injection_v6 = NULL;
+    }
+    if (context->injection_v4 != NULL) {
+        FwpsInjectionHandleDestroy0(context->injection_v4);
+        context->injection_v4 = NULL;
+    }
+    if (context->sha256 != NULL) {
+        BCryptCloseAlgorithmProvider(context->sha256, 0);
+        context->sha256 = NULL;
+    }
     WdfSpinLockAcquire(context->lock);
     policy = context->policy;
     context->policy = NULL;
@@ -174,21 +189,36 @@ NTSTATUS TgWfpStop(_Inout_ TG_DEVICE_CONTEXT* context)
         RtlSecureZeroMemory(policy, FIELD_OFFSET(TG_POLICY, entries) + (SIZE_T)policy->entry_count * sizeof(TACHYON_WFP_POLICY_ENTRY));
         ExFreePoolWithTag(policy, TG_POOL_TAG);
     }
-    return status;
+    InterlockedExchange(&context->stopped, 1);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS TgUnregisterCalloutBlocking(UINT32* callout_id)
 {
     LARGE_INTEGER delay;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_DEVICE_BUSY;
+    UINT32 attempt;
     if (callout_id == NULL || *callout_id == 0) return STATUS_SUCCESS;
-    delay.QuadPart = -10 * 1000 * 10; /* 10 ms; never return while WFP reports busy. */
-    do {
+    delay.QuadPart = -((LONGLONG)TG_STOP_RETRY_DELAY_MS * 10 * 1000);
+    for (attempt = 0; attempt < TG_STOP_RETRY_COUNT; ++attempt) {
         status = FwpsCalloutUnregisterById0(*callout_id);
-        if (status == STATUS_DEVICE_BUSY) KeDelayExecutionThread(KernelMode, FALSE, &delay);
-    } while (status == STATUS_DEVICE_BUSY);
-    if (NT_SUCCESS(status)) *callout_id = 0;
+        if (NT_SUCCESS(status) || status == STATUS_FWP_CALLOUT_NOT_FOUND) {
+            *callout_id = 0;
+            return STATUS_SUCCESS;
+        }
+        if (status != STATUS_DEVICE_BUSY && status != STATUS_FWP_IN_USE) return status;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
     return status;
+}
+
+static NTSTATUS TgWaitForDrain(KEVENT* event)
+{
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+    timeout.QuadPart = -((LONGLONG)TG_STOP_DRAIN_TIMEOUT_MS * 10 * 1000);
+    status = KeWaitForSingleObject(event, Executive, KernelMode, FALSE, &timeout);
+    return status == STATUS_TIMEOUT ? STATUS_IO_TIMEOUT : status;
 }
 
 static NTSTATUS TgRemoveAllFlowContexts(TG_DEVICE_CONTEXT* context)
@@ -209,11 +239,13 @@ static NTSTATUS TgRemoveAllFlowContexts(TG_DEVICE_CONTEXT* context)
         if (flow == NULL) break;
         {
             NTSTATUS status = FwpsFlowRemoveContext0(flow->flow_handle, flow->layer_id, flow->callout_id);
-            if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND) {
+            if (status == STATUS_SUCCESS || status == STATUS_PENDING) {
+                /* flowDeleteFn releases the association reference, synchronously or asynchronously. */
+            } else if (status == STATUS_UNSUCCESSFUL || status == STATUS_NOT_FOUND) {
+                TgCloseFlow(flow);
+            } else {
                 InterlockedExchange(&flow->remove_requested, 0);
                 result = status;
-            } else if (status == STATUS_NOT_FOUND) {
-                TgCloseFlow(flow);
             }
         }
         TgFlowDereference(flow);
@@ -300,8 +332,9 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     PEPROCESS process;
 
     UNREFERENCED_PARAMETER(filter);
+    if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) goto Exit;
     classify_out->actionType = FWP_ACTION_PERMIT;
-    if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0 || context == NULL ||
+    if (context == NULL ||
         InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
         metadata == NULL || (metadata->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) == 0 ||
         (metadata->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) == 0) goto Exit;
@@ -332,11 +365,13 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
         target_layer = FWPS_LAYER_DATAGRAM_DATA_V6;
         target_callout = context->callout_datagram_v6;
     }
+    if (values->incomingValue[app_index].value.type != FWP_BYTE_BLOB_TYPE ||
+        values->incomingValue[user_index].value.type != FWP_SECURITY_DESCRIPTOR_TYPE) goto Exit;
     app_id = values->incomingValue[app_index].value.byteBlob;
-    user_id = values->incomingValue[user_index].value.byteBlob;
+    user_id = values->incomingValue[user_index].value.sd;
     if (app_id == NULL || user_id == NULL ||
         !TgHashBytes(context, app_id->data, app_id->size, candidate.app_id_hash) ||
-        !TgHashBytes(context, user_id->data, user_id->size, candidate.user_sid_hash) ||
+        !TgHashBytes(context, user_id->data, user_id->size, candidate.user_security_descriptor_hash) ||
         !TgPolicyMatches(context, &candidate)) goto Exit;
     RtlZeroMemory(flow_seed, sizeof(flow_seed));
     RtlCopyMemory(flow_seed, &candidate.flow_handle, sizeof(candidate.flow_handle));
@@ -390,6 +425,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     TG_FLOW_CONTEXT* flow = (TG_FLOW_CONTEXT*)(ULONG_PTR)flow_context;
     NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layer_data;
     NET_BUFFER* net_buffer;
+    NET_BUFFER* clone_buffer;
     TG_PENDING_PACKET* packet = NULL;
     SIZE_T record_size;
     ULONG payload_size;
@@ -398,15 +434,20 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     UINT32 direction_index;
     UINT32 local_address_index, remote_address_index, local_port_index, remote_port_index;
     UINT32 interface_index, sub_interface_index;
+    UINT32 local_address_v4, remote_address_v4;
     FWPS_PACKET_INJECTION_STATE injection_state;
     HANDLE injection_context = NULL;
     NTSTATUS status;
+    NDIS_STATUS ndis_status;
     BOOLEAN flow_referenced = FALSE;
 
+    if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) goto Exit;
     classify_out->actionType = FWP_ACTION_PERMIT;
-    if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0 || context == NULL || flow == NULL || nbl == NULL ||
+    if (context == NULL || flow == NULL || nbl == NULL || metadata == NULL || values == NULL ||
         InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
-        InterlockedCompareExchange(&context->client_open, 0, 0) == 0 || !TgFlowTryReference(flow)) goto Exit;
+        InterlockedCompareExchange(&context->client_open, 0, 0) == 0 ||
+        (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE) == 0 ||
+        !TgFlowTryReference(flow)) goto Exit;
     flow_referenced = TRUE;
     if (!TgPolicyMatches(context, flow)) goto Exit;
     injection_state = FwpsQueryPacketInjectionState0(family == AF_INET ? context->injection_v4 : context->injection_v6,
@@ -438,6 +479,23 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     if (!NT_SUCCESS(status)) {
         goto Exit;
     }
+    if ((metadata->currentMetadataValues & FWPS_METADATA_FIELD_IP_HEADER_SIZE) != 0 && metadata->ipHeaderSize > 0) {
+        clone_buffer = NET_BUFFER_LIST_FIRST_NB(packet->clone);
+        if (clone_buffer == NULL || NET_BUFFER_NEXT_NB(clone_buffer) != NULL) goto Exit;
+        ndis_status = NdisRetreatNetBufferDataStart(clone_buffer, metadata->ipHeaderSize, 0, NULL);
+        if (ndis_status != NDIS_STATUS_SUCCESS) goto Exit;
+        packet->raw_send = TRUE;
+    }
+    if (!packet->raw_send &&
+        (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) != 0) {
+        if (metadata->controlData == NULL || metadata->controlDataLength == 0 ||
+            metadata->controlDataLength > TACHYON_WFP_MAX_MESSAGE_SIZE) goto Exit;
+        packet->send_params.controlData = (WSACMSGHDR*)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, metadata->controlDataLength, TG_POOL_TAG);
+        if (packet->send_params.controlData == NULL) goto Exit;
+        packet->send_params.controlDataLength = metadata->controlDataLength;
+        RtlCopyMemory(packet->send_params.controlData, metadata->controlData, metadata->controlDataLength);
+    }
     InitializeListHead(&packet->queue_link);
     InitializeListHead(&packet->pending_link);
     packet->flow = flow;
@@ -446,8 +504,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     packet->address_family = family;
     packet->direction = TachyonWfpDirectionOutbound;
     packet->compartment_id = (metadata->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) != 0 ? metadata->compartmentId : UNSPECIFIED_COMPARTMENT_ID;
-    packet->endpoint_handle = (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE) != 0 ? metadata->transportEndpointHandle : 0;
-    packet->deadline_100ns = TgNow100ns() + (UINT64)context->verdict_timeout_ms * 10000u;
+    packet->endpoint_handle = metadata->transportEndpointHandle;
     local_address_index = family == AF_INET ? FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_ADDRESS : FWPS_FIELD_DATAGRAM_DATA_V6_IP_LOCAL_ADDRESS;
     remote_address_index = family == AF_INET ? FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_ADDRESS : FWPS_FIELD_DATAGRAM_DATA_V6_IP_REMOTE_ADDRESS;
     local_port_index = family == AF_INET ? FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_PORT : FWPS_FIELD_DATAGRAM_DATA_V6_IP_LOCAL_PORT;
@@ -457,18 +514,20 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     packet->interface_index = values->incomingValue[interface_index].value.uint32;
     packet->sub_interface_index = values->incomingValue[sub_interface_index].value.uint32;
     if (family == AF_INET) {
-        RtlCopyMemory(packet->record->local_address, &values->incomingValue[local_address_index].value.uint32, 4);
-        RtlCopyMemory(packet->record->remote_address, &values->incomingValue[remote_address_index].value.uint32, 4);
-        RtlCopyMemory(packet->remote_address, &values->incomingValue[remote_address_index].value.uint32, 4);
+        local_address_v4 = RtlUlongByteSwap(values->incomingValue[local_address_index].value.uint32);
+        remote_address_v4 = RtlUlongByteSwap(values->incomingValue[remote_address_index].value.uint32);
+        RtlCopyMemory(packet->record->local_address, &local_address_v4, 4);
+        RtlCopyMemory(packet->record->remote_address, &remote_address_v4, 4);
+        RtlCopyMemory(packet->remote_address, &remote_address_v4, 4);
     } else {
         RtlCopyMemory(packet->record->local_address, values->incomingValue[local_address_index].value.byteArray16->byteArray16, 16);
         RtlCopyMemory(packet->record->remote_address, values->incomingValue[remote_address_index].value.byteArray16->byteArray16, 16);
         RtlCopyMemory(packet->remote_address, values->incomingValue[remote_address_index].value.byteArray16->byteArray16, 16);
     }
     packet->send_params.remoteAddress = packet->remote_address;
-    packet->send_params.remoteScopeId = 0;
-    packet->send_params.controlData = NULL;
-    packet->send_params.controlDataLength = 0;
+    if ((metadata->currentMetadataValues & FWPS_METADATA_FIELD_REMOTE_SCOPE_ID) != 0) {
+        packet->send_params.remoteScopeId = metadata->remoteScopeId;
+    }
     payload = ((UCHAR*)packet->record) + TACHYON_WFP_CAPTURE_HEADER_SIZE;
     contiguous = NdisGetDataBuffer(net_buffer, payload_size, payload, 1, 0);
     if (contiguous == NULL) goto Exit;
@@ -487,7 +546,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     }
     packet->request_id = ++context->next_request_id;
     packet->sequence = (UINT64)InterlockedIncrement64(&flow->next_sequence);
-    packet->deadline_100ns = TgNow100ns() + (UINT64)context->verdict_timeout_ms * 10000u;
+    packet->deadline_100ns = TgInterruptTime100ns() + (UINT64)context->verdict_timeout_ms * 10000u;
     packet->record->header.magic = TACHYON_WFP_ABI_MAGIC;
     packet->record->header.header_size = TACHYON_WFP_HEADER_SIZE;
     packet->record->header.abi_major = TACHYON_WFP_ABI_MAJOR;
@@ -502,7 +561,7 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     packet->record->process_id = flow->process_id;
     packet->record->process_start_key = flow->process_start_key;
     RtlCopyMemory(packet->record->app_id_hash, flow->app_id_hash, 32);
-    RtlCopyMemory(packet->record->user_sid_hash, flow->user_sid_hash, 32);
+    RtlCopyMemory(packet->record->user_security_descriptor_hash, flow->user_security_descriptor_hash, 32);
     packet->record->address_family = family;
     packet->record->direction = TachyonWfpDirectionOutbound;
     packet->record->protocol = IPPROTO_UDP;
@@ -580,7 +639,8 @@ VOID TgCompletePacket(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet, UIN
     if (action == TachyonWfpVerdictPermitDirect && packet->clone != NULL && injection != NULL) {
         if (InterlockedIncrement(&context->injection_count) == 1) KeClearEvent(&context->injections_drained);
         status = FwpsInjectTransportSendAsync0(injection, (HANDLE)packet, packet->endpoint_handle, 0,
-                                               &packet->send_params, packet->address_family, packet->compartment_id,
+                                               packet->raw_send ? NULL : &packet->send_params,
+                                               packet->address_family, packet->compartment_id,
                                                packet->clone, TgInjectComplete, packet);
         if (NT_SUCCESS(status)) {
             InterlockedIncrement64((volatile LONG64*)&context->statistics.permitted);
@@ -630,6 +690,12 @@ static VOID TgFreePendingPacket(TG_PENDING_PACKET* packet)
     if (packet->record != NULL) {
         RtlSecureZeroMemory(packet->record, packet->record_size);
         ExFreePoolWithTag(packet->record, TG_POOL_TAG);
+    }
+    if (packet->send_params.controlData != NULL) {
+        RtlSecureZeroMemory(packet->send_params.controlData, packet->send_params.controlDataLength);
+        ExFreePoolWithTag(packet->send_params.controlData, TG_POOL_TAG);
+        packet->send_params.controlData = NULL;
+        packet->send_params.controlDataLength = 0;
     }
     if (packet->flow != NULL) {
         TgFlowDereference(packet->flow);

@@ -31,7 +31,7 @@
 #define TACHYON_WFP_CAP_DATAGRAM_V4 (UINT64_C(1) << 2)
 #define TACHYON_WFP_CAP_DATAGRAM_V6 (UINT64_C(1) << 3)
 #define TACHYON_WFP_CAP_PROCESS_IDENTITY (UINT64_C(1) << 4)
-#define TACHYON_WFP_CAP_USER_SID (UINT64_C(1) << 5)
+#define TACHYON_WFP_CAP_USER_SECURITY_DESCRIPTOR (UINT64_C(1) << 5)
 #define TACHYON_WFP_CAP_APP_ID (UINT64_C(1) << 6)
 #define TACHYON_WFP_CAP_INJECT_SEND (UINT64_C(1) << 7)
 #define TACHYON_WFP_CAP_INJECTION_STATE (UINT64_C(1) << 8)
@@ -42,7 +42,8 @@
 #define TACHYON_WFP_REQUIRED_CAPABILITIES                                      \
     (TACHYON_WFP_CAP_FLOW_V4 | TACHYON_WFP_CAP_FLOW_V6 |                     \
      TACHYON_WFP_CAP_DATAGRAM_V4 | TACHYON_WFP_CAP_DATAGRAM_V6 |             \
-     TACHYON_WFP_CAP_PROCESS_IDENTITY | TACHYON_WFP_CAP_USER_SID |           \
+     TACHYON_WFP_CAP_PROCESS_IDENTITY |                                     \
+     TACHYON_WFP_CAP_USER_SECURITY_DESCRIPTOR |                             \
      TACHYON_WFP_CAP_APP_ID | TACHYON_WFP_CAP_INJECT_SEND |                  \
      TACHYON_WFP_CAP_INJECTION_STATE |                                        \
      TACHYON_WFP_CAP_BOUNDED_QUEUE | TACHYON_WFP_CAP_FAIL_OPEN_TIMEOUT |     \
@@ -84,7 +85,7 @@ enum TACHYON_WFP_POLICY_FLAGS {
     TachyonWfpPolicyMatchPid = 1u << 0,
     TachyonWfpPolicyMatchProcessStart = 1u << 1,
     TachyonWfpPolicyMatchAppIdHash = 1u << 2,
-    TachyonWfpPolicyMatchUserSidHash = 1u << 3
+    TachyonWfpPolicyMatchUserSecurityDescriptorHash = 1u << 3
 };
 
 #pragma pack(push, 1)
@@ -132,7 +133,8 @@ typedef struct TACHYON_WFP_POLICY_ENTRY {
     uint64_t process_id;
     uint64_t process_start_key;
     uint8_t app_id_hash[32];
-    uint8_t user_sid_hash[32];
+    /* SHA-256 of the exact self-relative security descriptor bytes from ALE_USER_ID. */
+    uint8_t user_security_descriptor_hash[32];
     uint32_t match_flags;
     uint32_t reserved;
 } TACHYON_WFP_POLICY_ENTRY;
@@ -153,7 +155,7 @@ typedef struct TACHYON_WFP_CAPTURE_RECORD {
     uint64_t process_id;
     uint64_t process_start_key;
     uint8_t app_id_hash[32];
-    uint8_t user_sid_hash[32];
+    uint8_t user_security_descriptor_hash[32];
     uint16_t address_family;
     uint8_t direction;
     uint8_t protocol;

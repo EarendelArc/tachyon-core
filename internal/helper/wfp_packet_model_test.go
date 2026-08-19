@@ -1,6 +1,8 @@
 package helper
 
 import (
+	"encoding/binary"
+	"math/bits"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -130,5 +132,149 @@ func TestWFPPacketOutputTooSmallOwnsSingleTerminalRelease(t *testing.T) {
 	if model.state.Load() != modelCompleted || model.terminal.Load() != 1 || model.refs.Load() != 0 || model.freed.Load() != 1 {
 		t.Fatalf("output-too-small ownership did not terminate exactly once: state=%d terminal=%d refs=%d freed=%d",
 			model.state.Load(), model.terminal.Load(), model.refs.Load(), model.freed.Load())
+	}
+}
+
+func modelClassifyDecision(upstream uint32, hasWriteRight, capture bool) uint32 {
+	if !hasWriteRight {
+		return upstream
+	}
+	if capture {
+		return 2 // FWP_ACTION_BLOCK
+	}
+	return 1 // FWP_ACTION_PERMIT
+}
+
+func TestWFPClassifyModelNeverOverwritesAnUpstreamDecisionWithoutRights(t *testing.T) {
+	for _, upstream := range []uint32{1, 2, 3, 0xdeadbeef} {
+		if got := modelClassifyDecision(upstream, false, true); got != upstream {
+			t.Fatalf("upstream decision %#x overwritten with %#x", upstream, got)
+		}
+	}
+	if got := modelClassifyDecision(3, true, false); got != 1 {
+		t.Fatalf("writable fail-open decision = %d", got)
+	}
+	if got := modelClassifyDecision(1, true, true); got != 2 {
+		t.Fatalf("writable capture decision = %d", got)
+	}
+}
+
+type modelFileSession struct{ negotiated bool }
+
+func (session *modelFileSession) authorize(ioctl string) bool {
+	if ioctl == "NEGOTIATE" {
+		session.negotiated = true
+		return true
+	}
+	return session.negotiated
+}
+
+func TestWFPPerHandleNegotiationModel(t *testing.T) {
+	first, second := &modelFileSession{}, &modelFileSession{}
+	for _, ioctl := range []string{"SET_POLICY", "DEQUEUE", "VERDICT"} {
+		if first.authorize(ioctl) || second.authorize(ioctl) {
+			t.Fatalf("%s accepted before negotiation", ioctl)
+		}
+	}
+	if !first.authorize("NEGOTIATE") || !first.authorize("SET_POLICY") || second.authorize("DEQUEUE") {
+		t.Fatal("negotiation state leaked across file handles")
+	}
+}
+
+const (
+	modelUnregisterSuccess = iota
+	modelUnregisterBusy
+	modelUnregisterInUse
+	modelUnregisterFatal
+)
+
+func modelUnregister(statuses []int, retryLimit int) bool {
+	for attempt, status := range statuses {
+		if attempt >= retryLimit {
+			return false
+		}
+		switch status {
+		case modelUnregisterSuccess:
+			return true
+		case modelUnregisterBusy, modelUnregisterInUse:
+			continue
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func TestWFPTeardownModelDestroysResourcesOnlyAfterUnregister(t *testing.T) {
+	for name, statuses := range map[string][]int{
+		"busy":   {modelUnregisterBusy, modelUnregisterSuccess},
+		"in_use": {modelUnregisterInUse, modelUnregisterInUse, modelUnregisterSuccess},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if absent := modelUnregister(statuses, 4); !absent {
+				t.Fatal("retryable callout never became absent")
+			}
+		})
+	}
+	if modelUnregister([]int{modelUnregisterFatal}, 4) || modelUnregister([]int{modelUnregisterBusy, modelUnregisterBusy}, 2) {
+		t.Fatal("unsafe teardown reached resource destruction")
+	}
+}
+
+func modelFlowStop(removePending, callbackCompletes bool) (drained, resourcesFreed bool) {
+	if !removePending {
+		return false, false
+	}
+	if !callbackCompletes {
+		return false, false // bounded wait expires with ownership retained
+	}
+	return true, true
+}
+
+func TestWFPFlowRemovalModelBoundsWaitAndRetainsOwnership(t *testing.T) {
+	if drained, freed := modelFlowStop(true, false); drained || freed {
+		t.Fatal("timed-out asynchronous flow removal released callback-owned resources")
+	}
+	if drained, freed := modelFlowStop(true, true); !drained || !freed {
+		t.Fatal("completed asynchronous flow removal did not drain")
+	}
+	if drained, freed := modelFlowStop(false, false); drained || freed {
+		t.Fatal("failed flow removal released associated context")
+	}
+}
+
+func TestWFPIPv4AndRawSendModel(t *testing.T) {
+	hostAddress := uint32(0x7f000001)
+	networkValue := bits.ReverseBytes32(hostAddress)
+	var wire [4]byte
+	binary.LittleEndian.PutUint32(wire[:], networkValue)
+	if wire != [4]byte{127, 0, 0, 1} {
+		t.Fatalf("IPv4 ABI bytes = %v", wire)
+	}
+	dataOffset, ipHeaderSize := uint32(48), uint32(20)
+	if dataOffset < ipHeaderSize {
+		t.Fatal("invalid raw-send fixture")
+	}
+	dataOffset -= ipHeaderSize // NdisRetreatNetBufferDataStart
+	sendArgsPresent := false   // raw transport injection requires NULL sendArgs
+	if dataOffset != 28 || sendArgsPresent {
+		t.Fatal("raw-send reinjection model did not expose the IP header")
+	}
+}
+
+func TestWFPPolicyReplacementModelFlushesOnlyOldGeneration(t *testing.T) {
+	pending := []uint64{7, 8, 7, 9}
+	oldGeneration := uint64(7)
+	kept := pending[:0]
+	flushed := 0
+	for _, generation := range pending {
+		if generation == oldGeneration {
+			flushed++
+			continue
+		}
+		kept = append(kept, generation)
+	}
+	if flushed != 2 || len(kept) != 2 || kept[0] != 8 || kept[1] != 9 {
+		t.Fatalf("flushed=%d kept=%v", flushed, kept)
 	}
 }

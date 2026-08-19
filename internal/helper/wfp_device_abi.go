@@ -34,35 +34,35 @@ type wfpNegotiateResponse struct {
 }
 
 type wfpPolicyEntry struct {
-	ProcessID    uint64
-	ProcessStart uint64
-	AppIDHash    [32]byte
-	UserSIDHash  [32]byte
-	MatchFlags   uint32
+	ProcessID                  uint64
+	ProcessStart               uint64
+	AppIDHash                  [32]byte
+	UserSecurityDescriptorHash [32]byte
+	MatchFlags                 uint32
 }
 
 type wfpCaptureFrame struct {
-	RequestID      uint64
-	FlowID         [16]byte
-	Generation     uint64
-	LeaseNonce     [16]byte
-	Sequence       uint64
-	ProcessID      uint64
-	ProcessStart   uint64
-	AppIDHash      [32]byte
-	UserSIDHash    [32]byte
-	AddressFamily  uint16
-	Direction      uint8
-	Protocol       uint8
-	InjectionState uint32
-	CompartmentID  uint32
-	InterfaceIndex uint32
-	SubInterface   uint32
-	LocalAddress   [16]byte
-	RemoteAddress  [16]byte
-	LocalPort      uint16
-	RemotePort     uint16
-	Payload        []byte
+	RequestID                  uint64
+	FlowID                     [16]byte
+	Generation                 uint64
+	LeaseNonce                 [16]byte
+	Sequence                   uint64
+	ProcessID                  uint64
+	ProcessStart               uint64
+	AppIDHash                  [32]byte
+	UserSecurityDescriptorHash [32]byte
+	AddressFamily              uint16
+	Direction                  uint8
+	Protocol                   uint8
+	InjectionState             uint32
+	CompartmentID              uint32
+	InterfaceIndex             uint32
+	SubInterface               uint32
+	LocalAddress               [16]byte
+	RemoteAddress              [16]byte
+	LocalPort                  uint16
+	RemotePort                 uint16
+	Payload                    []byte
 }
 
 func putWFPHeader(dst []byte, kind uint16, size uint32, requestID uint64) {
@@ -148,7 +148,7 @@ func marshalWFPPolicy(requestID, generation uint64, nonce [16]byte, entries []wf
 		binary.LittleEndian.PutUint64(data[offset:offset+8], entry.ProcessID)
 		binary.LittleEndian.PutUint64(data[offset+8:offset+16], entry.ProcessStart)
 		copy(data[offset+16:offset+48], entry.AppIDHash[:])
-		copy(data[offset+48:offset+80], entry.UserSIDHash[:])
+		copy(data[offset+48:offset+80], entry.UserSecurityDescriptorHash[:])
 		binary.LittleEndian.PutUint32(data[offset+80:offset+84], entry.MatchFlags)
 	}
 	return data, nil
@@ -171,7 +171,7 @@ func parseWFPCapture(data []byte) (wfpCaptureFrame, error) {
 	frame.ProcessID = binary.LittleEndian.Uint64(data[80:88])
 	frame.ProcessStart = binary.LittleEndian.Uint64(data[88:96])
 	copy(frame.AppIDHash[:], data[96:128])
-	copy(frame.UserSIDHash[:], data[128:160])
+	copy(frame.UserSecurityDescriptorHash[:], data[128:160])
 	frame.AddressFamily = binary.LittleEndian.Uint16(data[160:162])
 	frame.Direction, frame.Protocol = data[162], data[163]
 	frame.InjectionState = binary.LittleEndian.Uint32(data[164:168])

@@ -19,6 +19,9 @@ static BOOLEAN TgEqualIdentity(const TG_PENDING_PACKET* packet, const TACHYON_WF
            RtlCompareMemory(packet->flow->lease_nonce, verdict->lease_nonce, 16) == 16;
 }
 
+static VOID TgFlushPackets(TG_DEVICE_CONTEXT* context, BOOLEAN all_generations,
+                           UINT64 generation, BOOLEAN permit_direct);
+
 static VOID TgDetachQueueLocked(TG_DEVICE_CONTEXT* context, TG_PENDING_PACKET* packet)
 {
     if (!packet->queued) return;
@@ -83,12 +86,13 @@ NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input
     for (index = 0; index < header->entry_count; ++index) {
         const TACHYON_WFP_POLICY_ENTRY* entry = &entries[index];
         const UINT32 known = TachyonWfpPolicyMatchPid | TachyonWfpPolicyMatchProcessStart |
-                             TachyonWfpPolicyMatchAppIdHash | TachyonWfpPolicyMatchUserSidHash;
+                             TachyonWfpPolicyMatchAppIdHash | TachyonWfpPolicyMatchUserSecurityDescriptorHash;
         if (entry->reserved != 0 || entry->match_flags == 0 || (entry->match_flags & ~known) != 0 ||
             ((entry->match_flags & TachyonWfpPolicyMatchPid) != 0 && entry->process_id == 0) ||
             ((entry->match_flags & TachyonWfpPolicyMatchProcessStart) != 0 && entry->process_start_key == 0) ||
             ((entry->match_flags & TachyonWfpPolicyMatchAppIdHash) != 0 && TgAllZero(entry->app_id_hash, 32)) ||
-            ((entry->match_flags & TachyonWfpPolicyMatchUserSidHash) != 0 && TgAllZero(entry->user_sid_hash, 32))) {
+            ((entry->match_flags & TachyonWfpPolicyMatchUserSecurityDescriptorHash) != 0 &&
+             TgAllZero(entry->user_security_descriptor_hash, 32))) {
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -114,6 +118,7 @@ NTSTATUS TgSetPolicy(TG_DEVICE_CONTEXT* context, const VOID* input, SIZE_T input
     context->policy = policy;
     WdfSpinLockRelease(context->lock);
     if (previous != NULL) {
+        TgFlushGeneration(context, previous->generation, TRUE);
         RtlSecureZeroMemory(previous, FIELD_OFFSET(TG_POLICY, entries) + (SIZE_T)previous->entry_count * sizeof(TACHYON_WFP_POLICY_ENTRY));
         ExFreePoolWithTag(previous, TG_POOL_TAG);
     }
@@ -172,7 +177,8 @@ BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
         if (((entry->match_flags & TachyonWfpPolicyMatchPid) == 0 || entry->process_id == flow->process_id) &&
             ((entry->match_flags & TachyonWfpPolicyMatchProcessStart) == 0 || entry->process_start_key == flow->process_start_key) &&
             ((entry->match_flags & TachyonWfpPolicyMatchAppIdHash) == 0 || RtlCompareMemory(entry->app_id_hash, flow->app_id_hash, 32) == 32) &&
-            ((entry->match_flags & TachyonWfpPolicyMatchUserSidHash) == 0 || RtlCompareMemory(entry->user_sid_hash, flow->user_sid_hash, 32) == 32)) {
+            ((entry->match_flags & TachyonWfpPolicyMatchUserSecurityDescriptorHash) == 0 ||
+             RtlCompareMemory(entry->user_security_descriptor_hash, flow->user_security_descriptor_hash, 32) == 32)) {
             matched = TRUE;
             break;
         }
@@ -292,7 +298,7 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
     TG_DEVICE_CONTEXT* context = TgGetDeviceContext((WDFDEVICE)WdfTimerGetParentObject(timer));
     LIST_ENTRY expired;
     PLIST_ENTRY entry;
-    UINT64 now = TgNow100ns();
+    UINT64 now = TgInterruptTime100ns();
     InitializeListHead(&expired);
     WdfSpinLockAcquire(context->lock);
     entry = context->pending_packets.Flink;
@@ -315,27 +321,36 @@ VOID TgEvtTimeoutTimer(_In_ WDFTIMER timer)
 
 VOID TgFlushAll(TG_DEVICE_CONTEXT* context, BOOLEAN permit_direct)
 {
+    TgFlushPackets(context, TRUE, 0, permit_direct);
+}
+
+VOID TgFlushGeneration(TG_DEVICE_CONTEXT* context, UINT64 generation, BOOLEAN permit_direct)
+{
+    if (generation != 0) TgFlushPackets(context, FALSE, generation, permit_direct);
+}
+
+static VOID TgFlushPackets(TG_DEVICE_CONTEXT* context, BOOLEAN all_generations,
+                           UINT64 generation, BOOLEAN permit_direct)
+{
     LIST_ENTRY detached;
+    PLIST_ENTRY entry;
     WDFREQUEST request;
     InitializeListHead(&detached);
     WdfSpinLockAcquire(context->lock);
-    while (!IsListEmpty(&context->pending_packets)) {
-        TG_PENDING_PACKET* packet = CONTAINING_RECORD(context->pending_packets.Flink, TG_PENDING_PACKET, pending_link);
-        if (!TgBeginCompletionLocked(context, packet, TgPacketCancelled)) {
-            TgDetachPendingLocked(context, packet);
-            TgPacketDereference(packet);
-            continue;
+    entry = context->pending_packets.Flink;
+    while (entry != &context->pending_packets) {
+        TG_PENDING_PACKET* packet = CONTAINING_RECORD(entry, TG_PENDING_PACKET, pending_link);
+        entry = entry->Flink;
+        if ((all_generations || packet->flow->generation == generation) &&
+            TgBeginCompletionLocked(context, packet, TgPacketCancelled)) {
+            InsertTailList(&detached, &packet->pending_link); /* local completion reference */
         }
-        InsertTailList(&detached, &packet->pending_link); /* local completion reference */
     }
-    context->queue_depth = 0;
-    context->queue_bytes = 0;
-    context->pending_count = 0;
-    context->pending_bytes = 0;
-    InitializeListHead(&context->capture_queue);
     WdfSpinLockRelease(context->lock);
-    while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(context->dequeue_queue, &request))) {
-        WdfRequestComplete(request, STATUS_CANCELLED);
+    if (all_generations) {
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(context->dequeue_queue, &request))) {
+            WdfRequestComplete(request, STATUS_CANCELLED);
+        }
     }
     while (!IsListEmpty(&detached)) {
         TG_PENDING_PACKET* packet = CONTAINING_RECORD(RemoveHeadList(&detached), TG_PENDING_PACKET, pending_link);

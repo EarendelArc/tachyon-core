@@ -9,7 +9,7 @@ CatalogFile=tachyon-wfp.cat
 PnpLockdown=1
 
 [DestinationDirs]
-DefaultDestDir=12
+DefaultDestDir=13
 
 [DefaultInstall.NTamd64]
 CopyFiles=DriverCopy
@@ -32,7 +32,7 @@ Description=%ServiceDescription%
 ServiceType=1
 StartType=3
 ErrorControl=1
-ServiceBinary=%12%\tachyon-wfp.sys
+ServiceBinary=%13%\tachyon-wfp.sys
 LoadOrderGroup=PNP_TDI
 
 [SourceDisksNames]

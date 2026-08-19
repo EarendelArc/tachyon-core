@@ -288,6 +288,7 @@ func TestWFPWDKCompileTypesAndVersionedCallbacks(t *testing.T) {
 
 func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 	project := readWFPDriverSource(t, "TachyonWfp.vcxproj")
+	inf := readWFPDriverSource(t, "tachyon-wfp.inf")
 	workflowData, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "wfp-driver.yml"))
 	if err != nil {
 		t.Fatal(err)
@@ -306,10 +307,27 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 	if strings.Contains(project, "<NoWarn>") || strings.Contains(project, "<WarningsNotAsErrors>") {
 		t.Fatal("project hides NuGet or compiler warnings")
 	}
-	for _, required := range []string{"platform: x64", "platform: ARM64", "/warnaserror", "/p:EnablePREfast=true", "Locate WDK InfVerif and validate INF"} {
+	for _, required := range []string{
+		"platform: x64",
+		"platform: ARM64",
+		"/warnaserror",
+		"/p:EnablePREfast=true",
+		"Run host WDK InfVerif and validate INF",
+		`c\bin\10.0.28000.0\x64\infverif.exe`,
+		"Test-Path -LiteralPath $infverif -PathType Leaf",
+		"& $infverif /w drivers/windows/wfp/tachyon-wfp.inf",
+	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("WFP workflow gate missing %q", required)
 		}
+	}
+	for _, required := range []string{"DefaultDestDir=13", `ServiceBinary=%13%\tachyon-wfp.sys`} {
+		if !strings.Contains(inf, required) {
+			t.Fatalf("isolated WFP INF contract missing %q", required)
+		}
+	}
+	if strings.Contains(inf, "DefaultDestDir=12") || strings.Contains(inf, `ServiceBinary=%12%\`) {
+		t.Fatal("WFP INF still installs its binary outside DIRID 13")
 	}
 }
 

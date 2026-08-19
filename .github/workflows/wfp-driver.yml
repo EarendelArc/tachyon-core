@@ -71,11 +71,11 @@ jobs:
           /p:RunCodeAnalysis=true
           /p:EnablePREfast=true
           /warnaserror
-      - name: Locate WDK InfVerif and validate INF
+      - name: Run host WDK InfVerif and validate INF
         shell: pwsh
         run: |
           $packageRoot = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windows.wdk.${{ matrix.package }}\10.0.28000.2526"
-          $infverif = Get-ChildItem -LiteralPath $packageRoot -Recurse -Filter infverif.exe | Select-Object -First 1
-          if ($null -eq $infverif) { throw "InfVerif was not found in pinned WDK package $packageRoot" }
-          & $infverif.FullName /w drivers/windows/wfp/tachyon-wfp.inf
+          $infverif = Join-Path $packageRoot "c\bin\10.0.28000.0\x64\infverif.exe"
+          if (-not (Test-Path -LiteralPath $infverif -PathType Leaf)) { throw "Host InfVerif was not found in pinned WDK package $packageRoot" }
+          & $infverif /w drivers/windows/wfp/tachyon-wfp.inf
           if ($LASTEXITCODE -ne 0) { throw "InfVerif failed with exit code $LASTEXITCODE" }

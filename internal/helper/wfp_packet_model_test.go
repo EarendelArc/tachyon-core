@@ -323,6 +323,108 @@ func TestWFPPrivateStatisticsModelRequiresEightByteAlignment(t *testing.T) {
 	}
 }
 
+type modelCaptureSnapshot struct {
+	sessionGeneration uint64
+	policyGeneration  uint64
+	lease             [16]byte
+}
+
+type modelCaptureLinearizer struct {
+	mu               sync.Mutex
+	activeSession    uint64
+	policyGeneration uint64
+	lease            [16]byte
+	captureEnabled   bool
+	queue            []modelCaptureSnapshot
+}
+
+func (linearizer *modelCaptureLinearizer) snapshot() (modelCaptureSnapshot, bool) {
+	linearizer.mu.Lock()
+	defer linearizer.mu.Unlock()
+	if !linearizer.captureEnabled || linearizer.activeSession == 0 || linearizer.policyGeneration == 0 {
+		return modelCaptureSnapshot{}, false
+	}
+	return modelCaptureSnapshot{
+		sessionGeneration: linearizer.activeSession,
+		policyGeneration:  linearizer.policyGeneration,
+		lease:             linearizer.lease,
+	}, true
+}
+
+func (linearizer *modelCaptureLinearizer) commit(snapshot modelCaptureSnapshot) bool {
+	linearizer.mu.Lock()
+	defer linearizer.mu.Unlock()
+	if !linearizer.captureEnabled || linearizer.activeSession != snapshot.sessionGeneration ||
+		linearizer.policyGeneration != snapshot.policyGeneration || linearizer.lease != snapshot.lease {
+		return false
+	}
+	linearizer.queue = append(linearizer.queue, snapshot)
+	return true
+}
+
+func runDelayedModelClassify(linearizer *modelCaptureLinearizer, captured chan<- struct{}, resume <-chan struct{}, result chan<- bool) {
+	snapshot, ok := linearizer.snapshot()
+	close(captured)
+	<-resume
+	result <- ok && linearizer.commit(snapshot)
+}
+
+func TestWFPDelayedClassifyCannotEnterSuccessorSession(t *testing.T) {
+	firstLease := [16]byte{1}
+	linearizer := &modelCaptureLinearizer{
+		activeSession: 1, policyGeneration: 7, lease: firstLease, captureEnabled: true,
+	}
+	captured, resume, result := make(chan struct{}), make(chan struct{}), make(chan bool)
+	go runDelayedModelClassify(linearizer, captured, resume, result)
+	<-captured
+	linearizer.mu.Lock()
+	linearizer.activeSession = 0
+	linearizer.captureEnabled = false
+	linearizer.queue = nil // cleanup flushes the old session before admitting its successor
+	linearizer.activeSession = 2
+	linearizer.policyGeneration = 7
+	linearizer.lease = firstLease
+	linearizer.captureEnabled = true
+	linearizer.mu.Unlock()
+	close(resume)
+	if <-result {
+		t.Fatal("old classify committed into a successor session")
+	}
+	linearizer.mu.Lock()
+	defer linearizer.mu.Unlock()
+	if len(linearizer.queue) != 0 {
+		t.Fatalf("successor queue contains %d stale captures", len(linearizer.queue))
+	}
+}
+
+func TestWFPDelayedClassifyCannotRestoreReplacedPolicyGeneration(t *testing.T) {
+	oldLease, newLease := [16]byte{7}, [16]byte{8}
+	linearizer := &modelCaptureLinearizer{
+		activeSession: 3, policyGeneration: 11, lease: oldLease, captureEnabled: true,
+	}
+	captured, resume, result := make(chan struct{}), make(chan struct{}), make(chan bool)
+	go runDelayedModelClassify(linearizer, captured, resume, result)
+	<-captured
+	linearizer.mu.Lock()
+	linearizer.policyGeneration = 12
+	linearizer.lease = newLease
+	linearizer.queue = nil // replacement flushes generation 11
+	linearizer.mu.Unlock()
+	close(resume)
+	if <-result {
+		t.Fatal("old classify committed after policy replacement")
+	}
+	fresh, ok := linearizer.snapshot()
+	if !ok || !linearizer.commit(fresh) {
+		t.Fatal("current policy classify did not commit")
+	}
+	linearizer.mu.Lock()
+	defer linearizer.mu.Unlock()
+	if len(linearizer.queue) != 1 || linearizer.queue[0].policyGeneration != 12 || linearizer.queue[0].lease != newLease {
+		t.Fatalf("queue contains stale policy snapshots: %+v", linearizer.queue)
+	}
+}
+
 const (
 	modelUnregisterSuccess = iota
 	modelUnregisterBusy

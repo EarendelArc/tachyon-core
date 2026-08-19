@@ -184,6 +184,65 @@ func TestWFPStatisticsAtomicsUseAlignedPrivateStorage(t *testing.T) {
 	}
 }
 
+func TestWFPDatagramCaptureRevalidatesSessionAndPolicyAtQueueCommit(t *testing.T) {
+	header := readWFPDriverSource(t, filepath.Join("src", "tachyon_wfp.h"))
+	queue := readWFPDriverSource(t, filepath.Join("src", "queue.c"))
+	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
+	for _, required := range []string{"TG_CAPTURE_SNAPSHOT", "session_generation", "policy_generation",
+		"policy_lease_nonce", "TgCaptureSnapshot", "TgCaptureSnapshotIsActiveLocked"} {
+		if !strings.Contains(header, required) {
+			t.Fatalf("capture snapshot contract missing %q", required)
+		}
+	}
+	snapshotBody := cFunctionBody(t, queue, "BOOLEAN TgCaptureSnapshot(")
+	if strings.Contains(snapshotBody, "TG_POLICY*") ||
+		!strings.Contains(snapshotBody, "WdfSpinLockAcquire(context->lock)") ||
+		!strings.Contains(snapshotBody, "RtlCopyMemory(snapshot->policy_lease_nonce") {
+		t.Fatal("capture snapshot retains a policy pointer or reads policy outside the context lock")
+	}
+	activeBody := cFunctionBody(t, queue, "BOOLEAN TgCaptureSnapshotIsActiveLocked(")
+	for _, required := range []string{"active_session_generation", "flow->session_generation",
+		"context->policy->generation", "context->policy->lease_nonce", "flow->lease_nonce"} {
+		if !strings.Contains(activeBody, required) {
+			t.Fatalf("final capture revalidation missing %q", required)
+		}
+	}
+	classify := cFunctionBody(t, wfp, "static VOID TgClassifyDatagram(")
+	if strings.Contains(classify, "ExAcquireRundownProtection") || strings.Contains(classify, "TG_POLICY*") {
+		t.Fatal("datagram classify holds blocking rundown or a policy pointer")
+	}
+	initial := strings.Index(classify, "TgCaptureSnapshot(context, flow, &capture_snapshot)")
+	clone := strings.Index(classify, "FwpsAllocateCloneNetBufferList0")
+	insert := strings.Index(classify, "InsertTailList(&context->capture_queue")
+	block := strings.Index(classify, "classify_out->actionType = FWP_ACTION_BLOCK")
+	if initial < 0 || clone < 0 || insert < 0 || block < 0 || !(initial < clone && clone < insert && insert < block) {
+		t.Fatal("capture snapshot, clone, queue, and BLOCK ordering is not explicit")
+	}
+	finalLock := strings.LastIndex(classify[:insert], "WdfSpinLockAcquire(context->lock)")
+	revalidate := strings.LastIndex(classify[:insert], "TgCaptureSnapshotIsActiveLocked")
+	if finalLock < 0 || revalidate < 0 || !(finalLock < revalidate && revalidate < insert) {
+		t.Fatal("queue insertion is not linearized after final snapshot revalidation")
+	}
+	transfer := strings.Index(classify[insert:], "packet = NULL; /* pending/queue lists now own the base reference */")
+	if transfer < 0 {
+		t.Fatal("packet ownership is not transferred before classify leaves the commit lock")
+	}
+	transfer += insert
+	unlock := strings.Index(classify[transfer:], "WdfSpinLockRelease(context->lock)")
+	if unlock >= 0 {
+		unlock += transfer
+	}
+	if unlock < 0 || !(transfer < unlock && unlock < block) {
+		t.Fatal("packet ownership transfer is not ordered before unlock and BLOCK")
+	}
+	for _, required := range []string{"packet->record->generation = capture_snapshot.policy_generation",
+		"capture_snapshot.policy_lease_nonce"} {
+		if !strings.Contains(classify, required) {
+			t.Fatalf("capture record does not use the validated snapshot: missing %q", required)
+		}
+	}
+}
+
 func TestWFPWireAndRawInjectionContracts(t *testing.T) {
 	wfp := readWFPDriverSource(t, filepath.Join("src", "wfp.c"))
 	device := readWFPDriverSource(t, filepath.Join("src", "device.c"))

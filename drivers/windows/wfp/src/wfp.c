@@ -327,7 +327,7 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     UINT32 user_index;
     UINT16 target_layer;
     UINT32 target_callout;
-    UCHAR flow_seed[32];
+    UCHAR flow_seed[40];
     NTSTATUS status;
     PEPROCESS process;
 
@@ -344,12 +344,13 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
     candidate.address_family = family;
     candidate.direction = TachyonWfpDirectionOutbound;
     WdfSpinLockAcquire(context->lock);
-    if (context->policy != NULL) {
+    if (context->active_session_generation != 0 && context->policy != NULL) {
+        candidate.session_generation = (UINT64)context->active_session_generation;
         candidate.generation = context->policy->generation;
         RtlCopyMemory(candidate.lease_nonce, context->policy->lease_nonce, 16);
     }
     WdfSpinLockRelease(context->lock);
-    if (candidate.generation == 0) goto Exit;
+    if (candidate.session_generation == 0 || candidate.generation == 0) goto Exit;
     if (KeGetCurrentIrql() <= APC_LEVEL && NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)candidate.process_id, &process))) {
         candidate.process_start_key = PsGetProcessStartKey(process);
         ObDereferenceObject(process);
@@ -375,9 +376,10 @@ static VOID TgClassifyFlow(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES0* v
         !TgPolicyMatches(context, &candidate)) goto Exit;
     RtlZeroMemory(flow_seed, sizeof(flow_seed));
     RtlCopyMemory(flow_seed, &candidate.flow_handle, sizeof(candidate.flow_handle));
-    RtlCopyMemory(flow_seed + 8, &candidate.generation, sizeof(candidate.generation));
-    RtlCopyMemory(flow_seed + 16, &candidate.process_id, sizeof(candidate.process_id));
-    RtlCopyMemory(flow_seed + 24, &candidate.process_start_key, sizeof(candidate.process_start_key));
+    RtlCopyMemory(flow_seed + 8, &candidate.session_generation, sizeof(candidate.session_generation));
+    RtlCopyMemory(flow_seed + 16, &candidate.generation, sizeof(candidate.generation));
+    RtlCopyMemory(flow_seed + 24, &candidate.process_id, sizeof(candidate.process_id));
+    RtlCopyMemory(flow_seed + 32, &candidate.process_start_key, sizeof(candidate.process_start_key));
     if (!TgHashBytes(context, flow_seed, sizeof(flow_seed), candidate.flow_id)) goto Exit;
     flow = (TG_FLOW_CONTEXT*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*flow), TG_POOL_TAG);
     if (flow == NULL) goto Exit;
@@ -440,7 +442,9 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     NTSTATUS status;
     NDIS_STATUS ndis_status;
     BOOLEAN flow_referenced = FALSE;
+    TG_CAPTURE_SNAPSHOT capture_snapshot;
 
+    RtlZeroMemory(&capture_snapshot, sizeof(capture_snapshot));
     if ((classify_out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) goto Exit;
     classify_out->actionType = FWP_ACTION_PERMIT;
     if (context == NULL || flow == NULL || nbl == NULL || metadata == NULL || values == NULL ||
@@ -449,7 +453,8 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
         (metadata->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE) == 0 ||
         !TgFlowTryReference(flow)) goto Exit;
     flow_referenced = TRUE;
-    if (!TgPolicyMatches(context, flow)) goto Exit;
+    /* Value-only snapshot: no TG_POLICY pointer escapes context->lock. */
+    if (!TgCaptureSnapshot(context, flow, &capture_snapshot)) goto Exit;
     injection_state = FwpsQueryPacketInjectionState0(family == AF_INET ? context->injection_v4 : context->injection_v6,
                                                       nbl, &injection_context);
     if (injection_state == FWPS_PACKET_INJECTED_BY_SELF || injection_state == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) {
@@ -534,13 +539,13 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     if (contiguous != payload) RtlCopyMemory(payload, contiguous, payload_size);
 
     WdfSpinLockAcquire(context->lock);
-    if (InterlockedCompareExchange(&context->stopping, 0, 0) != 0 || context->policy == NULL ||
-        context->pending_count >= context->queue_capacity || record_size > context->resident_byte_capacity ||
+    if (!TgCaptureSnapshotIsActiveLocked(context, flow, &capture_snapshot)) {
+        WdfSpinLockRelease(context->lock);
+        goto Exit;
+    }
+    if (context->pending_count >= context->queue_capacity || record_size > context->resident_byte_capacity ||
         context->pending_bytes > context->resident_byte_capacity - record_size) {
-        if (context->pending_count >= context->queue_capacity || record_size > context->resident_byte_capacity ||
-            context->pending_bytes > context->resident_byte_capacity - record_size) {
-            InterlockedIncrement64(&context->statistics.queue_overflow);
-        }
+        InterlockedIncrement64(&context->statistics.queue_overflow);
         WdfSpinLockRelease(context->lock);
         goto Exit;
     }
@@ -555,8 +560,8 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     packet->record->header.total_size = (UINT32)record_size;
     packet->record->header.request_id = packet->request_id;
     RtlCopyMemory(packet->record->flow_id, flow->flow_id, 16);
-    packet->record->generation = flow->generation;
-    RtlCopyMemory(packet->record->lease_nonce, flow->lease_nonce, 16);
+    packet->record->generation = capture_snapshot.policy_generation;
+    RtlCopyMemory(packet->record->lease_nonce, capture_snapshot.policy_lease_nonce, 16);
     packet->record->sequence = packet->sequence;
     packet->record->process_id = flow->process_id;
     packet->record->process_start_key = flow->process_start_key;
@@ -581,15 +586,16 @@ static VOID TgClassifyDatagram(ADDRESS_FAMILY family, const FWPS_INCOMING_VALUES
     ++context->pending_count;
     context->pending_bytes += record_size;
     InterlockedIncrement64(&context->statistics.captured);
+    packet = NULL; /* pending/queue lists now own the base reference */
     WdfSpinLockRelease(context->lock);
     classify_out->actionType = FWP_ACTION_BLOCK;
     classify_out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
     classify_out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
     TgServiceCaptureWaiter(context);
-    packet = NULL;
 Exit:
     if (packet != NULL) TgPacketDereference(packet);
     if (flow_referenced) TgFlowDereference(flow);
+    RtlSecureZeroMemory(&capture_snapshot, sizeof(capture_snapshot));
     TgReleaseControlContext(context);
 }
 

@@ -43,6 +43,9 @@ Cleanup revokes that generation before draining synchronous operations and
 canceling queued dequeues, and does not admit a successor until policy cleanup
 finishes. Kernel-private statistics counters are explicitly 8-byte aligned;
 the packed statistics ABI is only populated as a non-atomic output snapshot.
+Datagram classify retains only a value snapshot of the active session and
+policy identity, then revalidates it under the queue lock immediately before
+transferring packet ownership and selecting `BLOCK|ABSORB`.
 
 ## Helper transaction
 

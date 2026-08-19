@@ -41,6 +41,12 @@ typedef struct TG_SESSION_TOKEN {
     UINT64 generation;
 } TG_SESSION_TOKEN;
 
+typedef struct TG_CAPTURE_SNAPSHOT {
+    UINT64 session_generation;
+    UINT64 policy_generation;
+    UCHAR policy_lease_nonce[16];
+} TG_CAPTURE_SNAPSHOT;
+
 typedef struct DECLSPEC_ALIGN(8) TG_STATISTICS_COUNTERS {
     volatile LONG64 captured;
     volatile LONG64 permitted;
@@ -65,6 +71,7 @@ typedef struct TG_FLOW_CONTEXT {
     UINT64 flow_handle;
     UINT16 layer_id;
     UINT32 callout_id;
+    UINT64 session_generation;
     UINT64 generation;
     UINT64 process_id;
     UINT64 process_start_key;
@@ -213,5 +220,9 @@ VOID TgReleaseControlContext(TG_DEVICE_CONTEXT* context);
 
 BOOLEAN TgHashBytes(TG_DEVICE_CONTEXT* context, const VOID* bytes, ULONG length, UCHAR output[32]);
 BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow);
+BOOLEAN TgCaptureSnapshot(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow,
+                          TG_CAPTURE_SNAPSHOT* snapshot);
+BOOLEAN TgCaptureSnapshotIsActiveLocked(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow,
+                                         const TG_CAPTURE_SNAPSHOT* snapshot);
 UINT64 TgInterruptTime100ns(VOID);
 DECLSPEC_NORETURN VOID TgFailStopUnload(NTSTATUS status);

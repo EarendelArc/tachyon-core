@@ -174,14 +174,14 @@ VOID TgClearPolicy(TG_DEVICE_CONTEXT* context)
     TgFlushAll(context, TRUE);
 }
 
-BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
+static BOOLEAN TgPolicyMatchesLocked(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
 {
     UINT32 index;
-    BOOLEAN matched = FALSE;
-    WdfSpinLockAcquire(context->lock);
-    if (context->policy == NULL || context->policy->generation != flow->generation ||
+    if (InterlockedCompareExchange(&context->stopping, 0, 0) != 0 ||
+        context->active_session_generation == 0 ||
+        context->active_session_generation != (LONG64)flow->session_generation ||
+        context->policy == NULL || context->policy->generation != flow->generation ||
         RtlCompareMemory(context->policy->lease_nonce, flow->lease_nonce, 16) != 16) {
-        WdfSpinLockRelease(context->lock);
         return FALSE;
     }
     for (index = 0; index < context->policy->entry_count; ++index) {
@@ -191,12 +191,50 @@ BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
             ((entry->match_flags & TachyonWfpPolicyMatchAppIdHash) == 0 || RtlCompareMemory(entry->app_id_hash, flow->app_id_hash, 32) == 32) &&
             ((entry->match_flags & TachyonWfpPolicyMatchUserSecurityDescriptorHash) == 0 ||
              RtlCompareMemory(entry->user_security_descriptor_hash, flow->user_security_descriptor_hash, 32) == 32)) {
-            matched = TRUE;
-            break;
+            return TRUE;
         }
+    }
+    return FALSE;
+}
+
+BOOLEAN TgPolicyMatches(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow)
+{
+    BOOLEAN matched;
+    WdfSpinLockAcquire(context->lock);
+    matched = TgPolicyMatchesLocked(context, flow);
+    WdfSpinLockRelease(context->lock);
+    return matched;
+}
+
+BOOLEAN TgCaptureSnapshot(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow,
+                          TG_CAPTURE_SNAPSHOT* snapshot)
+{
+    BOOLEAN matched;
+    RtlZeroMemory(snapshot, sizeof(*snapshot));
+    WdfSpinLockAcquire(context->lock);
+    matched = TgPolicyMatchesLocked(context, flow);
+    if (matched) {
+        snapshot->session_generation = (UINT64)context->active_session_generation;
+        snapshot->policy_generation = context->policy->generation;
+        RtlCopyMemory(snapshot->policy_lease_nonce, context->policy->lease_nonce,
+                      sizeof(snapshot->policy_lease_nonce));
     }
     WdfSpinLockRelease(context->lock);
     return matched;
+}
+
+BOOLEAN TgCaptureSnapshotIsActiveLocked(TG_DEVICE_CONTEXT* context, const TG_FLOW_CONTEXT* flow,
+                                         const TG_CAPTURE_SNAPSHOT* snapshot)
+{
+    /* Published policies are immutable, so identity equality preserves the initial entry match. */
+    return snapshot != NULL && snapshot->session_generation != 0 &&
+           InterlockedCompareExchange(&context->stopping, 0, 0) == 0 &&
+           context->active_session_generation == (LONG64)snapshot->session_generation &&
+           flow->session_generation == snapshot->session_generation &&
+           context->policy != NULL && context->policy->generation == snapshot->policy_generation &&
+           flow->generation == snapshot->policy_generation &&
+           RtlCompareMemory(context->policy->lease_nonce, snapshot->policy_lease_nonce, 16) == 16 &&
+           RtlCompareMemory(flow->lease_nonce, snapshot->policy_lease_nonce, 16) == 16;
 }
 
 NTSTATUS TgCopyNextCapture(TG_DEVICE_CONTEXT* context, const TG_SESSION_TOKEN* session,

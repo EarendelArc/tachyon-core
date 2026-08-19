@@ -38,6 +38,8 @@ SID 的散列。
 先撤销 generation，再等待同步操作并取消排队的 dequeue；策略清理结束前不会
 接纳继任会话。内核私有 statistics counter 显式按 8 字节对齐，packed ABI
 statistics 只作为普通输出快照写入，不作为 Interlocked 目标。
+datagram classify 仅保留 active session 与 policy identity 的值快照；在转移
+packet 所有权并选择 `BLOCK|ABSORB` 前，必须在 queue lock 下立即复验该快照。
 
 ## Helper 事务
 

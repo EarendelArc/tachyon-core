@@ -1,13 +1,27 @@
 package helper
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+type nugetLockFile struct {
+	Version      int                                  `json:"version"`
+	Dependencies map[string]map[string]nugetLockEntry `json:"dependencies"`
+}
+
+type nugetLockEntry struct {
+	Type        string `json:"type"`
+	Requested   string `json:"requested"`
+	Resolved    string `json:"resolved"`
+	ContentHash string `json:"contentHash"`
+}
 
 type msbuildElement struct {
 	XMLName xml.Name
@@ -295,8 +309,13 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 	}
 	workflow := string(workflowData)
 	for _, required := range []string{
+		`<PackageReference Include="Microsoft.Windows.WDK.x64" Version="[10.0.28000.2526]" GeneratePathProperty="true" />`,
+		`<PackageReference Include="Microsoft.Windows.WDK.ARM64" Version="[10.0.28000.2526]" GeneratePathProperty="true" />`,
 		`<PackageReference Include="Microsoft.Windows.SDK.CPP.x64" Version="[10.0.28000.1721]" />`,
 		`<PackageReference Include="Microsoft.Windows.SDK.CPP.ARM64" Version="[10.0.28000.1721]" />`,
+		"<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>",
+		`<RestoreLockedMode Condition="'$(RestoreLockedMode)'==''">true</RestoreLockedMode>`,
+		`<NuGetLockFilePath>$(ProjectDir)locks\$(Platform)\packages.lock.json</NuGetLockFilePath>`,
 		"<TreatWarningAsError>true</TreatWarningAsError>",
 		"<EnablePREfast>true</EnablePREfast>",
 	} {
@@ -308,8 +327,10 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 		t.Fatal("project hides NuGet or compiler warnings")
 	}
 	for _, required := range []string{
+		"permissions:\n  contents: read",
 		"platform: x64",
 		"platform: ARM64",
+		"/p:RestoreLockedMode=true",
 		"/warnaserror",
 		"/p:EnablePREfast=true",
 		"inf-verify:",
@@ -327,6 +348,66 @@ func TestWFPProjectPinsResolvedSDKAndPreservesAnalysisGates(t *testing.T) {
 	}
 	if strings.Contains(workflow, "matrix.package") || strings.Contains(workflow, `c\bin\10.0.28000.0\x64\infverif.exe`) {
 		t.Fatal("InfVerif still resolves a target-architecture or non-tool executable")
+	}
+	actionPattern := regexp.MustCompile(`(?m)^\s*uses:\s+([^@\s]+)@([0-9a-f]{40})\s+#\s+(\S+)\s*$`)
+	expectedActions := map[string]struct {
+		sha     string
+		version string
+		count   int
+	}{
+		"actions/checkout":        {sha: "9f698171ed81b15d1823a05fc7211befd50c8ae0", version: "v6.0.3", count: 3},
+		"actions/setup-go":        {sha: "4a3601121dd01d1626a1e23e37211e3254c1c06c", version: "v6.4.0", count: 1},
+		"microsoft/setup-msbuild": {sha: "30375c66a4eea26614e0d39710365f22f8b0af57", version: "v3", count: 2},
+	}
+	matches := actionPattern.FindAllStringSubmatch(workflow, -1)
+	if got := strings.Count(workflow, "uses:"); got != len(matches) {
+		t.Fatalf("WFP workflow has %d uses entries but only %d immutable SHA pins", got, len(matches))
+	}
+	seenActions := make(map[string]int)
+	for _, match := range matches {
+		expected, ok := expectedActions[match[1]]
+		if !ok || match[2] != expected.sha || match[3] != expected.version {
+			t.Fatalf("unexpected WFP action pin %q at %s with version comment %s", match[1], match[2], match[3])
+		}
+		seenActions[match[1]]++
+	}
+	for action, expected := range expectedActions {
+		if seenActions[action] != expected.count {
+			t.Fatalf("WFP workflow action %s appears %d times; want %d", action, seenActions[action], expected.count)
+		}
+	}
+	for _, lock := range []struct {
+		platform string
+		packages map[string]string
+	}{
+		{platform: "x64", packages: map[string]string{
+			"Microsoft.Windows.WDK.x64":     "10.0.28000.2526",
+			"Microsoft.Windows.SDK.CPP.x64": "10.0.28000.1721",
+		}},
+		{platform: "ARM64", packages: map[string]string{
+			"Microsoft.Windows.WDK.ARM64":     "10.0.28000.2526",
+			"Microsoft.Windows.SDK.CPP.arm64": "10.0.28000.1721",
+		}},
+	} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "drivers", "windows", "wfp", "locks", lock.platform, "packages.lock.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed nugetLockFile
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("parse %s package lock: %v", lock.platform, err)
+		}
+		dependencies := parsed.Dependencies["native,Version=v0.0"]
+		for packageName, version := range lock.packages {
+			entry, ok := dependencies[packageName]
+			if !ok || entry.Type != "Direct" || entry.Requested != "["+version+", "+version+"]" || entry.Resolved != version || entry.ContentHash == "" {
+				t.Fatalf("%s lock does not exactly pin %s at %s: %+v", lock.platform, packageName, version, entry)
+			}
+		}
+		sdk := dependencies["Microsoft.Windows.SDK.CPP"]
+		if sdk.Type != "Transitive" || sdk.Resolved != "10.0.28000.1721" || sdk.ContentHash == "" {
+			t.Fatalf("%s lock does not pin transitive SDK CPP content: %+v", lock.platform, sdk)
+		}
 	}
 	for _, required := range []string{
 		"DefaultDestDir=13",

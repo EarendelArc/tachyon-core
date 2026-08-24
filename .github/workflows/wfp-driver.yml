@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Setup Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
           cache: true
@@ -50,14 +50,14 @@ jobs:
           - platform: ARM64
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v3
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
         with:
           msbuild-architecture: x64
       - name: Restore pinned formal WDK NuGet package
         shell: pwsh
-        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TachyonUseNuGetWDK=true
+        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TachyonUseNuGetWDK=true /p:RestoreLockedMode=true
       - name: Compile with PREfast enabled
         shell: pwsh
         run: >-
@@ -76,14 +76,14 @@ jobs:
     runs-on: windows-2025
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v3
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
         with:
           msbuild-architecture: x64
       - name: Restore pinned host WDK NuGet package
         shell: pwsh
-        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=x64 /p:TachyonUseNuGetWDK=true
+        run: msbuild drivers/windows/wfp/TachyonWfp.sln /t:Restore /p:Configuration=Release /p:Platform=x64 /p:TachyonUseNuGetWDK=true /p:RestoreLockedMode=true
       - name: Run host WDK InfVerif and validate INF
         shell: pwsh
         run: |

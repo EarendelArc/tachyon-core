@@ -1,0 +1,57 @@
+; SPDX-License-Identifier: Apache-2.0
+[Version]
+Signature="$WINDOWS NT$"
+Class=WFPCALLOUTS
+ClassGuid={57465043-616C-6C6F-7574-5F636C617373}
+Provider=%Tachyon%
+DriverVer=08/10/2026,0.2.0.0
+CatalogFile=tachyon-wfp.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopy
+
+[DefaultInstall.NTarm64]
+CopyFiles=DriverCopy
+
+[DefaultInstall.NTamd64.Services]
+AddService=TachyonWFP,0x00000002,TachyonWFP_Service
+
+[DefaultInstall.NTarm64.Services]
+AddService=TachyonWFP,0x00000002,TachyonWFP_Service
+
+[DefaultInstall.NTamd64.Wdf]
+KmdfService=TachyonWFP,TachyonWFP_Wdf
+
+[DefaultInstall.NTarm64.Wdf]
+KmdfService=TachyonWFP,TachyonWFP_Wdf
+
+[DriverCopy]
+tachyon-wfp.sys
+
+[TachyonWFP_Service]
+DisplayName=%ServiceName%
+Description=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\tachyon-wfp.sys
+LoadOrderGroup=PNP_TDI
+
+[TachyonWFP_Wdf]
+KmdfLibraryVersion=1.15
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+tachyon-wfp.sys=1
+
+[Strings]
+Tachyon="Tachyon Project"
+ServiceName="Tachyon WFP Callout"
+ServiceDescription="Process-aware UDP capture callout for Tachyon Helper"
+DiskName="Tachyon WFP installation media"

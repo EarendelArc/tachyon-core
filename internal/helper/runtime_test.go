@@ -22,15 +22,19 @@ type invalidContractProvider struct{ lifecycleProvider }
 
 func (provider *invalidContractProvider) Contract() WFPDriverContract {
 	contract := RequiredWFPDriverContract()
-	contract.CancelIOCTL = contract.CaptureIOCTL
+	contract.VerdictIOCTL = contract.DequeueIOCTL
 	return contract
 }
 
 func (provider *lifecycleProvider) Contract() WFPDriverContract { return RequiredWFPDriverContract() }
 
-func (provider *lifecycleProvider) Start(context.Context, CaptureCallbacks) error {
+func (provider *lifecycleProvider) Start(ctx context.Context, _ CaptureCallbacks) error {
 	close(provider.started)
-	return provider.startErr
+	if provider.startErr != nil {
+		return provider.startErr
+	}
+	<-ctx.Done()
+	return nil
 }
 
 func (provider *lifecycleProvider) Stop(context.Context) error {
@@ -40,9 +44,12 @@ func (provider *lifecycleProvider) Stop(context.Context) error {
 
 func (provider *lifecycleProvider) Health() ProviderHealth {
 	return ProviderHealth{Status: "ready", Verified: true, Capabilities: CaptureCapabilities{
-		FlowCapture: true, DatagramCapture: true, KernelInjection: true, Cancelable: true,
+		FlowCapture: true, DatagramCapture: true, ProcessIdentity: true, PerFlowMTU: true, Cancelable: true,
 	}}
 }
+
+func (provider *lifecycleProvider) ActivatePolicy(context.Context, WFPPolicy) error { return nil }
+func (provider *lifecycleProvider) DisablePolicy(context.Context) error             { return nil }
 
 type lifecycleInjector struct {
 	closed chan struct{}
@@ -78,7 +85,7 @@ func (injector *lifecycleInjector) Close(context.Context) error {
 func TestRuntimeStopsProviderAfterPartialStartFailure(t *testing.T) {
 	provider := &lifecycleProvider{startErr: errors.New("start failed"), started: make(chan struct{}), stopped: make(chan struct{})}
 	injector := &lifecycleInjector{closed: make(chan struct{})}
-	runtime := &Runtime{provider: provider, injector: injector}
+	runtime := &Runtime{config: Config{Policy: fixturePolicy()}, provider: provider, injector: injector}
 	runtime.client = &blockingTestClient{}
 	if err := runtime.Run(context.Background()); err == nil {
 		t.Fatal("partial provider start unexpectedly succeeded")
@@ -98,7 +105,7 @@ func TestRuntimeStopsProviderAfterPartialStartFailure(t *testing.T) {
 func TestRuntimeRejectsInvalidProviderContractAndStopsProvider(t *testing.T) {
 	provider := &invalidContractProvider{lifecycleProvider: lifecycleProvider{started: make(chan struct{}), stopped: make(chan struct{})}}
 	injector := &lifecycleInjector{closed: make(chan struct{})}
-	runtime := &Runtime{provider: provider, injector: injector}
+	runtime := &Runtime{config: Config{Policy: fixturePolicy()}, provider: provider, injector: injector}
 	runtime.client = &blockingTestClient{}
 	if err := runtime.Run(context.Background()); !errors.Is(err, ErrInvalidCaptureContract) {
 		t.Fatalf("invalid provider contract error = %v", err)
@@ -120,7 +127,7 @@ func TestRuntimeProviderStopHasOneOwnerAndFailsClosedAtDeadline(t *testing.T) {
 	injector := &lifecycleInjector{closed: make(chan struct{})}
 	var failStopCalls atomic.Int32
 	runtime := &Runtime{
-		config: Config{OperationTimeout: 30 * time.Millisecond, FailStop: func(context.Context) error {
+		config: Config{OperationTimeout: 30 * time.Millisecond, Policy: fixturePolicy(), FailStop: func(context.Context) error {
 			failStopCalls.Add(1)
 			return nil
 		}},
@@ -259,5 +266,172 @@ func TestRuntimeHealthIncludesPipeFailureDiagnostics(t *testing.T) {
 	}
 	if !strings.Contains(health.LastError, "open server process") {
 		t.Fatalf("pipe failure detail was lost: %+v", health)
+	}
+}
+
+type orderedRuntimeLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (log *orderedRuntimeLog) add(entry string) {
+	log.mu.Lock()
+	log.entries = append(log.entries, entry)
+	log.mu.Unlock()
+}
+
+func (log *orderedRuntimeLog) snapshot() []string {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return append([]string(nil), log.entries...)
+}
+
+type transactionalTestProvider struct {
+	log         *orderedRuntimeLog
+	activated   chan struct{}
+	activateErr error
+}
+
+func (provider *transactionalTestProvider) Contract() WFPDriverContract {
+	return RequiredWFPDriverContract()
+}
+func (provider *transactionalTestProvider) Health() ProviderHealth {
+	return ProviderHealth{Status: "ready", Verified: true, Capabilities: RequiredWFPDriverContract().Capabilities}
+}
+func (provider *transactionalTestProvider) Start(ctx context.Context, _ CaptureCallbacks) error {
+	provider.log.add("provider-start")
+	<-ctx.Done()
+	return nil
+}
+func (provider *transactionalTestProvider) Stop(context.Context) error {
+	provider.log.add("provider-stop")
+	return nil
+}
+func (provider *transactionalTestProvider) ActivatePolicy(context.Context, WFPPolicy) error {
+	provider.log.add("provider-activate")
+	if provider.activateErr == nil {
+		select {
+		case <-provider.activated:
+		default:
+			close(provider.activated)
+		}
+	}
+	return provider.activateErr
+}
+func (provider *transactionalTestProvider) DisablePolicy(context.Context) error {
+	provider.log.add("provider-disable")
+	return nil
+}
+
+type transactionalTestClient struct {
+	log    *orderedRuntimeLog
+	mu     sync.Mutex
+	health capturedudp.NamedPipeClientHealth
+	closed chan struct{}
+}
+
+func newTransactionalTestClient(log *orderedRuntimeLog) *transactionalTestClient {
+	return &transactionalTestClient{log: log, health: capturedudp.NamedPipeClientHealth{Connected: true, Authenticated: true, Stage: "authenticated"}, closed: make(chan struct{})}
+}
+func (client *transactionalTestClient) Run(ctx context.Context) error {
+	client.log.add("pipe-start")
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-client.closed:
+		return nil
+	}
+}
+func (client *transactionalTestClient) Close() error {
+	client.mu.Lock()
+	select {
+	case <-client.closed:
+	default:
+		close(client.closed)
+	}
+	client.mu.Unlock()
+	return nil
+}
+func (client *transactionalTestClient) Health() capturedudp.NamedPipeClientHealth {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.health
+}
+func (client *transactionalTestClient) disconnect() {
+	client.mu.Lock()
+	client.health.Connected, client.health.Authenticated, client.health.Stage = false, false, "session_failed"
+	client.mu.Unlock()
+}
+func (client *transactionalTestClient) Ping(context.Context, []byte) ([]byte, error) { return nil, nil }
+func (client *transactionalTestClient) PrepareGeneration(_ context.Context, generation uint64) (capturedudp.GenerationTransaction, error) {
+	client.log.add("core-prepare")
+	return capturedudp.GenerationTransaction{Generation: generation, ID: [16]byte{1}}, nil
+}
+func (client *transactionalTestClient) CommitGeneration(context.Context, capturedudp.GenerationTransaction) error {
+	client.log.add("core-commit")
+	return nil
+}
+func (client *transactionalTestClient) AbortGeneration(context.Context, capturedudp.GenerationTransaction) error {
+	client.log.add("core-abort")
+	return nil
+}
+func (client *transactionalTestClient) DisableGeneration(context.Context, uint64) error {
+	client.log.add("core-disable")
+	return nil
+}
+func (client *transactionalTestClient) OpenFlow(context.Context, capturedudp.FlowSpec) (capturedudp.FlowLease, error) {
+	return capturedudp.FlowLease{}, nil
+}
+func (client *transactionalTestClient) SendDatagram(context.Context, capturedudp.Datagram) error {
+	return nil
+}
+func (client *transactionalTestClient) CloseFlow(context.Context, uint64, capturedudp.FlowID, capturedudp.LeaseNonce) error {
+	return nil
+}
+
+func TestRuntimeActivatesAfterBothHandshakesAndDisablesOnDisconnect(t *testing.T) {
+	log := &orderedRuntimeLog{}
+	provider := &transactionalTestProvider{log: log, activated: make(chan struct{})}
+	client := newTransactionalTestClient(log)
+	runtime := &Runtime{config: Config{Policy: fixturePolicy(), OperationTimeout: 250 * time.Millisecond},
+		provider: provider, injector: &lifecycleInjector{closed: make(chan struct{})}, client: client, failStop: func(context.Context) error { return nil }}
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(context.Background()) }()
+	select {
+	case <-provider.activated:
+	case <-time.After(time.Second):
+		t.Fatal("policy transaction did not activate")
+	}
+	client.disconnect()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRuntimePipeDisconnected) {
+			t.Fatalf("run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not stop after authenticated pipe disconnect")
+	}
+	entries := strings.Join(log.snapshot(), ",")
+	for _, ordered := range []string{"core-prepare,provider-activate,core-commit", "provider-disable", "core-disable", "provider-stop"} {
+		if !strings.Contains(entries, ordered) {
+			t.Fatalf("transaction log %q missing %q", entries, ordered)
+		}
+	}
+}
+
+func TestRuntimeActivationFailureAbortsAndDisables(t *testing.T) {
+	log := &orderedRuntimeLog{}
+	provider := &transactionalTestProvider{log: log, activated: make(chan struct{}), activateErr: errors.New("activation rejected")}
+	client := newTransactionalTestClient(log)
+	runtime := &Runtime{config: Config{Policy: fixturePolicy(), OperationTimeout: 250 * time.Millisecond},
+		provider: provider, injector: &lifecycleInjector{closed: make(chan struct{})}, client: client, failStop: func(context.Context) error { return nil }}
+	if err := runtime.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "activation rejected") {
+		t.Fatalf("run error = %v", err)
+	}
+	entries := strings.Join(log.snapshot(), ",")
+	for _, required := range []string{"core-prepare", "provider-activate", "core-abort", "provider-disable", "core-disable"} {
+		if !strings.Contains(entries, required) {
+			t.Fatalf("transaction log %q missing %q", entries, required)
+		}
 	}
 }
